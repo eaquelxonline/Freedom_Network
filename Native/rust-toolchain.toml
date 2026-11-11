@@ -1,0 +1,6 @@
+# Pinned, verified toolchain (stable 1.99.1, released 2026-10-15 channel).
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["aarch64-linux-android", "x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"]
