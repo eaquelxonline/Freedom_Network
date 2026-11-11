@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------
+# THE DPI — .gitignore
+# Platforms in scope: Android (ARM64), Windows (x86_64)
+# Build systems: Gradle (Kotlin DSL), Cargo
+# ---------------------------------------------------------------
+
+# --- Gradle ---
+.gradle/
+build/
+**/build/
+local.properties
+# Gradle Wrapper must stay tracked (reproducible builds)
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# --- Kotlin ---
+.kotlin/
+*.class
+
+# --- Android ---
+.cxx/
+.externalNativeBuild/
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+output-metadata.json
+
+# --- Rust / Cargo ---
+# Cargo.lock is intentionally tracked (application binary, reproducible builds)
+Native/target/
+target/
+**/*.rs.bk
+*.pdb
+
+# --- Native build outputs ---
+*.so
+*.dll
+*.lib
+*.exp
+*.obj
+*.o
+
+# --- Signing material and secrets (never commit) ---
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+keystore.properties
+signing.properties
+.env
+.env.*
+
+# --- IDE ---
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Diagnostics (privacy: no persistent diagnostic/DNS data in VCS) ---
+*.log
+*.hprof
+*.trace
+*.pcap
+*.pcapng
