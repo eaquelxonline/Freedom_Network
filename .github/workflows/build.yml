@@ -83,7 +83,10 @@ jobs:
 
       - name: Zip app image
         shell: pwsh
-        run: Compress-Archive -Path Windows/build/package/image/FreedomNetwork -DestinationPath FreedomNetwork-Windows-x64.zip
+        run: |
+          Compress-Archive -Path Windows/build/package/image/FreedomNetwork -DestinationPath FreedomNetwork-Windows-x64.zip -CompressionLevel Optimal
+          $bytes = (Get-Item FreedomNetwork-Windows-x64.zip).Length
+          Write-Host ("FreedomNetwork-Windows-x64.zip size: {0:N2} MB ({1} bytes)" -f ($bytes / 1MB), $bytes)
 
       - uses: actions/upload-artifact@v7
         with:

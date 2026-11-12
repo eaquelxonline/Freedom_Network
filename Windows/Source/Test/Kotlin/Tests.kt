@@ -889,6 +889,176 @@ fun main() {
         }
     }
 
+    // ------------------------------------------------------------------ 26. ExitRelayConfig & IP-leak hardening helpers
+    test("ExitRelayConfig parsing, leak-risk ports, and plaintext HTTP IP header stripping") {
+        val tor = ExitRelayConfig.parse("tor")!!
+        eq(tor.scheme, "socks5", "tor scheme")
+        eq(tor.host, "127.0.0.1", "tor host")
+        eq(tor.port, 9050, "tor port")
+        expect(tor.isLoopback()) { "tor must be loopback" }
+
+        val customSocks = ExitRelayConfig.parse("socks5://alice:s3cr3t@198.51.100.10:1080")!!
+        eq(customSocks.scheme, "socks5", "custom scheme")
+        eq(customSocks.host, "198.51.100.10", "custom host")
+        eq(customSocks.port, 1080, "custom port")
+        eq(customSocks.username, "alice", "username")
+        eq(customSocks.password, "s3cr3t", "password")
+        expect(!customSocks.isLoopback()) { "public relay not loopback" }
+
+        val httpsRelay = ExitRelayConfig.parse("https://proxy.example.org")!!
+        eq(httpsRelay.scheme, "https", "https scheme")
+        eq(httpsRelay.port, 443, "default https port")
+
+        eq(ExitRelayConfig.parse(""), null, "blank relay")
+        eq(ExitRelayConfig.parse("ftp://bad.example.org:21"), null, "unsupported scheme")
+
+        expect(IpPackets.isLeakRiskUdpPort(3478) && IpPackets.isLeakRiskUdpPort(19302) && IpPackets.isLeakRiskUdpPort(5353)) { "leak UDP ports" }
+        expect(!IpPackets.isLeakRiskUdpPort(443)) { "443 not leak-risk UDP port" }
+        expect(IpPackets.isLeakRiskTcpPort(3478) && IpPackets.isLeakRiskTcpPort(5349)) { "leak TCP ports" }
+
+        val rawHttp = ("GET /ip HTTP/1.1\r\nHost: api.ipify.org\r\n" +
+            "X-Forwarded-For: 176.89.26.149\r\nX-Real-IP: 10.0.0.2\r\nForwarded: for=1.2.3.4\r\nVia: 1.1 carrier\r\n\r\nbody").toByteArray()
+        val stripped = String(IpPackets.stripPlainHttpClientIpHeaders(rawHttp), Charsets.ISO_8859_1)
+        expect("Host: api.ipify.org" in stripped && stripped.endsWith("\r\n\r\nbody")) { "keeps safe HTTP header and body: $stripped" }
+        expect("176.89.26.149" !in stripped && "X-Real-IP" !in stripped && "Forwarded" !in stripped && "Via:" !in stripped) { "strips leaking headers: $stripped" }
+
+        val tls = byteArrayOf(0x16, 0x03, 0x01, 0x00, 0x20) + ByteArray(32)
+        expect(IpPackets.stripPlainHttpClientIpHeaders(tls) === tls) { "binary TLS payload untouched" }
+    }
+
+    // ------------------------------------------------------------------ 27. TunBridge through loopback Exit Relay & strict leak guard
+    test("TunBridge routes TCP through HTTP CONNECT Exit Relay, strips leak headers, and blocks TCP-53 under Kill Switch") {
+        DiagnosticSession(fastConfig).use { s ->
+            val appToBridgeIn = java.io.PipedInputStream(65536)
+            val appToBridgeOut = java.io.PipedOutputStream(appToBridgeIn)
+            val bridgeToAppIn = java.io.PipedInputStream(65536)
+            val bridgeToAppOut = java.io.PipedOutputStream(bridgeToAppIn)
+
+            fun readNextIp(input: java.io.InputStream): ByteArray {
+                val hdr = ByteArray(20)
+                var read = 0
+                while (read < 20) {
+                    val n = input.read(hdr, read, 20 - read)
+                    if (n < 0) error("EOF")
+                    read += n
+                }
+                val totalLen = IpPackets.u16(hdr, 2)
+                val full = ByteArray(totalLen)
+                System.arraycopy(hdr, 0, full, 0, 20)
+                while (read < totalLen) {
+                    val n = input.read(full, read, totalLen - read)
+                    if (n < 0) error("EOF")
+                    read += n
+                }
+                return full
+            }
+
+            ServerSocket(0, 8, InetAddress.getLoopbackAddress()).use { originSrv ->
+                originSrv.soTimeout = 4000
+                val receivedOnOrigin = AtomicReference("")
+                val originThread = Thread {
+                    originSrv.accept().use { conn ->
+                        conn.soTimeout = 3000
+                        val sb = StringBuilder()
+                        while (true) {
+                            val b = conn.inputStream.read()
+                            if (b < 0) break
+                            sb.append(b.toChar())
+                            if (sb.endsWith("\r\n\r\n")) break
+                        }
+                        receivedOnOrigin.set(sb.toString())
+                        conn.outputStream.write("HTTP/1.1 200 MASKED_OK\r\n\r\n".toByteArray())
+                        conn.outputStream.flush()
+                    }
+                }.apply { isDaemon = true; start() }
+
+                ServerSocket(0, 8, InetAddress.getLoopbackAddress()).use { relaySrv ->
+                    relaySrv.soTimeout = 4000
+                    val connectTarget = AtomicReference("")
+                    val relayThread = Thread {
+                        relaySrv.accept().use { client ->
+                            client.soTimeout = 3000
+                            val rIn = client.inputStream
+                            val rOut = client.outputStream
+                            val sb = StringBuilder()
+                            while (true) {
+                                val b = rIn.read()
+                                if (b < 0) break
+                                sb.append(b.toChar())
+                                if (sb.endsWith("\r\n\r\n")) break
+                            }
+                            val reqLine = sb.toString().lineSequence().firstOrNull().orEmpty()
+                            connectTarget.set(reqLine.substringAfter("CONNECT ").substringBefore(' '))
+                            Socket(InetAddress.getLoopbackAddress(), originSrv.localPort).use { upstream ->
+                                rOut.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+                                rOut.flush()
+                                val fwd = Thread {
+                                    runCatching { rIn.transferTo(upstream.outputStream); upstream.shutdownOutput() }
+                                }.apply { isDaemon = true; start() }
+                                runCatching { upstream.inputStream.transferTo(rOut); rOut.flush() }
+                                fwd.join(2000)
+                            }
+                        }
+                    }.apply { isDaemon = true; start() }
+
+                    val clientIp = IpPackets.parseIpLiteral(TunBridge.VPN_CLIENT_IP)!!
+                    val loopbackIp = IpPackets.parseIpLiteral("127.0.0.1")!!
+                    val fakePeerIp = IpPackets.parseIpLiteral("198.51.100.77")!!
+
+                    TunBridge(
+                        session = s,
+                        tunInput = appToBridgeIn,
+                        tunOutput = bridgeToAppOut,
+                        strictKillSwitch = true,
+                        hardenStunLeaks = true,
+                        exitRelayUri = "http://127.0.0.1:${relaySrv.localPort}",
+                    ).use { bridge ->
+                        bridge.start()
+                        expect(bridge.isExitRelayActive) { "exit relay must be active" }
+
+                        // 1) TCP SYN to port 53 must immediately RST under Strict Kill Switch
+                        val tcpDnsSyn = IpPackets.buildIpv4Tcp(clientIp, loopbackIp, 56001, 53, 100L, 0L, IpPackets.TCP_SYN)
+                        appToBridgeOut.write(tcpDnsSyn)
+                        appToBridgeOut.flush()
+                        val dnsRst = IpPackets.parseTcp(readNextIp(bridgeToAppIn))!!
+                        expect((dnsRst.flags and IpPackets.TCP_RST) != 0) { "TCP:53 must be reset under Kill Switch" }
+
+                        // 2) TCP connection routed through Exit Relay (CONNECT) with X-Forwarded-For stripped
+                        val syn = IpPackets.buildIpv4Tcp(clientIp, fakePeerIp, 56002, originSrv.localPort, 2000L, 0L, IpPackets.TCP_SYN)
+                        appToBridgeOut.write(syn)
+                        appToBridgeOut.flush()
+                        val synAck = IpPackets.parseTcp(readNextIp(bridgeToAppIn))!!
+                        eq(synAck.flags and (IpPackets.TCP_SYN or IpPackets.TCP_ACK), IpPackets.TCP_SYN or IpPackets.TCP_ACK, "SYN+ACK")
+
+                        val dirtyHttp = "GET /ip HTTP/1.1\r\nHost: test.local\r\nX-Forwarded-For: 176.89.26.149\r\n\r\n".toByteArray()
+                        val data = IpPackets.buildIpv4Tcp(
+                            clientIp, fakePeerIp, 56002, originSrv.localPort,
+                            2001L, (synAck.seq + 1L) and 0xFFFFFFFFL,
+                            IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = dirtyHttp,
+                        )
+                        appToBridgeOut.write(data)
+                        appToBridgeOut.flush()
+
+                        var resp = ""
+                        for (attempt in 0 until 4) {
+                            val seg = IpPackets.parseTcp(readNextIp(bridgeToAppIn))!!
+                            if (seg.payload.isNotEmpty()) {
+                                resp = String(seg.payload)
+                                break
+                            }
+                        }
+                        eq(resp, "HTTP/1.1 200 MASKED_OK\r\n\r\n", "relayed TCP response")
+                        eq(connectTarget.get(), "198.51.100.77:${originSrv.localPort}", "CONNECT target")
+                        expect("176.89.26.149" !in receivedOnOrigin.get()) { "X-Forwarded-For must be stripped before Exit Relay" }
+                        expect(bridge.leaksBlocked.get() >= 2) { "expected >=2 blocked leaks (TCP:53 + X-Forwarded-For)" }
+                        relayThread.join(2500)
+                        originThread.join(2500)
+                    }
+                }
+            }
+        }
+    }
+
     println()
     println("RESULT: $passed passed, ${failures.size} failed")
     if (failures.isNotEmpty()) {

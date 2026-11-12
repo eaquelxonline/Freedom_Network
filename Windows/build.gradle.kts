@@ -127,6 +127,8 @@ val packageWindows = tasks.register<Exec>("packageWindows") {
         "--input", inputDir,
         "--main-jar", "FreedomNetwork-$appVer.jar", "--main-class", "com.freedom.network.CoreKt",
         "--java-options", "-Djava.library.path=\$APPDIR",
+        "--add-modules", "java.base,java.desktop,java.logging,java.net.http,jdk.crypto.ec,jdk.crypto.mscapi,jdk.charsets",
+        "--jlink-options", "--strip-native-commands --strip-debug --no-man-pages --no-header-files --compress=zip-9",
         "--icon", iconFile,
         "--dest", outPath,
     )

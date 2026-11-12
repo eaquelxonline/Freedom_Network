@@ -1331,19 +1331,29 @@ object Text {
         trackersBlocked: Int = 0,
         leaksBlocked: Int = 0,
         killSwitch: Boolean = false,
+        exitRelayLabel: String = "",
     ): String = buildString {
         if (!vpnActive && !p.active) {
             appendLine("FREEDOM NETWORK (SİSTEM GENELİ ÖZGÜR AĞ): Kapalı")
             return@buildString
         }
         val modeDesc = if (vpnActive) {
-            "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · Şifreli DoH3/ODoH + REALITY/Vision Desync + Tam UDP NAT)"
+            if (exitRelayLabel.isNotBlank() && !exitRelayLabel.startsWith("Doğrudan")) {
+                "Sistem Geneli Şifreli Tünel + Çıkış Rölesi ($exitRelayLabel)"
+            } else {
+                "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · Şifreli DoH3 + REALITY/Vision Desync + Tam UDP NAT)"
+            }
         } else {
             "Yerel Proxy (127.0.0.1:${p.port})"
         }
         appendLine("FREEDOM NETWORK: Etkin · $modeDesc")
         if (p.active) {
             appendLine("  Yerel Proxy: 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
+        }
+        if (exitRelayLabel.isNotBlank() && !exitRelayLabel.startsWith("Doğrudan")) {
+            appendLine("  Çıkış IP   : Maskeli · Aktif Çıkış Rölesi: $exitRelayLabel")
+        } else if (vpnActive) {
+            appendLine("  Çıkış IP   : Doğrudan DPI & DoH3 Modu (Genel IP'yi gizlemek için Çıkış Rölesi / Tor seçin)")
         }
         appendLine("  Strateji   : ${desyncMode(p.mode)}${if (killSwitch) " · Sızdırmaz Kill Switch AKTİF" else ""}")
         appendLine("  TUN Köprüsü: TCP $tcpFlows (Desync $desyncedFlows, TLS Kayıt Parçalama $tlsFragmented, Vision Splice $visionSplicedFlows) · Gerçek Zamanlı UDP $udpFlows (QUIC Geçişi $quicFallbacks) · DNS $dnsQueries (Şifreli DoH $dohResolved, Zehir $poisonedBlocked, İzleyici $trackersBlocked, Sızıntı Engeli $leaksBlocked)")
@@ -2055,6 +2065,106 @@ object IpPackets {
         pkt[17] = 11
         return pkt
     }
+
+    /** True when [port] is a known STUN/TURN/mDNS/SSDP IP-discovery/local-leak UDP port. */
+    fun isLeakRiskUdpPort(port: Int): Boolean =
+        port == 3478 || port == 3479 || port == 5349 || port == 5353 || port == 1900 || (port in 19302..19309)
+
+    /** True when [port] is a STUN/TURN TCP port that can expose client IP addresses. */
+    fun isLeakRiskTcpPort(port: Int): Boolean =
+        port == 3478 || port == 3479 || port == 5349
+
+    /**
+     * Strips privacy-leaking proxy/client-IP forwarding headers (`X-Forwarded-For`, `Forwarded`,
+     * `Via`, `X-Real-IP`, `Client-IP`, `True-Client-IP`, `CF-Connecting-IP`) from plaintext
+     * HTTP/1.x requests while leaving TLS/binary streams completely untouched.
+     */
+    fun stripPlainHttpClientIpHeaders(payload: ByteArray): ByteArray {
+        if (payload.size < 16) return payload
+        val b0 = payload[0].toInt() and 0xFF
+        if (b0 < 0x41 || b0 > 0x5A) return payload // not uppercase ASCII HTTP method
+        val headText = String(payload, 0, minOf(payload.size, 8192), Charsets.ISO_8859_1)
+        val hdrEnd = headText.indexOf("\r\n\r\n")
+        if (hdrEnd <= 0) return payload
+        val headerBlock = headText.substring(0, hdrEnd)
+        val lines = headerBlock.split("\r\n")
+        if (lines.isEmpty() || !lines[0].contains("HTTP/1.")) return payload
+        var changed = false
+        val kept = ArrayList<String>(lines.size)
+        kept.add(lines[0])
+        for (i in 1 until lines.size) {
+            val line = lines[i]
+            val lower = line.lowercase()
+            if (lower.startsWith("x-forwarded-for:") ||
+                lower.startsWith("forwarded:") ||
+                lower.startsWith("via:") ||
+                lower.startsWith("x-real-ip:") ||
+                lower.startsWith("client-ip:") ||
+                lower.startsWith("true-client-ip:") ||
+                lower.startsWith("cf-connecting-ip:")
+            ) {
+                changed = true
+            } else {
+                kept.add(line)
+            }
+        }
+        if (!changed) return payload
+        val newHead = (kept.joinToString("\r\n") + "\r\n\r\n").toByteArray(Charsets.ISO_8859_1)
+        val bodyOff = hdrEnd + 4
+        val bodyLen = payload.size - bodyOff
+        val out = ByteArray(newHead.size + bodyLen)
+        System.arraycopy(newHead, 0, out, 0, newHead.size)
+        if (bodyLen > 0) System.arraycopy(payload, bodyOff, out, newHead.size, bodyLen)
+        return out
+    }
+}
+
+/**
+ * Validated upstream exit relay descriptor for public IP hiding (`socks5://`, `http://`,
+ * `https://`, or `tor`/`orbot` shortcut to `127.0.0.1:9050`).
+ */
+data class ExitRelayConfig(
+    val scheme: String,
+    val host: String,
+    val port: Int,
+    val username: String = "",
+    val password: String = "",
+) {
+    fun isLoopback(): Boolean =
+        host == "127.0.0.1" || host.equals("localhost", ignoreCase = true) || host == "::1"
+
+    fun label(): String = "${scheme.uppercase()} $host:$port"
+
+    companion object {
+        fun parse(raw: String): ExitRelayConfig? {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return null
+            if (trimmed.equals("tor", ignoreCase = true) || trimmed.equals("orbot", ignoreCase = true)) {
+                return ExitRelayConfig(scheme = "socks5", host = "127.0.0.1", port = 9050)
+            }
+            val normalized = if ("://" in trimmed) trimmed else "socks5://$trimmed"
+            val uri = runCatching { java.net.URI(normalized) }.getOrNull() ?: return null
+            val rawScheme = (uri.scheme ?: "socks5").lowercase()
+            val scheme = when (rawScheme) {
+                "socks", "socks5", "socks5h" -> "socks5"
+                "http" -> "http"
+                "https" -> "https"
+                else -> return null
+            }
+            val host = uri.host?.trim('[', ']')?.takeIf { it.isNotEmpty() } ?: return null
+            val defaultPort = when (scheme) {
+                "socks5" -> 1080
+                "https" -> 443
+                else -> 8080
+            }
+            val port = if (uri.port > 0) uri.port else defaultPort
+            if (port !in 1..65535) return null
+            val userInfo = uri.userInfo.orEmpty()
+            val user = userInfo.substringBefore(':', "")
+            val pass = if (':' in userInfo) userInfo.substringAfter(':') else ""
+            return ExitRelayConfig(scheme, host, port, user, pass)
+        }
+    }
 }
 
 /**
@@ -2264,6 +2374,7 @@ class TunBridge(
     private val blockTrackers: Boolean = false,
     private val hardenStunLeaks: Boolean = false,
     private val logger: ((String, String) -> Unit)? = null,
+    private val exitRelayUri: String = "",
 ) : AutoCloseable {
     private fun log(tag: String, msg: String) {
         logger?.invoke(tag, msg)
@@ -2271,6 +2382,7 @@ class TunBridge(
 
     private data class FlowKey(val srcIp: Int, val srcPort: Int, val dstIp: Int, val dstPort: Int)
 
+    private val exitRelay: ExitRelayConfig? = ExitRelayConfig.parse(exitRelayUri)
     private val running = AtomicBoolean(false)
     private val writeLock = Any()
     private val ioPool: ExecutorService = Executors.newCachedThreadPool { r ->
@@ -2279,9 +2391,13 @@ class TunBridge(
     private var readerThread: Thread? = null
     private val tcpTable = ConcurrentHashMap<FlowKey, TcpFlow>()
     private val udpTable = ConcurrentHashMap<FlowKey, UdpFlow>()
+    private val dnsIpToHost = ConcurrentHashMap<Int, String>()
     private val virtualDnsIp: Int = IpPackets.parseIpLiteral(VPN_DNS_IP) ?: 0x0AD7AD02
     private val dnsCache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
     @Volatile private var preferredDoh = 0
+
+    val isExitRelayActive: Boolean get() = exitRelay != null
+    val activeExitRelayLabel: String get() = exitRelay?.label() ?: "Doğrudan (Yerel DPI)"
 
     val tcpFlows = AtomicInteger(0)
     val udpFlows = AtomicInteger(0)
@@ -2318,7 +2434,7 @@ class TunBridge(
         if (!running.compareAndSet(false, true)) return
         log(
             "TunBridge",
-            "Freedom Network TunBridge başlatıldı (DoH=${dohEndpoints.size}, killSwitch=$strictKillSwitch, trackers=$blockTrackers, stunShield=$hardenStunLeaks)",
+            "Freedom Network TunBridge başlatıldı (DoH=${dohEndpoints.size}, relay=${activeExitRelayLabel}, killSwitch=$strictKillSwitch, trackers=$blockTrackers, stunShield=$hardenStunLeaks)",
         )
         readerThread = Thread({ readLoop() }, "freedom-tun-reader").apply {
             isDaemon = true
@@ -2373,6 +2489,220 @@ class TunBridge(
         }
     }
 
+    private fun readExactBytes(input: InputStream, n: Int): ByteArray {
+        val out = ByteArray(n)
+        var got = 0
+        while (got < n) {
+            val k = input.read(out, got, n - got)
+            if (k < 0) throw IOException("EOF")
+            got += k
+        }
+        return out
+    }
+
+    private fun readHttpHeaderLine(input: InputStream): String {
+        val sb = StringBuilder()
+        while (sb.length < 8192) {
+            val c = input.read()
+            if (c < 0) throw IOException("EOF")
+            if (c == '\n'.code) break
+            if (c != '\r'.code) sb.append(c.toChar())
+        }
+        return sb.toString()
+    }
+
+    private fun openExitRelayTunnel(
+        relay: ExitRelayConfig,
+        dstHostOrIp: String,
+        dstPort: Int,
+        timeoutMs: Int = 5500,
+    ): Socket {
+        val raw = Socket()
+        try {
+            raw.bind(null)
+            if (!relay.isLoopback()) {
+                protectSocket(raw)
+            }
+            raw.tcpNoDelay = true
+            runCatching { raw.trafficClass = 0x10 }
+            raw.connect(InetSocketAddress(InetAddress.getByName(relay.host), relay.port), timeoutMs)
+            raw.soTimeout = timeoutMs
+
+            val connSock: Socket = if (relay.scheme == "https") {
+                val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                val ssl = sslFactory.createSocket(raw, relay.host, relay.port, true) as SSLSocket
+                val params = ssl.sslParameters
+                params.endpointIdentificationAlgorithm = "HTTPS"
+                ssl.sslParameters = params
+                ssl.startHandshake()
+                ssl
+            } else {
+                raw
+            }
+
+            val input = connSock.getInputStream()
+            val out = connSock.getOutputStream()
+
+            if (relay.scheme == "socks5") {
+                val hasAuth = relay.username.isNotEmpty() || relay.password.isNotEmpty()
+                val greet = if (hasAuth) byteArrayOf(0x05, 0x02, 0x00, 0x02) else byteArrayOf(0x05, 0x01, 0x00)
+                out.write(greet)
+                out.flush()
+                val choice = readExactBytes(input, 2)
+                if (choice[0].toInt() != 0x05) throw IOException("SOCKS5 bad version")
+                val method = choice[1].toInt() and 0xFF
+                if (method == 0x02) {
+                    val u = relay.username.toByteArray(Charsets.UTF_8).take(255).toByteArray()
+                    val p = relay.password.toByteArray(Charsets.UTF_8).take(255).toByteArray()
+                    val auth = ByteArray(3 + u.size + p.size)
+                    auth[0] = 0x01
+                    auth[1] = u.size.toByte()
+                    System.arraycopy(u, 0, auth, 2, u.size)
+                    auth[2 + u.size] = p.size.toByte()
+                    System.arraycopy(p, 0, auth, 3 + u.size, p.size)
+                    out.write(auth)
+                    out.flush()
+                    val authReply = readExactBytes(input, 2)
+                    if (authReply[1].toInt() != 0x00) throw IOException("SOCKS5 auth rejected")
+                } else if (method != 0x00) {
+                    throw IOException("SOCKS5 unsupported auth method: $method")
+                }
+
+                val ipv4 = IpPackets.parseIpLiteral(dstHostOrIp)
+                val req = if (ipv4 != null) {
+                    val ipB = IpPackets.ipToBytes(ipv4)
+                    byteArrayOf(
+                        0x05, 0x01, 0x00, 0x01,
+                        ipB[0], ipB[1], ipB[2], ipB[3],
+                        ((dstPort ushr 8) and 0xFF).toByte(),
+                        (dstPort and 0xFF).toByte(),
+                    )
+                } else {
+                    val hostB = dstHostOrIp.toByteArray(Charsets.UTF_8)
+                    if (hostB.isEmpty() || hostB.size > 255) throw IOException("SOCKS5 bad host")
+                    ByteArray(7 + hostB.size).also { b ->
+                        b[0] = 0x05; b[1] = 0x01; b[2] = 0x00; b[3] = 0x03
+                        b[4] = hostB.size.toByte()
+                        System.arraycopy(hostB, 0, b, 5, hostB.size)
+                        b[5 + hostB.size] = ((dstPort ushr 8) and 0xFF).toByte()
+                        b[6 + hostB.size] = (dstPort and 0xFF).toByte()
+                    }
+                }
+                out.write(req)
+                out.flush()
+                val hdr = readExactBytes(input, 4)
+                if (hdr[0].toInt() != 0x05 || hdr[1].toInt() != 0x00) {
+                    throw IOException("SOCKS5 CONNECT failed: rep=${hdr[1].toInt() and 0xFF}")
+                }
+                when (hdr[3].toInt() and 0xFF) {
+                    0x01 -> readExactBytes(input, 6)
+                    0x03 -> {
+                        val dLen = readExactBytes(input, 1)[0].toInt() and 0xFF
+                        readExactBytes(input, dLen + 2)
+                    }
+                    0x04 -> readExactBytes(input, 18)
+                    else -> throw IOException("SOCKS5 unknown ATYP")
+                }
+            } else {
+                val target = "$dstHostOrIp:$dstPort"
+                val sb = StringBuilder()
+                sb.append("CONNECT ").append(target).append(" HTTP/1.1\r\n")
+                sb.append("Host: ").append(target).append("\r\n")
+                if (relay.username.isNotEmpty() || relay.password.isNotEmpty()) {
+                    val creds = "${relay.username}:${relay.password}".toByteArray(Charsets.UTF_8)
+                    val b64 = java.util.Base64.getEncoder().encodeToString(creds)
+                    sb.append("Proxy-Authorization: Basic ").append(b64).append("\r\n")
+                }
+                sb.append("\r\n")
+                out.write(sb.toString().toByteArray(Charsets.US_ASCII))
+                out.flush()
+                val statusLine = readHttpHeaderLine(input)
+                val code = statusLine.split(' ').getOrNull(1)?.toIntOrNull() ?: 0
+                if (code !in 200..299) {
+                    throw IOException("Proxy CONNECT failed: $statusLine")
+                }
+                while (readHttpHeaderLine(input).isNotEmpty()) { /* drain proxy response headers */ }
+            }
+            connSock.soTimeout = 90_000
+            return connSock
+        } catch (t: Throwable) {
+            runCatching { raw.close() }
+            throw t
+        }
+    }
+
+    private fun postDohViaRelay(
+        relay: ExitRelayConfig,
+        url: String,
+        wireQuery: ByteArray,
+        timeoutMs: Int,
+    ): DohResponse? {
+        val start = System.nanoTime()
+        fun rtt() = (System.nanoTime() - start) / 1000
+        val uri = runCatching { java.net.URI(url) }.getOrNull() ?: return null
+        val host = uri.host?.trim('[', ']') ?: return null
+        val port = if (uri.port > 0) uri.port else 443
+        val path = (uri.rawPath ?: "/dns-query").ifEmpty { "/dns-query" }
+        var tunnel: Socket? = null
+        var ssl: SSLSocket? = null
+        return try {
+            tunnel = openExitRelayTunnel(relay, host, port, timeoutMs)
+            val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+            ssl = sslFactory.createSocket(tunnel, host, port, true) as SSLSocket
+            val params = ssl.sslParameters
+            params.endpointIdentificationAlgorithm = "HTTPS"
+            ssl.sslParameters = params
+            ssl.soTimeout = timeoutMs
+            ssl.startHandshake()
+
+            val hostHeader = if (host.contains(':')) "[$host]" else host
+            val head = "POST $path HTTP/1.1\r\nHost: $hostHeader\r\n" +
+                "Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n" +
+                "Content-Length: ${wireQuery.size}\r\nConnection: close\r\n\r\n"
+            val out = ssl.outputStream
+            out.write(head.toByteArray(Charsets.US_ASCII))
+            out.write(wireQuery)
+            out.flush()
+
+            val input = java.io.BufferedInputStream(ssl.inputStream)
+            val statusLine = readHttpHeaderLine(input)
+            val status = statusLine.split(' ').getOrNull(1)?.toIntOrNull() ?: return null
+            val headers = HashMap<String, String>()
+            while (true) {
+                val line = readHttpHeaderLine(input)
+                if (line.isEmpty()) break
+                val idx = line.indexOf(':')
+                if (idx > 0) headers[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
+            }
+            val respBody = if (headers["transfer-encoding"].orEmpty().contains("chunked", ignoreCase = true)) {
+                val acc = ByteArrayOutputStream()
+                while (true) {
+                    val size = readHttpHeaderLine(input).substringBefore(';').trim().toIntOrNull(16) ?: break
+                    if (size == 0) break
+                    if (acc.size() + size > Wire.MAX_BYTES) break
+                    acc.write(readExactBytes(input, size))
+                    readHttpHeaderLine(input)
+                }
+                acc.toByteArray()
+            } else {
+                val len = headers["content-length"]?.toIntOrNull() ?: return null
+                if (len < 12 || len > Wire.MAX_BYTES) return null
+                readExactBytes(input, len)
+            }
+            val type = headers["content-type"].orEmpty()
+            if (status == 200 && type.startsWith("application/dns-message") && respBody.size >= 12) {
+                DohResponse(1, rtt(), EncProtocol.DOH, respBody)
+            } else {
+                DohResponse(6, rtt(), EncProtocol.DOH, null)
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            runCatching { ssl?.close() }
+            runCatching { tunnel?.close() }
+        }
+    }
+
     private fun dispatchPacket(raw: ByteArray) {
         if (raw.isNotEmpty() && ((raw[0].toInt() ushr 4) and 0x0F) == 6) {
             // IPv6 is not bridged: answer immediately so dual-stack apps switch to IPv4 without leak.
@@ -2391,8 +2721,12 @@ class TunBridge(
                     // so ISP SNI/ECH inspection cannot drop the session.
                     quicFallbacks.incrementAndGet()
                     IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
-                } else if (hardenStunLeaks && IpPackets.isStunBindingRequest(udp.payload)) {
-                    // Prevent WebRTC/STUN IP discovery probes from exposing local/ISP IP addresses.
+                } else if (hardenStunLeaks && (IpPackets.isStunBindingRequest(udp.payload) || IpPackets.isLeakRiskUdpPort(udp.dstPort))) {
+                    // Prevent WebRTC/STUN/mDNS/SSDP IP discovery probes from exposing local/ISP IP addresses.
+                    leaksBlocked.incrementAndGet()
+                    IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
+                } else if (exitRelay != null && strictKillSwitch) {
+                    // Never leak direct UDP datagrams around the TCP Exit Relay when Kill Switch is active.
                     leaksBlocked.incrementAndGet()
                     IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
                 } else {
@@ -2401,7 +2735,27 @@ class TunBridge(
             }
             IpPackets.PROTO_TCP -> {
                 val tcp = IpPackets.parseTcp(raw, ip) ?: return
-                handleTcp(tcp)
+                val blockLeakTcp = (hardenStunLeaks && IpPackets.isLeakRiskTcpPort(tcp.dstPort)) ||
+                    (strictKillSwitch && (tcp.dstPort == 853 || tcp.dstPort == 53))
+                if (blockLeakTcp) {
+                    if ((tcp.flags and IpPackets.TCP_RST) == 0) {
+                        leaksBlocked.incrementAndGet()
+                        val ackNum = (tcp.seq + maxOf(1, tcp.payload.size) + if ((tcp.flags and IpPackets.TCP_SYN) != 0) 1 else 0) and 0xFFFFFFFFL
+                        writeTun(
+                            IpPackets.buildIpv4Tcp(
+                                srcIp = tcp.ip.dstIp,
+                                dstIp = tcp.ip.srcIp,
+                                srcPort = tcp.dstPort,
+                                dstPort = tcp.srcPort,
+                                seq = 0L,
+                                ack = ackNum,
+                                flags = IpPackets.TCP_RST or IpPackets.TCP_ACK,
+                            ),
+                        )
+                    }
+                } else {
+                    handleTcp(tcp)
+                }
             }
         }
     }
@@ -2435,13 +2789,11 @@ class TunBridge(
 
     private fun resolveDnsQuery(query: ByteArray, @Suppress("UNUSED_PARAMETER") requestedServerIp: Int): ByteArray? {
         if (query.size < 12) return null
+        val qname = IpPackets.parseDnsQuestionName(query)
         // 0) Privacy & Tracker Shield sinkhole before leaving the device
-        if (blockTrackers) {
-            val qname = IpPackets.parseDnsQuestionName(query)
-            if (qname != null && IpPackets.isTrackerOrAdDomain(qname)) {
-                trackersBlocked.incrementAndGet()
-                return IpPackets.buildDnsNxdomain(query)
-            }
+        if (blockTrackers && qname != null && IpPackets.isTrackerOrAdDomain(qname)) {
+            trackersBlocked.incrementAndGet()
+            return IpPackets.buildDnsNxdomain(query)
         }
         // 1) TTL-bounded cache keyed by the query without its ID
         val cacheKey = query.copyOfRange(2, query.size).joinToString("") { "%02x".format(it) }
@@ -2454,18 +2806,50 @@ class TunBridge(
             dnsCache.remove(cacheKey)
         }
         fun remember(msg: ByteArray): ByteArray {
+            if (qname != null) {
+                IpPackets.dnsAnswerAddresses(msg)?.forEach { a ->
+                    if (a.size == 4) {
+                        val ipInt = ((a[0].toInt() and 0xFF) shl 24) or
+                            ((a[1].toInt() and 0xFF) shl 16) or
+                            ((a[2].toInt() and 0xFF) shl 8) or
+                            (a[3].toInt() and 0xFF)
+                        if (dnsIpToHost.size > 1024) dnsIpToHost.clear()
+                        dnsIpToHost[ipInt] = qname
+                    }
+                }
+            }
             val ttl = (IpPackets.dnsMinTtl(msg) ?: 30L).coerceIn(10L, 600L)
             if (dnsCache.size > 2048) dnsCache.clear()
             dnsCache[cacheKey] = (now + ttl * 1000L) to msg
             return withId(msg, query)
         }
-        // 2) Encrypted DNS (RFC 8484, ID 0) with Happy Eyeballs parallel racing on top 2 resolvers
-        val client = dohClient
+        // 2) Encrypted DNS (RFC 8484, ID 0) — via Exit Relay first if active, else Happy Eyeballs parallel racing
         val endpoints = dohEndpoints.filter(Doh::validEndpoint)
+        val dohWire = query.copyOf().also { it[0] = 0; it[1] = 0 }
+        val relay = exitRelay
+        if (relay != null && endpoints.isNotEmpty()) {
+            val first = preferredDoh.coerceIn(0, endpoints.size - 1)
+            for (k in endpoints.indices) {
+                val idx = (first + k) % endpoints.size
+                val resp = postDohViaRelay(relay, endpoints[idx], dohWire, 3500) ?: continue
+                val body = resp.body
+                if (resp.transport == 1 && body != null && body.size >= 12) {
+                    if (IpPackets.containsPoisonedDns(body)) {
+                        poisonedDnsBlocked.incrementAndGet()
+                        continue
+                    }
+                    preferredDoh = idx
+                    dohResolved.incrementAndGet()
+                    return remember(body)
+                }
+            }
+            if (strictKillSwitch) {
+                leaksBlocked.incrementAndGet()
+                return null
+            }
+        }
+        val client = dohClient
         if (client != null && endpoints.isNotEmpty()) {
-            val dohWire = query.copyOf()
-            dohWire[0] = 0
-            dohWire[1] = 0
             val first = preferredDoh.coerceIn(0, endpoints.size - 1)
             val tried = HashSet<Int>(2)
             if (endpoints.size >= 2) {
@@ -2790,28 +3174,37 @@ class TunBridge(
                             }
                             helloBuf = null
                             firstPayloadDone = true
-                            val packet = IpPackets.buildIpv4Tcp(
-                                srcIp = key.srcIp, dstIp = key.dstIp, srcPort = key.srcPort, dstPort = key.dstPort,
-                                seq = 1L, ack = 1L, flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = data,
-                            )
-                            val res = runCatching { session.desyncPacket(packet, desyncConfig) }.getOrNull()
-                            val nativeChunks = IpPackets.extractOrderedStreamChunks(packet, data, res)
-                            val chunks = IpPackets.planFirstPayload(data, nativeChunks)
-                            if (chunks.size > 1) {
-                                desyncedFlows.incrementAndGet()
+                            val cleanData = IpPackets.stripPlainHttpClientIpHeaders(data)
+                            if (cleanData !== data) {
+                                leaksBlocked.incrementAndGet()
                             }
-                            if (isTls && chunks.size > 1 && chunks.all { it.size >= 5 && (it[0].toInt() and 0xFF) == 0x16 }) {
-                                tlsRecordFragmented.incrementAndGet()
-                            }
-                            if (desyncConfig.mode == DesyncMode.REALITY_VISION && isTls) {
-                                visionSpliced = true
-                                visionSplicedFlows.incrementAndGet()
-                            }
-                            for (i in chunks.indices) {
-                                out.write(chunks[i])
+                            if (exitRelay != null) {
+                                out.write(cleanData)
                                 out.flush()
-                                if (i < chunks.size - 1) {
-                                    try { Thread.sleep(3) } catch (_: InterruptedException) { break }
+                            } else {
+                                val packet = IpPackets.buildIpv4Tcp(
+                                    srcIp = key.srcIp, dstIp = key.dstIp, srcPort = key.srcPort, dstPort = key.dstPort,
+                                    seq = 1L, ack = 1L, flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = cleanData,
+                                )
+                                val res = runCatching { session.desyncPacket(packet, desyncConfig) }.getOrNull()
+                                val nativeChunks = IpPackets.extractOrderedStreamChunks(packet, cleanData, res)
+                                val chunks = IpPackets.planFirstPayload(cleanData, nativeChunks)
+                                if (chunks.size > 1) {
+                                    desyncedFlows.incrementAndGet()
+                                }
+                                if (isTls && chunks.size > 1 && chunks.all { it.size >= 5 && (it[0].toInt() and 0xFF) == 0x16 }) {
+                                    tlsRecordFragmented.incrementAndGet()
+                                }
+                                if (desyncConfig.mode == DesyncMode.REALITY_VISION && isTls) {
+                                    visionSpliced = true
+                                    visionSplicedFlows.incrementAndGet()
+                                }
+                                for (i in chunks.indices) {
+                                    out.write(chunks[i])
+                                    out.flush()
+                                    if (i < chunks.size - 1) {
+                                        try { Thread.sleep(3) } catch (_: InterruptedException) { break }
+                                    }
                                 }
                             }
                         } else {
@@ -2833,21 +3226,40 @@ class TunBridge(
         }
 
         private fun connectAndPump() {
-            val sock = Socket()
+            var pendingSock: Socket? = null
             try {
-                sock.bind(null)
-                protectSocket(sock)
-                sock.tcpNoDelay = true
-                runCatching { sock.trafficClass = 0x10 }
-                runCatching { sock.receiveBufferSize = 65536; sock.sendBufferSize = 65536 }
-                runCatching { sock.keepAlive = true }
-                sock.soTimeout = 90_000
-                val dstInet = if (key.dstIp == virtualDnsIp) {
-                    InetAddress.getByName(upstreamDnsServers.firstOrNull()?.substringBefore(':') ?: "1.1.1.1")
-                } else {
-                    InetAddress.getByAddress(IpPackets.ipToBytes(key.dstIp))
+                if (key.dstIp == virtualDnsIp && strictKillSwitch) {
+                    leaksBlocked.incrementAndGet()
+                    throw IOException("Strict Kill Switch blocks plaintext TCP DNS")
                 }
-                sock.connect(InetSocketAddress(dstInet, key.dstPort), 5000)
+                val relay = exitRelay
+                val sock: Socket = if (relay != null) {
+                    val targetHost = dnsIpToHost[key.dstIp] ?: IpPackets.ipToString(key.dstIp)
+                    try {
+                        openExitRelayTunnel(relay, targetHost, key.dstPort, 6000)
+                    } catch (t: Throwable) {
+                        leaksBlocked.incrementAndGet()
+                        throw t
+                    }
+                } else {
+                    Socket().also { s ->
+                        pendingSock = s
+                        s.bind(null)
+                        protectSocket(s)
+                        s.tcpNoDelay = true
+                        runCatching { s.trafficClass = 0x10 }
+                        runCatching { s.receiveBufferSize = 65536; s.sendBufferSize = 65536 }
+                        runCatching { s.keepAlive = true }
+                        s.soTimeout = 90_000
+                        val dstInet = if (key.dstIp == virtualDnsIp) {
+                            InetAddress.getByName(upstreamDnsServers.firstOrNull()?.substringBefore(':') ?: "1.1.1.1")
+                        } else {
+                            InetAddress.getByAddress(IpPackets.ipToBytes(key.dstIp))
+                        }
+                        s.connect(InetSocketAddress(dstInet, key.dstPort), 5000)
+                    }
+                }
+                pendingSock = sock
                 if (closed.get()) {
                     runCatching { sock.close() }
                     return
@@ -2905,6 +3317,7 @@ class TunBridge(
                     }
                 }
             } catch (_: Throwable) {
+                runCatching { if (pendingSock !== upstreamSocket) pendingSock?.close() }
                 val rstSeq: Long
                 val ackNum: Long
                 synchronized(lock) {
@@ -2946,6 +3359,7 @@ class TunBridge(
             tcpTable.clear()
             udpTable.clear()
             dnsCache.clear()
+            dnsIpToHost.clear()
             ioPool.shutdownNow()
         }
     }
@@ -2983,10 +3397,12 @@ object CrashLogger {
     private const val CRASH_FILE_NAME = "freedom_crash.log"
     private const val DEBUG_FILE_NAME = "freedom_debug.log"
     private const val MAX_DEBUG_LOG_BYTES = 1024 * 1024 // 1 MB döner günlük
+    private const val MAX_MEM_LOGS = 240
 
     @Volatile private var appContext: Context? = null
     @Volatile private var isInitialized = false
     private val logLock = Any()
+    private val memLogs = ArrayDeque<String>(MAX_MEM_LOGS)
     private val dateFormat = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US).apply {
         timeZone = java.util.TimeZone.getDefault()
     }
@@ -3023,29 +3439,53 @@ object CrashLogger {
             android.util.Log.i(component, message)
         }
 
-        val ctx = appContext ?: return
+        val ctx = appContext
         try {
-            val targetDir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
-            if (!targetDir.exists()) targetDir.mkdirs()
-            val debugFile = java.io.File(targetDir, DEBUG_FILE_NAME)
             synchronized(logLock) {
-                if (debugFile.exists() && debugFile.length() > MAX_DEBUG_LOG_BYTES) {
-                    val bakFile = java.io.File(targetDir, "$DEBUG_FILE_NAME.old")
-                    if (bakFile.exists()) bakFile.delete()
-                    debugFile.renameTo(bakFile)
-                }
-                java.io.FileOutputStream(debugFile, true).use { fos ->
-                    fos.write(line.toByteArray(Charsets.UTF_8))
-                    fos.write('\n'.code)
-                    if (throwable != null) {
-                        val sw = java.io.StringWriter()
-                        throwable.printStackTrace(java.io.PrintWriter(sw))
-                        fos.write(sw.toString().toByteArray(Charsets.UTF_8))
+                if (memLogs.size >= MAX_MEM_LOGS) memLogs.removeFirst()
+                memLogs.addLast(if (throwable != null) "$line (${throwable.javaClass.simpleName}: ${throwable.message})" else line)
+
+                if (ctx != null) {
+                    val targetDir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+                    if (!targetDir.exists()) targetDir.mkdirs()
+                    val debugFile = java.io.File(targetDir, DEBUG_FILE_NAME)
+                    if (debugFile.exists() && debugFile.length() > MAX_DEBUG_LOG_BYTES) {
+                        val bakFile = java.io.File(targetDir, "$DEBUG_FILE_NAME.old")
+                        if (bakFile.exists()) bakFile.delete()
+                        debugFile.renameTo(bakFile)
                     }
-                    fos.flush()
+                    java.io.FileOutputStream(debugFile, true).use { fos ->
+                        fos.write(line.toByteArray(Charsets.UTF_8))
+                        fos.write('\n'.code)
+                        if (throwable != null) {
+                            val sw = java.io.StringWriter()
+                            throwable.printStackTrace(java.io.PrintWriter(sw))
+                            fos.write(sw.toString().toByteArray(Charsets.UTF_8))
+                        }
+                        fos.flush()
+                    }
                 }
             }
         } catch (_: Throwable) {}
+    }
+
+    fun getRecentLogs(limit: Int = 150): String {
+        val fromFile = runCatching {
+            val ctx = appContext ?: return@runCatching null
+            val candidates = listOfNotNull(
+                ctx.getExternalFilesDir(null)?.let { java.io.File(it, DEBUG_FILE_NAME) },
+                java.io.File(ctx.filesDir, DEBUG_FILE_NAME),
+            )
+            val existing = candidates.firstOrNull { it.exists() && it.length() > 0 } ?: return@runCatching null
+            synchronized(logLock) {
+                existing.readLines(Charsets.UTF_8).takeLast(limit).joinToString("\n")
+            }
+        }.getOrNull()
+        if (!fromFile.isNullOrBlank()) return fromFile
+        synchronized(logLock) {
+            if (memLogs.isNotEmpty()) return memLogs.takeLast(limit).joinToString("\n")
+        }
+        return "Henüz günlük kaydı oluşturulmadı."
     }
 
     private fun handleUncaughtException(thread: Thread, throwable: Throwable) {
@@ -3486,8 +3926,9 @@ class FreedomVpnService : VpnService() {
         val blockTrackers = intent?.getBooleanExtra(EXTRA_BLOCK_TRACKERS, true) ?: true
         val stunShield = intent?.getBooleanExtra(EXTRA_STUN_SHIELD, true) ?: true
         val quicPassthrough = intent?.getBooleanExtra(EXTRA_QUIC_PASSTHROUGH, false) ?: false
+        val exitRelay = intent?.getStringExtra(EXTRA_EXIT_RELAY)?.trim().orEmpty()
         if (running.compareAndSet(false, true)) {
-            startTunnel(customDoh, customDns, killSwitch, blockTrackers, stunShield, quicPassthrough)
+            startTunnel(customDoh, customDns, killSwitch, blockTrackers, stunShield, quicPassthrough, exitRelay)
         }
         return START_STICKY
     }
@@ -3540,10 +3981,20 @@ class FreedomVpnService : VpnService() {
         blockTrackers: Boolean,
         stunShield: Boolean,
         quicPassthrough: Boolean,
+        exitRelay: String,
     ) {
-        CrashLogger.log("FreedomVpnService", "startTunnel başlatılıyor... (doh=${customDoh.size}, killSwitch=$killSwitch, trackers=$blockTrackers, stunShield=$stunShield)")
+        val parsedRelay = ExitRelayConfig.parse(exitRelay)
+        CrashLogger.log(
+            "FreedomVpnService",
+            "startTunnel başlatılıyor... (doh=${customDoh.size}, killSwitch=$killSwitch, trackers=$blockTrackers, stunShield=$stunShield, relay=${parsedRelay?.label() ?: "yok"})",
+        )
         createNotificationChannel()
-        val notif = buildNotification("Sistem Geneli Şifreli Tünel Aktif (DoH3 + ECH/REALITY + Kalkan)")
+        val notifText = if (parsedRelay != null) {
+            "Çıkış IP Gizli (${parsedRelay.label()}) + DoH3 + Kalkan"
+        } else {
+            "Sistem Geneli DPI & DoH3 Tüneli Aktif (Kalkan)"
+        }
+        val notif = buildNotification(notifText)
         try {
             if (Build.VERSION.SDK_INT >= 34) { // Android 14+ (UPSIDE_DOWN_CAKE)
                 startForeground(NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -3565,11 +4016,15 @@ class FreedomVpnService : VpnService() {
                 .addAddress(TunBridge.VPN_CLIENT_IP, 30)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer(TunBridge.VPN_DNS_IP)
-                .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
-            builder.allowBypass()
+            if (!killSwitch) {
+                builder.allowBypass()
+            }
             val disResult = runCatching { builder.addDisallowedApplication(packageName) }
             CrashLogger.log("FreedomVpnService", "addDisallowedApplication($packageName) -> ${if (disResult.isSuccess) "başarılı" else disResult.exceptionOrNull()?.message}")
+            if (parsedRelay?.isLoopback() == true) {
+                runCatching { builder.addDisallowedApplication("org.torproject.android") }
+                runCatching { builder.addDisallowedApplication("org.torproject.android.beta") }
+            }
             // Route IPv6 into TUN so TunBridge answers with immediate ICMPv6 unreachable,
             // preventing dual-stack apps from leaking past the VPN to the ISP.
             runCatching {
@@ -3617,6 +4072,7 @@ class FreedomVpnService : VpnService() {
                     blockTrackers = blockTrackers,
                     hardenStunLeaks = stunShield,
                     logger = { tag, msg -> CrashLogger.log(tag, msg) },
+                    exitRelayUri = exitRelay,
                 )
                 bridge = b
                 ActiveBridgeHolder.current = b
@@ -3705,6 +4161,7 @@ class FreedomVpnService : VpnService() {
         const val EXTRA_BLOCK_TRACKERS = "com.freedom.network.EXTRA_BLOCK_TRACKERS"
         const val EXTRA_STUN_SHIELD = "com.freedom.network.EXTRA_STUN_SHIELD"
         const val EXTRA_QUIC_PASSTHROUGH = "com.freedom.network.EXTRA_QUIC_PASSTHROUGH"
+        const val EXTRA_EXIT_RELAY = "com.freedom.network.EXTRA_EXIT_RELAY"
         const val NOTIFICATION_CHANNEL_ID = "freedom_vpn_channel"
         const val NOTIFICATION_ID = 2026
         val isRunning = AtomicBoolean(false)
@@ -4552,10 +5009,13 @@ class MainActivity : Activity() {
     private lateinit var cardUdp: ModernMetricCard
     private lateinit var cardDns: ModernMetricCard
 
-    // 2026-2027 Security & Speed Shield Toggles
+    // 2026-2027 Security & Speed Shield Toggles + Exit Relay
     private lateinit var switchKillSwitch: Switch
     private lateinit var switchTrackerGuard: Switch
     private lateinit var switchQuicPassthrough: Switch
+    private lateinit var exitRelayInput: EditText
+    private lateinit var ipPrivacyResult: TextView
+    private lateinit var btnCheckPublicIp: Button
 
     // Tab buttons & containers
     private lateinit var tabBtnControl: TextView
@@ -4656,14 +5116,38 @@ class MainActivity : Activity() {
             throw t
         }
 
+        refreshLogViewer()
         worker.execute {
             try {
                 CrashLogger.log("MainActivity", "DiagnosticSession oluşturuluyor...")
-                session = DiagnosticSession()
+                val created = DiagnosticSession()
+                session = created
+                val initialEnv = runCatching { AndroidPlatform.environment(cm) }.getOrNull()
+                if (initialEnv != null) {
+                    runCatching { created.setEnvironment(initialEnv) }
+                    lastFingerprint = fingerprint(initialEnv)
+                }
+                val initialSummary = buildString {
+                    if (initialEnv != null) {
+                        append(Text.environment(initialEnv))
+                        appendLine()
+                    }
+                    appendLine("FREEDOM NETWORK — HAZIR DURUM ÖZETİ")
+                    appendLine("• Şifreli DNS : Çoklu DoH3/DoH (1.1.1.1, 8.8.8.8, 9.9.9.9) + Zehirli Yanıt Filtresi")
+                    appendLine("• Sansür Aşma : TLS 1.3 ECH / SNI Record Parçalama + REALITY Vision Desync")
+                    appendLine("• Gizlilik    : STUN/WebRTC/mDNS/IPv6/TCP-53 Sızıntı Kalkanı + İzleyici Engeli")
+                    appendLine("• Çıkış IP    : Çıkış Rölesi girilmezse doğrudan yerel DPI; röle (Tor/SOCKS5/HTTPS) ile maskelenir")
+                    appendLine()
+                    appendLine("Detaylı sansür ve hat testi için yukarıdaki 'Ağ Tanıla' düğmesine dokunun.")
+                }
                 CrashLogger.log("MainActivity", "DiagnosticSession hazır: v${Native.engineVersion()}")
                 ui {
                     diagStatus.text = "Motor ${Native.engineVersion()} hazır · Freedom Network 2026–2027"
                     runButton.isEnabled = true
+                    if (diagOutput.text.toString().startsWith("Tanılama henüz")) {
+                        diagOutput.text = initialSummary
+                    }
+                    refreshLogViewer()
                 }
             } catch (e: NativeException) {
                 CrashLogger.log("MainActivity", "NativeException: ${e.message}", e)
@@ -4953,6 +5437,129 @@ class MainActivity : Activity() {
         )
         panelControl.addView(shieldCard)
 
+        // Exit Relay & Public IP Masking Card (Tor/Orbot, SOCKS5, HTTP, HTTPS CONNECT)
+        val relayCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createCardShape("#0B1220", borderColor = "#1E293B", cornerDp = 14f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), dp(8), dp(4), dp(4))
+            }
+        }
+        val relayHeader = TextView(this).apply {
+            text = "ÇIKIŞ IP GİZLEME & RÖLE (TOR / SOCKS5 / HTTPS)"
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#A78BFA"))
+            setPadding(0, 0, 0, dp(4))
+        }
+        relayCard.addView(relayHeader)
+
+        val relayHintDesc = TextView(this).apply {
+            text = "DPI Aşma + DoH3 sansürü kendi hattınızda kırar. Genel IP adresinizi web sitelerinden tamamen gizlemek için Tor/Orbot veya kendi SOCKS5/HTTPS sunucunuzu girin."
+            textSize = 9.5f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, 0, 0, dp(6))
+        }
+        relayCard.addView(relayHintDesc)
+
+        exitRelayInput = EditText(this).apply {
+            setText(state?.getString(KEY_EXIT_RELAY) ?: prefs.getString(PREF_EXIT_RELAY, "") ?: "")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            textSize = 11.5f
+            setTextColor(Color.WHITE)
+            hint = "Örn: tor · socks5://127.0.0.1:9050 · https://k:s@sunucu:443"
+            setHintTextColor(Color.parseColor("#475569"))
+            background = createCardShape("#070B14", borderColor = "#1E293B", cornerDp = 8f)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    prefs.edit().putString(PREF_EXIT_RELAY, s?.toString()?.trim().orEmpty()).apply()
+                }
+            })
+        }
+        relayCard.addView(exitRelayInput)
+
+        val presetRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(6), 0, dp(6))
+            }
+        }
+        val btnPresetDirect = Button(this).apply {
+            text = "Doğrudan (DPI + DoH3)"
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#E2E8F0"))
+            background = createCardShape("#131D31", borderColor = "#1E293B", cornerDp = 8f)
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, 0, dp(4), 0)
+            }
+            setOnClickListener {
+                exitRelayInput.setText("")
+                prefs.edit().putString(PREF_EXIT_RELAY, "").apply()
+                ipPrivacyResult.text = "Mod: Doğrudan DPI & Şifreli DoH3 (hızlı hat, genel IP doğrudan operatör hattıdır)."
+            }
+        }
+        val btnPresetTor = Button(this).apply {
+            text = "Tor / Orbot (:9050)"
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#DDD6FE"))
+            background = createCardShape("#2E1065", borderColor = "#7C3AED", cornerDp = 8f)
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(4), 0, 0, 0)
+            }
+            setOnClickListener {
+                exitRelayInput.setText("socks5://127.0.0.1:9050")
+                prefs.edit().putString(PREF_EXIT_RELAY, "socks5://127.0.0.1:9050").apply()
+                ipPrivacyResult.text = "127.0.0.1:9050 (Tor/Orbot) portu kontrol ediliyor..."
+                worker.execute {
+                    val reachable = runCatching {
+                        java.net.Socket().use { sock ->
+                            sock.connect(java.net.InetSocketAddress("127.0.0.1", 9050), 900)
+                        }
+                        true
+                    }.getOrDefault(false)
+                    ui {
+                        ipPrivacyResult.text = if (reachable) {
+                            "Tor/Orbot (127.0.0.1:9050) dinlemede ve hazır! Korumayı (yeniden) başlatın."
+                        } else {
+                            "127.0.0.1:9050 kapalı — önce cihazda Orbot/Tor'u çalıştırın veya başka bir SOCKS5/HTTPS rölesi girin."
+                        }
+                    }
+                }
+            }
+        }
+        presetRow.addView(btnPresetDirect)
+        presetRow.addView(btnPresetTor)
+        relayCard.addView(presetRow)
+
+        btnCheckPublicIp = Button(this).apply {
+            text = "Genel Çıkış IP & Sızıntı Testi"
+            textSize = 10.5f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#38BDF8"))
+            background = createCardShape("#0F1B2E", borderColor = "#1D4ED8", cornerDp = 8f)
+            setPadding(dp(8), dp(7), dp(8), dp(7))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            setOnClickListener { runPublicIpLeakCheck() }
+        }
+        relayCard.addView(btnCheckPublicIp)
+
+        ipPrivacyResult = TextView(this).apply {
+            text = "Sızıntı Testi: Hazır (IPv6 Red · STUN/WebRTC Engel · TCP-53 Kill Switch etkin)"
+            textSize = 9.5f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(6), 0, 0)
+        }
+        relayCard.addView(ipPrivacyResult)
+        panelControl.addView(relayCard)
+
         // Quick Bottom Action Button
         heroActionButton = Button(this).apply {
             text = "ÖZGÜR AĞI BAŞLAT (Tam Koruma + DPI Aşma)"
@@ -4973,6 +5580,7 @@ class MainActivity : Activity() {
 
         val scrollControl = ScrollView(this).apply {
             isFillViewport = true
+            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
             addView(panelControl)
         }
         contentFrame.addView(scrollControl)
@@ -4980,7 +5588,6 @@ class MainActivity : Activity() {
         // ---------------- TAB 1: TEŞHİS PANELİ ----------------
         panelDiag = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
         }
 
         val noticeCard = TextView(this).apply {
@@ -5084,6 +5691,7 @@ class MainActivity : Activity() {
         panelDiag.addView(actRow)
 
         diagStatus = TextView(this).apply {
+            text = "Teşhis motoru başlatılıyor..."
             textSize = 11.5f
             setTextColor(Color.parseColor("#38BDF8"))
             setPadding(0, dp(2), 0, dp(6))
@@ -5123,6 +5731,7 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#E2E8F0"))
             background = createCardShape("#090D16", borderColor = "#1E293B", cornerDp = 10f)
             setPadding(dp(10), dp(10), dp(10), dp(10))
+            minLines = 6
             setTextIsSelectable(true)
             text = state?.getString(KEY_OUTPUT) ?: "Tanılama henüz çalıştırılmadı."
         }
@@ -5130,6 +5739,7 @@ class MainActivity : Activity() {
 
         val scrollDiag = ScrollView(this).apply {
             isFillViewport = true
+            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
             addView(panelDiag)
         }
         contentFrame.addView(scrollDiag)
@@ -5137,7 +5747,6 @@ class MainActivity : Activity() {
         // ---------------- TAB 2: GÜNLÜK & DEBUGGER ----------------
         panelLog = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
         }
 
         val logPathCard = LinearLayout(this).apply {
@@ -5211,13 +5820,15 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#A7F3D0"))
             background = createCardShape("#080C14", borderColor = "#1E293B", cornerDp = 10f)
             setPadding(dp(10), dp(10), dp(10), dp(10))
+            minLines = 8
             setTextIsSelectable(true)
-            text = "Günlük yükleniyor..."
+            text = CrashLogger.getRecentLogs(150)
         }
         panelLog.addView(logOutput)
 
         val scrollLog = ScrollView(this).apply {
             isFillViewport = true
+            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
             addView(panelLog)
         }
         contentFrame.addView(scrollLog)
@@ -5283,13 +5894,21 @@ class MainActivity : Activity() {
 
         val isFreedomActive = isVpn || (p?.active == true)
         if (isFreedomActive) {
-            statusPill.text = if (isVpn) {
-                "FREEDOM NETWORK AKTİF · TÜM AĞ ŞİFRELİ TÜNELDE"
+            if (isVpn) {
+                if (b?.isExitRelayActive == true) {
+                    statusPill.text = "ÇIKIŞ IP GİZLİ (${b.activeExitRelayLabel}) · DoH3 + KALKAN"
+                    statusPill.setTextColor(Color.parseColor("#10B981"))
+                    statusPill.background = createCardShape("#064E3B", borderColor = "#059669", cornerDp = 20f)
+                } else {
+                    statusPill.text = "DPI AŞMA + DoH3 AKTİF · GENEL IP DOĞRUDAN (Röle Yok)"
+                    statusPill.setTextColor(Color.parseColor("#38BDF8"))
+                    statusPill.background = createCardShape("#0B2942", borderColor = "#0284C7", cornerDp = 20f)
+                }
             } else {
-                "YEREL VEKİL AKTİF (127.0.0.1:${p?.port ?: 0})"
+                statusPill.text = "YEREL VEKİL AKTİF (127.0.0.1:${p?.port ?: 0})"
+                statusPill.setTextColor(Color.parseColor("#10B981"))
+                statusPill.background = createCardShape("#064E3B", borderColor = "#059669", cornerDp = 20f)
             }
-            statusPill.setTextColor(Color.parseColor("#10B981"))
-            statusPill.background = createCardShape("#064E3B", borderColor = "#059669", cornerDp = 20f)
 
             heroActionButton.text = "KORUMAYI DURDUR (Özgür Ağ Tünelini Kapat)"
             heroActionButton.setTextColor(Color.WHITE)
@@ -5314,18 +5933,7 @@ class MainActivity : Activity() {
 
     private fun refreshLogViewer() {
         worker.execute {
-            val path = CrashLogger.getDebugLogPath()
-            val text = try {
-                val f = java.io.File(path)
-                if (f.exists()) {
-                    val lines = f.readLines(Charsets.UTF_8)
-                    lines.takeLast(120).joinToString("\n")
-                } else {
-                    "Henüz günlük kaydı oluşturulmadı."
-                }
-            } catch (t: Throwable) {
-                "Günlük okuma hatası: ${t.message}"
-            }
+            val text = CrashLogger.getRecentLogs(150)
             ui {
                 logOutput.text = text
                 logStatus.text = "Canlı Günlük: ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())} itibarıyla güncellendi"
@@ -5371,6 +5979,7 @@ class MainActivity : Activity() {
         outState.putString(KEY_TARGETS, targets.text.toString())
         outState.putString(KEY_ALT, altDns.text.toString())
         outState.putString(KEY_DOH, dohEndpoints.text.toString())
+        outState.putString(KEY_EXIT_RELAY, exitRelayInput.text.toString())
         outState.putBoolean(KEY_AUTO, auto.isChecked)
         outState.putString(KEY_OUTPUT, diagOutput.text.toString().take(64 * 1024))
     }
@@ -5404,6 +6013,158 @@ class MainActivity : Activity() {
             diagStatus.text = "Ağ değişti (${Text.networkType(env.networkType)}); önceki sonuçlar geçersiz."
             appliedButton.isEnabled = false
             if (auto.isChecked && env.metered != YES && !busy.get()) startRun(verifyRuns = 0)
+        }
+    }
+
+    private fun readHeaderLineAscii(input: InputStream): String {
+        val sb = StringBuilder()
+        while (sb.length < 4096) {
+            val c = input.read()
+            if (c < 0) throw IOException("EOF")
+            if (c == '\n'.code) break
+            if (c != '\r'.code) sb.append(c.toChar())
+        }
+        return sb.toString()
+    }
+
+    private fun readFixedBytes(input: InputStream, n: Int): ByteArray {
+        val buf = ByteArray(n)
+        var got = 0
+        while (got < n) {
+            val r = input.read(buf, got, n - got)
+            if (r < 0) throw IOException("EOF")
+            got += r
+        }
+        return buf
+    }
+
+    private fun fetchPublicIpDirect(): String {
+        val conn = (URL("https://api.ipify.org").openConnection() as HttpsURLConnection).apply {
+            connectTimeout = 4000
+            readTimeout = 4000
+            instanceFollowRedirects = false
+        }
+        return try {
+            val code = conn.responseCode
+            if (code !in 200..299) throw IOException("HTTP $code")
+            conn.inputStream.bufferedReader(Charsets.UTF_8).readText().trim()
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun fetchPublicIpViaRelay(relay: ExitRelayConfig): String {
+        val raw = Socket()
+        var ssl: SSLSocket? = null
+        try {
+            raw.connect(InetSocketAddress(InetAddress.getByName(relay.host), relay.port), 5000)
+            raw.soTimeout = 5500
+            val tunnel: Socket = if (relay.scheme == "https") {
+                val fac = SSLSocketFactory.getDefault() as SSLSocketFactory
+                (fac.createSocket(raw, relay.host, relay.port, true) as SSLSocket).apply {
+                    sslParameters = sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
+                    startHandshake()
+                }
+            } else {
+                raw
+            }
+            val input = tunnel.getInputStream()
+            val out = tunnel.getOutputStream()
+            if (relay.scheme == "socks5") {
+                val hasAuth = relay.username.isNotEmpty() || relay.password.isNotEmpty()
+                out.write(if (hasAuth) byteArrayOf(0x05, 0x02, 0x00, 0x02) else byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                val choice = readFixedBytes(input, 2)
+                val method = choice[1].toInt() and 0xFF
+                if (method == 0x02) {
+                    val u = relay.username.toByteArray(Charsets.UTF_8).take(255).toByteArray()
+                    val p = relay.password.toByteArray(Charsets.UTF_8).take(255).toByteArray()
+                    val auth = ByteArray(3 + u.size + p.size)
+                    auth[0] = 0x01; auth[1] = u.size.toByte()
+                    System.arraycopy(u, 0, auth, 2, u.size)
+                    auth[2 + u.size] = p.size.toByte()
+                    System.arraycopy(p, 0, auth, 3 + u.size, p.size)
+                    out.write(auth); out.flush()
+                    if (readFixedBytes(input, 2)[1].toInt() != 0) throw IOException("SOCKS5 kimlik doğrulama hatası")
+                } else if (method != 0x00) {
+                    throw IOException("SOCKS5 yöntem desteklenmiyor: $method")
+                }
+                val hostB = "api.ipify.org".toByteArray(Charsets.US_ASCII)
+                val req = ByteArray(7 + hostB.size)
+                req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03; req[4] = hostB.size.toByte()
+                System.arraycopy(hostB, 0, req, 5, hostB.size)
+                req[5 + hostB.size] = ((443 ushr 8) and 0xFF).toByte()
+                req[6 + hostB.size] = (443 and 0xFF).toByte()
+                out.write(req); out.flush()
+                val hdr = readFixedBytes(input, 4)
+                if (hdr[1].toInt() != 0) throw IOException("SOCKS5 CONNECT hatası (${hdr[1].toInt() and 0xFF})")
+                when (hdr[3].toInt() and 0xFF) {
+                    0x01 -> readFixedBytes(input, 6)
+                    0x03 -> readFixedBytes(input, (readFixedBytes(input, 1)[0].toInt() and 0xFF) + 2)
+                    0x04 -> readFixedBytes(input, 18)
+                }
+            } else {
+                val sb = StringBuilder("CONNECT api.ipify.org:443 HTTP/1.1\r\nHost: api.ipify.org:443\r\n")
+                if (relay.username.isNotEmpty() || relay.password.isNotEmpty()) {
+                    val b64 = java.util.Base64.getEncoder().encodeToString("${relay.username}:${relay.password}".toByteArray(Charsets.UTF_8))
+                    sb.append("Proxy-Authorization: Basic ").append(b64).append("\r\n")
+                }
+                sb.append("\r\n")
+                out.write(sb.toString().toByteArray(Charsets.US_ASCII)); out.flush()
+                val statusLine = readHeaderLineAscii(input)
+                val code = statusLine.split(' ').getOrNull(1)?.toIntOrNull() ?: 0
+                if (code !in 200..299) throw IOException("CONNECT başarısız: $statusLine")
+                while (readHeaderLineAscii(input).isNotEmpty()) { /* drain */ }
+            }
+            val sslFac = SSLSocketFactory.getDefault() as SSLSocketFactory
+            ssl = sslFac.createSocket(tunnel, "api.ipify.org", 443, true) as SSLSocket
+            ssl.sslParameters = ssl.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
+            ssl.soTimeout = 5500
+            ssl.startHandshake()
+            ssl.outputStream.write("GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
+            ssl.outputStream.flush()
+            val sIn = ssl.inputStream
+            readHeaderLineAscii(sIn)
+            while (readHeaderLineAscii(sIn).isNotEmpty()) { /* drain headers */ }
+            return sIn.bufferedReader(Charsets.UTF_8).readText().trim()
+        } finally {
+            runCatching { ssl?.close() }
+            runCatching { raw.close() }
+        }
+    }
+
+    private fun runPublicIpLeakCheck() {
+        val relayRaw = exitRelayInput.text.toString().trim()
+        val relay = ExitRelayConfig.parse(relayRaw)
+        btnCheckPublicIp.isEnabled = false
+        ipPrivacyResult.text = "Çıkış IP ve sızıntı kalkanı test ediliyor..."
+        CrashLogger.log("MainActivity", "Genel Çıkış IP & Sızıntı testi başlatıldı (relay=${relay?.label() ?: "yok"})")
+        worker.execute {
+            val directRes = runCatching { fetchPublicIpDirect() }
+            val relayRes = if (relay != null) runCatching { fetchPublicIpViaRelay(relay) } else null
+            val b = ActiveBridgeHolder.current
+            val summary = buildString {
+                if (relay != null && relayRes != null) {
+                    val maskedIp = relayRes.getOrNull()
+                    if (maskedIp != null) {
+                        append("GİZLİ ÇIKIŞ IP (Röle): $maskedIp")
+                    } else {
+                        append("Röle Hatası (${relay.label()}): ${relayRes.exceptionOrNull()?.message ?: "bağlanılamadı"}")
+                    }
+                    directRes.getOrNull()?.let { append(" · Doğrudan Hat IP: $it") }
+                } else {
+                    val dirIp = directRes.getOrNull() ?: "ölçülemedi (${directRes.exceptionOrNull()?.message})"
+                    append("Doğrudan Hat IP: $dirIp · DPI + DoH3 aktif; genel IP gizlemek için Tor/SOCKS5 rölesi girin")
+                }
+                if (b != null) {
+                    append("\nKalkan Sayaçları: IPv6 Red=${b.ipv6Rejected.get()} · Sızıntı/STUN/Port Engel=${b.leaksBlocked.get()} · Zehirli DNS=${b.poisonedDnsBlocked.get()}")
+                }
+            }
+            CrashLogger.log("MainActivity", "IP Test Sonucu: $summary")
+            ui {
+                btnCheckPublicIp.isEnabled = true
+                ipPrivacyResult.text = summary
+            }
         }
     }
 
@@ -5578,9 +6339,14 @@ class MainActivity : Activity() {
         val killSwitchEnabled = switchKillSwitch.isChecked
         val trackersEnabled = switchTrackerGuard.isChecked
         val quicEnabled = switchQuicPassthrough.isChecked
+        val exitRelayStr = exitRelayInput.text.toString().trim()
+        getSharedPreferences("freedom_prefs", Context.MODE_PRIVATE).edit()
+            .putString(PREF_EXIT_RELAY, exitRelayStr)
+            .apply()
+        val exitRelayLabel = ExitRelayConfig.parse(exitRelayStr)?.label() ?: ""
         CrashLogger.log(
             "MainActivity",
-            "activateEngelsizMod çağrıldı (vpnGranted=$vpnGranted, killSwitch=$killSwitchEnabled, trackers=$trackersEnabled, quic=$quicEnabled)",
+            "activateEngelsizMod çağrıldı (vpnGranted=$vpnGranted, killSwitch=$killSwitchEnabled, trackers=$trackersEnabled, quic=$quicEnabled, relay=$exitRelayLabel)",
         )
         val dohList = ArrayList(split(dohEndpoints.text.toString()))
         val dnsList = ArrayList(split(altDns.text.toString()))
@@ -5593,6 +6359,7 @@ class MainActivity : Activity() {
                     .putExtra(FreedomVpnService.EXTRA_BLOCK_TRACKERS, trackersEnabled)
                     .putExtra(FreedomVpnService.EXTRA_STUN_SHIELD, killSwitchEnabled)
                     .putExtra(FreedomVpnService.EXTRA_QUIC_PASSTHROUGH, quicEnabled)
+                    .putExtra(FreedomVpnService.EXTRA_EXIT_RELAY, exitRelayStr)
                 startForegroundService(vpnIntent)
                 CrashLogger.log("MainActivity", "FreedomVpnService startForegroundService çağrıldı")
             }.onFailure {
@@ -5621,13 +6388,18 @@ class MainActivity : Activity() {
                     trackersBlocked = b?.trackersBlocked?.get() ?: 0,
                     leaksBlocked = b?.leaksBlocked?.get() ?: 0,
                     killSwitch = killSwitchEnabled,
+                    exitRelayLabel = exitRelayLabel,
                 )
                 ui {
                     diagOutput.text = text + "\n" + diagOutput.text.toString()
                     powerShieldView.isActive = true
                     updateDashboardMetrics(vpnGranted, next, b)
                     if (vpnGranted) {
-                        diagStatus.text = "Freedom Network etkin: Tüm Ağ (DoH3 + ECH/REALITY + UDP) + 127.0.0.1:${next.port}"
+                        diagStatus.text = if (exitRelayLabel.isNotEmpty()) {
+                            "Freedom Network etkin: Çıkış IP Gizli ($exitRelayLabel) + DoH3"
+                        } else {
+                            "Freedom Network etkin: Tüm Ağ (DoH3 + ECH/REALITY + UDP) + 127.0.0.1:${next.port}"
+                        }
                     } else {
                         diagStatus.text = "VPN izni verilmedi; yalnızca yerel proxy etkin (127.0.0.1:${next.port})"
                     }
@@ -5663,10 +6435,12 @@ class MainActivity : Activity() {
         const val KEY_TARGETS = "targets"
         const val KEY_ALT = "alt"
         const val KEY_DOH = "doh"
+        const val KEY_EXIT_RELAY = "exit_relay"
         const val KEY_AUTO = "auto"
         const val KEY_OUTPUT = "output"
         const val PREF_KILL_SWITCH = "pref_kill_switch"
         const val PREF_BLOCK_TRACKERS = "pref_block_trackers"
         const val PREF_QUIC_PASSTHROUGH = "pref_quic_passthrough"
+        const val PREF_EXIT_RELAY = "pref_exit_relay"
     }
 }
