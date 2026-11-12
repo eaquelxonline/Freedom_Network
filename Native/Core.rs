@@ -5645,7 +5645,12 @@ pub mod intel {
                 let args: Vec<i64> = match first_v4 {
                     Some(a) => {
                         let o = a.octets();
-                        vec![i64::from(o[0]), i64::from(o[1]), i64::from(o[2]), i64::from(o[3])]
+                        vec![
+                            i64::from(o[0]),
+                            i64::from(o[1]),
+                            i64::from(o[2]),
+                            i64::from(o[3]),
+                        ]
                     }
                     None => vec![],
                 };

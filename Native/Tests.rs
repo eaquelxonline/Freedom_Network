@@ -3440,10 +3440,12 @@ fn dns_poisoning_detection_and_classification() {
     assert!(!diags.is_empty());
     assert_eq!(diags[0].category, intel::Category::DnsResolutionFailure);
     assert_eq!(diags[0].confidence, 100);
-    assert!(diags[0]
-        .observations
-        .iter()
-        .any(|o| o.code == intel::Obs::DnsPoisoned));
+    assert!(
+        diags[0]
+            .observations
+            .iter()
+            .any(|o| o.code == intel::Obs::DnsPoisoned)
+    );
     assert_eq!(
         decide::recommend_desync_mode(&diags),
         desync::DesyncMode::RealityVision
