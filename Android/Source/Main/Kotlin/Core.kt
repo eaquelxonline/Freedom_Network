@@ -148,6 +148,13 @@ object Native {
     @JvmStatic external fun startProxy(handle: Long, config: ByteArray): ByteArray?
     @JvmStatic external fun stopProxy(handle: Long): Int
     @JvmStatic external fun proxyStats(handle: Long): ByteArray?
+    @JvmStatic external fun wgPublicKey(privKey: ByteArray): ByteArray?
+    @JvmStatic external fun wgCreate(privKey: ByteArray, peerPub: ByteArray): Long
+    @JvmStatic external fun wgDestroy(wgHandle: Long): Int
+    @JvmStatic external fun wgHandshakeInit(wgHandle: Long, ephPriv: ByteArray, tai64n12: ByteArray): ByteArray?
+    @JvmStatic external fun wgConsumeResponse(wgHandle: Long, pkt: ByteArray): Int
+    @JvmStatic external fun wgEncrypt(wgHandle: Long, ipPacket: ByteArray): ByteArray?
+    @JvmStatic external fun wgDecrypt(wgHandle: Long, wgPacket: ByteArray): ByteArray?
 }
 
 object Codes {
@@ -1332,16 +1339,22 @@ object Text {
         leaksBlocked: Int = 0,
         killSwitch: Boolean = false,
         exitRelayLabel: String = "",
+        ipMasked: Boolean = false,
+        maskMethodLabel: String = "",
+        devicePersonaLabel: String = "",
+        locationShieldLabel: String = "",
     ): String = buildString {
         if (!vpnActive && !p.active) {
             appendLine("FREEDOM NETWORK (SİSTEM GENELİ ÖZGÜR AĞ): Kapalı")
             return@buildString
         }
+        val activeLabel = maskMethodLabel.ifBlank { exitRelayLabel }
+        val isMaskedNow = ipMasked || (activeLabel.isNotBlank() && !activeLabel.startsWith("Doğrudan"))
         val modeDesc = if (vpnActive) {
-            if (exitRelayLabel.isNotBlank() && !exitRelayLabel.startsWith("Doğrudan")) {
-                "Sistem Geneli Şifreli Tünel + Çıkış Rölesi ($exitRelayLabel)"
+            if (isMaskedNow && activeLabel.isNotBlank()) {
+                "Sistem Geneli Gizlilik Tüneli ($activeLabel)"
             } else {
-                "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · Şifreli DoH3 + REALITY/Vision Desync + Tam UDP NAT)"
+                "Sistem Geneli TUN Köprüsü (DoH3 + REALITY/Vision Desync + Tam UDP NAT)"
             }
         } else {
             "Yerel Proxy (127.0.0.1:${p.port})"
@@ -1350,13 +1363,19 @@ object Text {
         if (p.active) {
             appendLine("  Yerel Proxy: 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         }
-        if (exitRelayLabel.isNotBlank() && !exitRelayLabel.startsWith("Doğrudan")) {
-            appendLine("  Çıkış IP   : Maskeli · Aktif Çıkış Rölesi: $exitRelayLabel")
+        if (isMaskedNow && activeLabel.isNotBlank()) {
+            appendLine("  Çıkış IP   : MASKELİ · $activeLabel")
         } else if (vpnActive) {
-            appendLine("  Çıkış IP   : Doğrudan DPI & DoH3 Modu (Genel IP'yi gizlemek için Çıkış Rölesi / Tor seçin)")
+            appendLine("  Çıkış IP   : Doğrudan (Yerel DoH3 + DPI Açık · Tünel/Röle Bağlanmadı)")
+        }
+        if (locationShieldLabel.isNotBlank()) {
+            appendLine("  Konum Kalkanı : $locationShieldLabel")
+        }
+        if (devicePersonaLabel.isNotBlank()) {
+            appendLine("  Cihaz Kimliği : $devicePersonaLabel")
         }
         appendLine("  Strateji   : ${desyncMode(p.mode)}${if (killSwitch) " · Sızdırmaz Kill Switch AKTİF" else ""}")
-        appendLine("  TUN Köprüsü: TCP $tcpFlows (Desync $desyncedFlows, TLS Kayıt Parçalama $tlsFragmented, Vision Splice $visionSplicedFlows) · Gerçek Zamanlı UDP $udpFlows (QUIC Geçişi $quicFallbacks) · DNS $dnsQueries (Şifreli DoH $dohResolved, Zehir $poisonedBlocked, İzleyici $trackersBlocked, Sızıntı Engeli $leaksBlocked)")
+        appendLine("  TUN Köprüsü: TCP $tcpFlows (Desync $desyncedFlows, TLS Parçalama $tlsFragmented, Vision $visionSplicedFlows) · UDP $udpFlows (QUIC $quicFallbacks) · DNS $dnsQueries (DoH $dohResolved, Zehir $poisonedBlocked, İzleyici $trackersBlocked, Sızıntı $leaksBlocked)")
         if (bytesUp > 0 || bytesDown > 0) {
             appendLine("  Veri Akışı : Yükleme ${bytesUp / 1024} KB · İndirme ${bytesDown / 1024} KB")
         }
@@ -1590,9 +1609,10 @@ object IpPackets {
     }
 
     /**
-     * True when a DNS response points to a known ISP block/warning page or a sinkhole:
-     * Türk Telekom / BTK `195.175.254.0/24` and `2a01:358:4014:a00::/64`, `0.0.0.0`,
-     * `127.0.0.0/8`, or the IPv6 unspecified/loopback addresses.
+     * True when a DNS response points to a known ISP block/warning page, sinkhole, or
+     * private/link-local/CGNAT DNS-rebinding target (`195.175.254.0/24`, `127/8`, `10/8`,
+     * `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `::`, `::1`, `fe80::/10`, `fc00::/7`,
+     * or `2a01:358:4014:a00::/64`).
      */
     fun containsPoisonedDns(payload: ByteArray): Boolean {
         val addrs = dnsAnswerAddresses(payload) ?: return false
@@ -1602,10 +1622,15 @@ object IpPackets {
                 val b1 = a[1].toInt() and 0xFF
                 val b2 = a[2].toInt() and 0xFF
                 if (b0 == 195 && b1 == 175 && b2 == 254) return true
-                if (b0 == 127) return true
-                if (a.all { it.toInt() == 0 }) return true
+                if (b0 == 127 || b0 == 10 || b0 == 0) return true
+                if (b0 == 172 && b1 in 16..31) return true
+                if (b0 == 192 && b1 == 168) return true
+                if (b0 == 169 && b1 == 254) return true
+                if (b0 == 100 && b1 in 64..127) return true
             } else {
                 if (a.copyOfRange(0, 15).all { it.toInt() == 0 }) return true // :: and ::1
+                if (b0 == 0xFE && (a[1].toInt() and 0xC0) == 0x80) return true // fe80::/10
+                if ((b0 and 0xFE) == 0xFC) return true // fc00::/7
                 val tt = byteArrayOf(0x2a, 0x01, 0x03, 0x58, 0x40, 0x14, 0x0a, 0x00)
                 if (a.copyOfRange(0, 8).contentEquals(tt)) return true
             }
@@ -1998,6 +2023,14 @@ object IpPackets {
         return if (sb.isEmpty()) null else sb.toString()
     }
 
+    /** Extracts the DNS QTYPE (e.g. `1`=A, `28`=AAAA) from a standard DNS wire query, or null. */
+    fun parseDnsQuestionType(msg: ByteArray): Int? {
+        if (msg.size < 13 || u16(msg, 4) == 0) return null
+        val end = skipDnsName(msg, 12)
+        if (end < 13 || end + 4 > msg.size) return null
+        return u16(msg, end)
+    }
+
     /** Synthesizes a fast local NXDOMAIN DNS answer (RCODE=3) preserving query ID and question. */
     fun buildDnsNxdomain(query: ByteArray): ByteArray {
         if (query.size < 12) return query.copyOf()
@@ -2014,6 +2047,22 @@ object IpPackets {
         return out
     }
 
+    /** Synthesizes an empty NOERROR/NODATA DNS answer (ANCOUNT=0) to suppress AAAA leaks when IPv6 is unbridged. */
+    fun buildDnsNodataAaaa(query: ByteArray): ByteArray {
+        if (query.size < 12) return query.copyOf()
+        val end = skipDnsName(query, 12)
+        val qEnd = if (end in 13..(query.size - 4)) end + 4 else query.size
+        val out = ByteArray(qEnd)
+        System.arraycopy(query, 0, out, 0, qEnd)
+        out[2] = ((query[2].toInt() and 0x01) or 0x81).toByte() // QR=1, copy RD
+        out[3] = 0x80.toByte() // RA=1, RCODE=0 (NOERROR, NODATA)
+        out[4] = 0; out[5] = if (qEnd > 12) 1 else 0
+        out[6] = 0; out[7] = 0
+        out[8] = 0; out[9] = 0
+        out[10] = 0; out[11] = 0
+        return out
+    }
+
     private val TRACKER_SUFFIXES = arrayOf(
         "doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
         "analytics.google.com", "adservice.google.com", "app-measurement.com", "appsflyer.com",
@@ -2021,9 +2070,15 @@ object IpPackets {
         "taboola.com", "outbrain.com", "criteo.com", "pubmatic.com", "rubiconproject.com",
         "scorecardresearch.com", "quantserve.com", "unityads.unity3d.com",
         "ads-api.tiktok.com", "analytics.tiktok.com", "ads.reddit.com", "telemetry.mozilla.org",
+        "fpjs.io", "fingerprintjs.com", "fingerprint.com", "location.services.mozilla.com",
+        "mls.services.mozilla.com", "diagmon.samsung.com", "samsungcloudsolution.com",
+        "metrics.icloud.com", "metrics.apple.com", "crashlytics.com", "firebase-settings.crashlytics.com",
+        "vortex.data.microsoft.com", "telemetry.microsoft.com", "data.mistat.xiaomi.com",
+        "tracking.miui.com", "singular.net", "kochava.com", "inmobi.com", "applovin.com",
+        "ironsrc.com", "vungle.com", "sentry.io", "datadoghq.com", "segment.io", "segment.com",
     )
 
-    /** True when [host] matches a known advertising or behavioral telemetry tracker domain. */
+    /** True when [host] matches a known advertising, fingerprinting, geo-beacon, or telemetry domain. */
     fun isTrackerOrAdDomain(host: String): Boolean {
         val h = host.lowercase().trimEnd('.')
         return TRACKER_SUFFIXES.any { s -> h == s || h.endsWith(".$s") }
@@ -2074,12 +2129,110 @@ object IpPackets {
     fun isLeakRiskTcpPort(port: Int): Boolean =
         port == 3478 || port == 3479 || port == 5349
 
+    private fun csumAdjust16(csum: Int, oldVal: Int, newVal: Int): Int {
+        var sum = (csum.inv() and 0xFFFF) + (oldVal.inv() and 0xFFFF) + (newVal and 0xFFFF)
+        sum = (sum ushr 16) + (sum and 0xFFFF)
+        sum += (sum ushr 16)
+        return sum.inv() and 0xFFFF
+    }
+
+    private fun csumAdjust32(csum: Int, oldVal: Int, newVal: Int): Int {
+        val mid = csumAdjust16(csum, (oldVal ushr 16) and 0xFFFF, (newVal ushr 16) and 0xFFFF)
+        return csumAdjust16(mid, oldVal and 0xFFFF, newVal and 0xFFFF)
+    }
+
     /**
-     * Strips privacy-leaking proxy/client-IP forwarding headers (`X-Forwarded-For`, `Forwarded`,
-     * `Via`, `X-Real-IP`, `Client-IP`, `True-Client-IP`, `CF-Connecting-IP`) from plaintext
-     * HTTP/1.x requests while leaving TLS/binary streams completely untouched.
+     * Layer-3 NAT translation on an IPv4 packet (`srcIp` and/or `dstIp`) with RFC 1624
+     * incremental IPv4 and TCP/UDP checksum updates and optional TCP SYN MSS clamping.
      */
-    fun stripPlainHttpClientIpHeaders(payload: ByteArray): ByteArray {
+    fun rewriteIpv4Nat(
+        pkt: ByteArray,
+        newSrcIp: Int? = null,
+        newDstIp: Int? = null,
+        clampMss: Int = 0,
+    ): ByteArray? {
+        val ip = parseIpv4(pkt) ?: return null
+        if (pkt.size < ip.totalLen) return null
+        val out = pkt.copyOfRange(0, ip.totalLen)
+        var ipCsum = u16(out, 10)
+        val proto = ip.proto
+        val ihl = ip.ihl
+        var l4CsumOff = -1
+        var l4Csum = 0
+        if (proto == PROTO_TCP && out.size >= ihl + 20) {
+            l4CsumOff = ihl + 16
+            l4Csum = u16(out, l4CsumOff)
+        } else if (proto == PROTO_UDP && out.size >= ihl + 8) {
+            l4CsumOff = ihl + 6
+            l4Csum = u16(out, l4CsumOff)
+        }
+
+        if (newSrcIp != null && newSrcIp != ip.srcIp) {
+            putU32(out, 12, newSrcIp.toLong() and 0xFFFFFFFFL)
+            ipCsum = csumAdjust32(ipCsum, ip.srcIp, newSrcIp)
+            if (l4CsumOff >= 0 && (proto == PROTO_TCP || l4Csum != 0)) {
+                l4Csum = csumAdjust32(l4Csum, ip.srcIp, newSrcIp)
+            }
+        }
+        if (newDstIp != null && newDstIp != ip.dstIp) {
+            putU32(out, 16, newDstIp.toLong() and 0xFFFFFFFFL)
+            ipCsum = csumAdjust32(ipCsum, ip.dstIp, newDstIp)
+            if (l4CsumOff >= 0 && (proto == PROTO_TCP || l4Csum != 0)) {
+                l4Csum = csumAdjust32(l4Csum, ip.dstIp, newDstIp)
+            }
+        }
+        if (clampMss > 0 && proto == PROTO_TCP && out.size >= ihl + 24) {
+            val dataOff = ((out[ihl + 12].toInt() ushr 4) and 0x0F) * 4
+            val flags = out[ihl + 13].toInt() and 0xFF
+            if ((flags and TCP_SYN) != 0 && dataOff >= 24 && ihl + dataOff <= out.size) {
+                var pos = ihl + 20
+                val end = ihl + dataOff
+                while (pos < end) {
+                    val kind = out[pos].toInt() and 0xFF
+                    if (kind == 0) break
+                    if (kind == 1) {
+                        pos++
+                        continue
+                    }
+                    if (pos + 1 >= end) break
+                    val optLen = out[pos + 1].toInt() and 0xFF
+                    if (optLen < 2 || pos + optLen > end) break
+                    if (kind == 2 && optLen == 4 && pos + 4 <= end) {
+                        val curMss = u16(out, pos + 2)
+                        if (curMss > clampMss) {
+                            putU16(out, pos + 2, clampMss)
+                            l4Csum = csumAdjust16(l4Csum, curMss, clampMss)
+                        }
+                        break
+                    }
+                    pos += optLen
+                }
+            }
+        }
+        putU16(out, 10, ipCsum)
+        if (l4CsumOff >= 0) {
+            if (proto == PROTO_UDP) {
+                if (u16(out, l4CsumOff) != 0) {
+                    putU16(out, l4CsumOff, if (l4Csum == 0) 0xFFFF else l4Csum)
+                }
+            } else {
+                putU16(out, l4CsumOff, l4Csum)
+            }
+        }
+        return out
+    }
+
+    /**
+     * Strips privacy-leaking IP/geo/device headers (`X-Forwarded-For`, `Forwarded`, `Via`,
+     * `X-Real-IP`, `Client-IP`, `True-Client-IP`, `CF-Connecting-IP`, `X-Geo-Location`,
+     * `X-Device-Model`, `X-Requested-With`, etc.) from plaintext HTTP/1.x requests and optionally
+     * replaces device identity headers with a synthetic future [DevicePersona].
+     */
+    fun sanitizePlainHttpHeaders(
+        payload: ByteArray,
+        persona: DevicePersona? = null,
+        stripGeoHeaders: Boolean = true,
+    ): ByteArray {
         if (payload.size < 16) return payload
         val b0 = payload[0].toInt() and 0xFF
         if (b0 < 0x41 || b0 > 0x5A) return payload // not uppercase ASCII HTTP method
@@ -2089,8 +2242,10 @@ object IpPackets {
         val headerBlock = headText.substring(0, hdrEnd)
         val lines = headerBlock.split("\r\n")
         if (lines.isEmpty() || !lines[0].contains("HTTP/1.")) return payload
+        val spoofUa = persona != null && persona != DevicePersona.OFF
         var changed = false
-        val kept = ArrayList<String>(lines.size)
+        var sawUa = false
+        val kept = ArrayList<String>(lines.size + 4)
         kept.add(lines[0])
         for (i in 1 until lines.size) {
             val line = lines[i]
@@ -2101,12 +2256,50 @@ object IpPackets {
                 lower.startsWith("x-real-ip:") ||
                 lower.startsWith("client-ip:") ||
                 lower.startsWith("true-client-ip:") ||
-                lower.startsWith("cf-connecting-ip:")
+                lower.startsWith("cf-connecting-ip:") ||
+                lower.startsWith("x-originating-ip:") ||
+                lower.startsWith("x-client-ip:") ||
+                (stripGeoHeaders && (
+                    lower.startsWith("x-geo-location:") ||
+                        lower.startsWith("x-location:") ||
+                        lower.startsWith("geo-position:")
+                    )) ||
+                (spoofUa && (
+                    lower.startsWith("x-requested-with:") ||
+                        lower.startsWith("x-device-model:") ||
+                        lower.startsWith("x-device-brand:")
+                    ))
             ) {
+                changed = true
+            } else if (spoofUa && lower.startsWith("user-agent:")) {
+                kept.add("User-Agent: ${persona!!.userAgent}")
+                sawUa = true
+                changed = true
+            } else if (spoofUa && lower.startsWith("sec-ch-ua:")) {
+                kept.add("Sec-CH-UA: ${persona!!.secChUa}")
+                changed = true
+            } else if (spoofUa && lower.startsWith("sec-ch-ua-model:")) {
+                kept.add("Sec-CH-UA-Model: ${persona!!.secChModel}")
+                changed = true
+            } else if (spoofUa && lower.startsWith("sec-ch-ua-platform:")) {
+                kept.add("Sec-CH-UA-Platform: ${persona!!.secChPlatform}")
+                changed = true
+            } else if (spoofUa && lower.startsWith("sec-ch-ua-platform-version:")) {
+                kept.add("Sec-CH-UA-Platform-Version: ${persona!!.secChPlatformVersion}")
+                changed = true
+            } else if (spoofUa && lower.startsWith("sec-ch-ua-mobile:")) {
+                kept.add("Sec-CH-UA-Mobile: ${persona!!.secChMobile}")
+                changed = true
+            } else if (stripGeoHeaders && spoofUa && lower.startsWith("accept-language:")) {
+                kept.add("Accept-Language: en-US,en;q=0.9")
                 changed = true
             } else {
                 kept.add(line)
             }
+        }
+        if (spoofUa && !sawUa) {
+            kept.add("User-Agent: ${persona!!.userAgent}")
+            changed = true
         }
         if (!changed) return payload
         val newHead = (kept.joinToString("\r\n") + "\r\n\r\n").toByteArray(Charsets.ISO_8859_1)
@@ -2116,6 +2309,75 @@ object IpPackets {
         System.arraycopy(newHead, 0, out, 0, newHead.size)
         if (bodyLen > 0) System.arraycopy(payload, bodyOff, out, newHead.size, bodyLen)
         return out
+    }
+
+    /** Backwards-compatible helper stripping forwarding/client-IP headers from HTTP/1.x payloads. */
+    fun stripPlainHttpClientIpHeaders(payload: ByteArray): ByteArray =
+        sanitizePlainHttpHeaders(payload, null, false)
+}
+
+/**
+ * Futuristic/fictional HTTP device identity profiles masking real OEM brand & OS headers on plaintext HTTP/proxy traffic.
+ */
+enum class DevicePersona(
+    val id: String,
+    val labelTr: String,
+    val shortLabel: String,
+    val userAgent: String,
+    val secChUa: String,
+    val secChModel: String,
+    val secChPlatform: String,
+    val secChPlatformVersion: String,
+    val secChMobile: String,
+) {
+    IPHONE_19_BETA(
+        id = "iphone19",
+        labelTr = "iPhone 19 Beta · iOS 21.0 (Hayalet Kimlik)",
+        shortLabel = "iPhone 19 Beta (iOS 21)",
+        userAgent = "Mozilla/5.0 (iPhone19,3; CPU iPhone OS 21_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/21.0 Mobile/25A109 Safari/604.1",
+        secChUa = "\"Safari\";v=\"21\", \"Not_A Brand\";v=\"99\"",
+        secChModel = "\"iPhone 19 Beta\"",
+        secChPlatform = "\"iOS\"",
+        secChPlatformVersion = "\"21.0.0\"",
+        secChMobile = "?1",
+    ),
+    ANDROID_19_QUANTUM(
+        id = "android19",
+        labelTr = "Android 19 Quantum · SDK 39 (Hayalet Kimlik)",
+        shortLabel = "Android 19 Quantum",
+        userAgent = "Mozilla/5.0 (Linux; Android 19; Quantum-X99) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36",
+        secChUa = "\"Chromium\";v=\"148\", \"Not_A Brand\";v=\"99\"",
+        secChModel = "\"Quantum-X99 Beta\"",
+        secChPlatform = "\"Android\"",
+        secChPlatformVersion = "\"19.0.0\"",
+        secChMobile = "?1",
+    ),
+    PIXEL_14_FUTURE(
+        id = "pixel14",
+        labelTr = "Pixel 14 Ultra · Android 19 Beta (Hayalet Kimlik)",
+        shortLabel = "Pixel 14 Ultra Prototype",
+        userAgent = "Mozilla/5.0 (Linux; Android 19; Pixel 14 Ultra Proto) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36",
+        secChUa = "\"Google Chrome\";v=\"149\", \"Not_A Brand\";v=\"99\"",
+        secChModel = "\"Pixel 14 Ultra Proto\"",
+        secChPlatform = "\"Android\"",
+        secChPlatformVersion = "\"19.0.0\"",
+        secChMobile = "?1",
+    ),
+    OFF(
+        id = "off",
+        labelTr = "Gerçek Cihaz Kimliği (Maskesiz)",
+        shortLabel = "Kapalı",
+        userAgent = "",
+        secChUa = "",
+        secChModel = "",
+        secChPlatform = "",
+        secChPlatformVersion = "",
+        secChMobile = "",
+    );
+
+    companion object {
+        fun fromId(id: String?): DevicePersona =
+            values().firstOrNull { it.id == id } ?: IPHONE_19_BETA
     }
 }
 
@@ -2338,21 +2600,539 @@ class DirectDohClient(
     }
 }
 
+/** Provisioned Cloudflare WARP WireGuard credentials (persisted locally for instant reconnect). */
+data class WarpIdentity(
+    val privateKeyB64: String,
+    val peerPublicKeyB64: String,
+    val clientIpv4: String,
+    val endpointHost: String,
+    val endpointPort: Int = 2408,
+    val deviceId: String = "",
+    val accessToken: String = "",
+    val createdAtMs: Long = System.currentTimeMillis(),
+) {
+    fun privateKeyBytes(): ByteArray? = runCatching {
+        java.util.Base64.getDecoder().decode(privateKeyB64).takeIf { it.size == 32 }
+    }.getOrNull()
+
+    fun peerPublicKeyBytes(): ByteArray? = runCatching {
+        java.util.Base64.getDecoder().decode(peerPublicKeyB64).takeIf { it.size == 32 }
+    }.getOrNull()
+
+    fun clientIpInt(): Int? = IpPackets.parseIpLiteral(clientIpv4)
+
+    fun isValid(): Boolean =
+        privateKeyBytes() != null &&
+            peerPublicKeyBytes() != null &&
+            clientIpInt() != null &&
+            endpointHost.isNotBlank() &&
+            endpointPort in 1..65535
+
+    fun serialize(): String =
+        listOf(
+            privateKeyB64,
+            peerPublicKeyB64,
+            clientIpv4,
+            endpointHost,
+            endpointPort.toString(),
+            deviceId,
+            accessToken,
+            createdAtMs.toString(),
+        ).joinToString("|")
+
+    companion object {
+        fun deserialize(raw: String?): WarpIdentity? {
+            if (raw.isNullOrBlank()) return null
+            val p = raw.split('|')
+            if (p.size < 5) return null
+            val id = WarpIdentity(
+                privateKeyB64 = p[0].trim(),
+                peerPublicKeyB64 = p[1].trim(),
+                clientIpv4 = p[2].trim(),
+                endpointHost = p[3].trim(),
+                endpointPort = p[4].trim().toIntOrNull() ?: 2408,
+                deviceId = p.getOrNull(5)?.trim().orEmpty(),
+                accessToken = p.getOrNull(6)?.trim().orEmpty(),
+                createdAtMs = p.getOrNull(7)?.trim()?.toLongOrNull() ?: 0L,
+            )
+            return if (id.isValid()) id else null
+        }
+    }
+}
+
+/** Zero-config Cloudflare WARP WireGuard account provisioner via pure Rust X25519 + TLS. */
+object WarpProvisioner {
+    private const val API_HOST = "api.cloudflareclient.com"
+    private const val API_PATH = "/v0a2158/reg"
+    private val FALLBACK_API_IPS = listOf("162.159.137.105", "162.159.138.105", "104.16.80.230")
+
+    internal fun extractJsonString(json: String, key: String, startAt: Int = 0): String? {
+        val needle = "\"$key\""
+        var idx = json.indexOf(needle, startAt)
+        while (idx >= 0) {
+            var pos = idx + needle.length
+            while (pos < json.length && json[pos].isWhitespace()) pos++
+            if (pos < json.length && json[pos] == ':') {
+                pos++
+                while (pos < json.length && json[pos].isWhitespace()) pos++
+                if (pos < json.length && json[pos] == '"') {
+                    val end = json.indexOf('"', pos + 1)
+                    if (end > pos) return json.substring(pos + 1, end)
+                }
+            }
+            idx = json.indexOf(needle, idx + needle.length)
+        }
+        return null
+    }
+
+    internal fun extractJsonBool(json: String, key: String, startAt: Int = 0): Boolean? {
+        val needle = "\"$key\""
+        var idx = json.indexOf(needle, startAt)
+        while (idx >= 0) {
+            var pos = idx + needle.length
+            while (pos < json.length && json[pos].isWhitespace()) pos++
+            if (pos < json.length && json[pos] == ':') {
+                pos++
+                while (pos < json.length && json[pos].isWhitespace()) pos++
+                if (json.startsWith("true", pos)) return true
+                if (json.startsWith("false", pos)) return false
+            }
+            idx = json.indexOf(needle, idx + needle.length)
+        }
+        return null
+    }
+
+    fun parseRegistrationJson(json: String, privKeyB64: String): WarpIdentity? {
+        val deviceId = extractJsonString(json, "id").orEmpty()
+        val token = extractJsonString(json, "token").orEmpty()
+        val addrIdx = json.indexOf("\"addresses\"")
+        val rawV4 = if (addrIdx >= 0) extractJsonString(json, "v4", addrIdx) else extractJsonString(json, "v4")
+        val clientIpv4 = rawV4?.substringBefore('/')?.trim().orEmpty()
+        val peersIdx = json.indexOf("\"peers\"")
+        val searchFrom = if (peersIdx >= 0) peersIdx else 0
+        val peerPub = extractJsonString(json, "public_key", searchFrom).orEmpty()
+        val epIdx = json.indexOf("\"endpoint\"", searchFrom)
+        val rawEndpoint = if (epIdx >= 0) extractJsonString(json, "v4", epIdx).orEmpty() else "162.159.192.1:2408"
+        val cleanEp = rawEndpoint.substringBefore('/')
+        val colon = cleanEp.lastIndexOf(':')
+        val host = if (colon > 0) cleanEp.substring(0, colon).trim('[', ']') else cleanEp.trim('[', ']')
+        val port = if (colon > 0) cleanEp.substring(colon + 1).toIntOrNull() ?: 2408 else 2408
+        val id = WarpIdentity(
+            privateKeyB64 = privKeyB64,
+            peerPublicKeyB64 = peerPub,
+            clientIpv4 = clientIpv4,
+            endpointHost = host.ifBlank { "162.159.192.1" },
+            endpointPort = if (port in 1..65535) port else 2408,
+            deviceId = deviceId,
+            accessToken = token,
+        )
+        return if (id.isValid()) id else null
+    }
+
+    private fun readHttpLine(input: InputStream): String {
+        val sb = StringBuilder()
+        while (sb.length < 8192) {
+            val c = input.read()
+            if (c < 0) throw IOException("EOF")
+            if (c == '\n'.code) break
+            if (c != '\r'.code) sb.append(c.toChar())
+        }
+        return sb.toString()
+    }
+
+    private fun readHttpExact(input: InputStream, n: Int): ByteArray {
+        val out = ByteArray(n)
+        var r = 0
+        while (r < n) {
+            val k = input.read(out, r, n - r)
+            if (k < 0) throw IOException("EOF")
+            r += k
+        }
+        return out
+    }
+
+    private fun httpsJsonRequest(
+        ip: InetAddress,
+        method: String,
+        path: String,
+        bodyJson: String,
+        bearerToken: String = "",
+        protectSocket: (Socket) -> Boolean,
+        timeoutMs: Int = 5500,
+    ): Pair<Int, String> {
+        val raw = Socket()
+        var ssl: SSLSocket? = null
+        try {
+            raw.bind(null)
+            protectSocket(raw)
+            raw.tcpNoDelay = true
+            raw.connect(InetSocketAddress(ip, 443), timeoutMs)
+            raw.soTimeout = timeoutMs
+            val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
+            ssl = factory.createSocket(raw, API_HOST, 443, true) as SSLSocket
+            val params = ssl.sslParameters
+            params.endpointIdentificationAlgorithm = "HTTPS"
+            ssl.sslParameters = params
+            ssl.startHandshake()
+
+            val bodyBytes = bodyJson.toByteArray(Charsets.UTF_8)
+            val sb = StringBuilder()
+            sb.append("$method $path HTTP/1.1\r\n")
+            sb.append("Host: $API_HOST\r\n")
+            sb.append("User-Agent: okhttp/3.12.1\r\n")
+            sb.append("Accept-Encoding: identity\r\n")
+            sb.append("Content-Type: application/json; charset=UTF-8\r\n")
+            if (bearerToken.isNotEmpty()) {
+                sb.append("Authorization: Bearer $bearerToken\r\n")
+            }
+            sb.append("Content-Length: ${bodyBytes.size}\r\n")
+            sb.append("Connection: close\r\n\r\n")
+            val out = ssl.outputStream
+            out.write(sb.toString().toByteArray(Charsets.US_ASCII))
+            out.write(bodyBytes)
+            out.flush()
+
+            val input = java.io.BufferedInputStream(ssl.inputStream)
+            val statusLine = readHttpLine(input)
+            val code = statusLine.split(' ').getOrNull(1)?.toIntOrNull() ?: 0
+            val headers = HashMap<String, String>()
+            while (true) {
+                val line = readHttpLine(input)
+                if (line.isEmpty()) break
+                val i = line.indexOf(':')
+                if (i > 0) headers[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim()
+            }
+            val respBytes = if (headers["transfer-encoding"].orEmpty().contains("chunked", ignoreCase = true)) {
+                val acc = ByteArrayOutputStream()
+                while (true) {
+                    val sz = readHttpLine(input).substringBefore(';').trim().toIntOrNull(16) ?: break
+                    if (sz == 0) break
+                    if (acc.size() + sz > 262144) break
+                    acc.write(readHttpExact(input, sz))
+                    readHttpLine(input)
+                }
+                acc.toByteArray()
+            } else {
+                val cl = headers["content-length"]?.toIntOrNull()
+                if (cl != null && cl in 0..262144) {
+                    readHttpExact(input, cl)
+                } else {
+                    val acc = ByteArrayOutputStream()
+                    val buf = ByteArray(4096)
+                    while (acc.size() < 262144) {
+                        val k = input.read(buf)
+                        if (k <= 0) break
+                        acc.write(buf, 0, k)
+                    }
+                    acc.toByteArray()
+                }
+            }
+            return code to String(respBytes, Charsets.UTF_8)
+        } finally {
+            runCatching { ssl?.close() }
+            runCatching { raw.close() }
+        }
+    }
+
+    private fun resolveApiCandidates(protectSocket: (Socket) -> Boolean): List<InetAddress> {
+        val out = ArrayList<InetAddress>()
+        runCatching {
+            DirectDohClient(protectSocket).use { doh ->
+                val q = Doh.query(API_HOST)
+                if (q != null) {
+                    val r = doh.post("https://1.1.1.1/dns-query", q, 2500)
+                    val b = r.body
+                    if (r.transport == 1 && b != null && !IpPackets.containsPoisonedDns(b)) {
+                        IpPackets.dnsAnswerAddresses(b)?.forEach { addr ->
+                            if (addr.size == 4) runCatching { out.add(InetAddress.getByAddress(addr)) }
+                        }
+                    }
+                }
+            }
+        }
+        runCatching {
+            InetAddress.getAllByName(API_HOST).forEach { a ->
+                if (a is Inet4Address && !a.isLoopbackAddress && !a.isSiteLocalAddress) out.add(a)
+            }
+        }
+        for (ipStr in FALLBACK_API_IPS) {
+            IpPackets.parseIpLiteral(ipStr)?.let { v4 ->
+                runCatching { out.add(InetAddress.getByAddress(IpPackets.ipToBytes(v4))) }
+            }
+        }
+        return out.distinct()
+    }
+
+    fun register(
+        protectSocket: (Socket) -> Boolean = { true },
+        logger: ((String, String) -> Unit)? = null,
+    ): WarpIdentity? {
+        if (!Native.available) return null
+        val priv = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        val pub = Native.wgPublicKey(priv) ?: return null
+        if (pub.size != 32) return null
+        val privB64 = java.util.Base64.getEncoder().encodeToString(priv)
+        val pubB64 = java.util.Base64.getEncoder().encodeToString(pub)
+        val df = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.000'Z'", java.util.Locale.US).apply {
+            timeZone = java.util.TimeZone.getTimeZone("UTC")
+        }
+        val tos = df.format(java.util.Date())
+        val payload = "{\"install_id\":\"\",\"tos\":\"$tos\",\"key\":\"$pubB64\",\"fcm_token\":\"\",\"type\":\"Android\",\"model\":\"PC\",\"locale\":\"en_US\"}"
+
+        val candidates = resolveApiCandidates(protectSocket)
+        for (ip in candidates) {
+            val res = runCatching {
+                httpsJsonRequest(ip, "POST", API_PATH, payload, "", protectSocket, 5000)
+            }.getOrNull() ?: continue
+            val (code, json) = res
+            if (code in 200..299 && json.isNotBlank()) {
+                val id = parseRegistrationJson(json, privB64)
+                if (id != null) {
+                    val enabled = extractJsonBool(json, "warp_enabled") ?: false
+                    if (!enabled && id.deviceId.isNotEmpty() && id.accessToken.isNotEmpty()) {
+                        runCatching {
+                            httpsJsonRequest(
+                                ip,
+                                "PATCH",
+                                "$API_PATH/${id.deviceId}",
+                                "{\"warp_enabled\":true}",
+                                id.accessToken,
+                                protectSocket,
+                                3500,
+                            )
+                        }
+                    }
+                    logger?.invoke("WarpProvisioner", "WARP hesabı hazır (${id.clientIpv4} -> ${id.endpointHost}:${id.endpointPort})")
+                    return id
+                }
+            }
+        }
+        logger?.invoke("WarpProvisioner", "WARP kaydı oluşturulamadı (tüm API adayları yanıt vermedi)")
+        return null
+    }
+}
+
+/** Pure-Rust WireGuard UDP tunnel client over `VpnService.protect()`ed `DatagramSocket`. */
+class WarpTunnel(
+    val identity: WarpIdentity,
+    private val protectDatagram: (DatagramSocket) -> Boolean = { true },
+    private val logger: ((String, String) -> Unit)? = null,
+) : AutoCloseable {
+    private val wgHandle = java.util.concurrent.atomic.AtomicLong(0L)
+    private val closed = AtomicBoolean(false)
+    @Volatile private var socket: DatagramSocket? = null
+    @Volatile var activeEndpoint: InetSocketAddress? = null
+    @Volatile var established: Boolean = false
+    @Volatile private var lastRxMs: Long = 0L
+    @Volatile private var lastTxMs: Long = 0L
+    private var recvThread: Thread? = null
+    private var keepaliveThread: Thread? = null
+
+    private fun buildTai64n(): ByteArray {
+        val nowMs = System.currentTimeMillis()
+        val secs = (nowMs / 1000L) + 4611686018427387914L
+        val nanos = ((nowMs % 1000L) * 1_000_000L).toInt()
+        val out = ByteArray(12)
+        IpPackets.putU32(out, 0, (secs ushr 32) and 0xFFFFFFFFL)
+        IpPackets.putU32(out, 4, secs and 0xFFFFFFFFL)
+        IpPackets.putU32(out, 8, nanos.toLong() and 0xFFFFFFFFL)
+        return out
+    }
+
+    private fun buildCandidates(): List<InetSocketAddress> {
+        val list = ArrayList<Pair<String, Int>>()
+        list.add(identity.endpointHost to identity.endpointPort)
+        for (p in intArrayOf(2408, 500, 4500, 1701, 894, 854)) {
+            list.add(identity.endpointHost to p)
+        }
+        list.add("162.159.192.1" to 2408)
+        list.add("162.159.193.1" to 2408)
+        list.add("162.159.192.1" to 500)
+        list.add("162.159.193.1" to 4500)
+        list.add("162.159.195.1" to 2408)
+        return list.distinct().mapNotNull { (h, p) ->
+            runCatching { InetSocketAddress(InetAddress.getByName(h), p) }.getOrNull()
+        }
+    }
+
+    fun connect(timeoutMs: Int = 3500): Boolean {
+        if (!Native.available || !identity.isValid()) return false
+        val priv = identity.privateKeyBytes() ?: return false
+        val peerPub = identity.peerPublicKeyBytes() ?: return false
+        val h = Native.wgCreate(priv, peerPub)
+        if (h <= 0L) return false
+        wgHandle.set(h)
+        val s = try {
+            DatagramSocket().also { ds ->
+                protectDatagram(ds)
+                runCatching { ds.receiveBufferSize = 262144; ds.sendBufferSize = 262144 }
+                ds.soTimeout = 500
+            }
+        } catch (t: Throwable) {
+            Native.wgDestroy(h)
+            wgHandle.set(0L)
+            return false
+        }
+        socket = s
+        val rng = java.security.SecureRandom()
+        val ephPriv = ByteArray(32).also { rng.nextBytes(it) }
+        val initPkt = Native.wgHandshakeInit(h, ephPriv, buildTai64n())
+        if (initPkt == null || initPkt.size != 148) {
+            close()
+            return false
+        }
+        val candidates = buildCandidates()
+        for (ep in candidates) {
+            runCatching { s.send(DatagramPacket(initPkt, initPkt.size, ep)) }
+        }
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val buf = ByteArray(2048)
+        while (!closed.get() && System.currentTimeMillis() < deadline) {
+            val dp = DatagramPacket(buf, buf.size)
+            val got = try {
+                s.receive(dp)
+                true
+            } catch (_: SocketTimeoutException) {
+                false
+            } catch (_: Throwable) {
+                break
+            }
+            if (!got || dp.length < 16) continue
+            val pkt = buf.copyOf(dp.length)
+            when (Native.wgConsumeResponse(h, pkt)) {
+                0 -> {
+                    activeEndpoint = dp.socketAddress as? InetSocketAddress ?: candidates.firstOrNull()
+                    established = true
+                    val now = System.currentTimeMillis()
+                    lastRxMs = now
+                    lastTxMs = now
+                    sendIpPacket(ByteArray(0))
+                    logger?.invoke(
+                        "WarpTunnel",
+                        "WARP WireGuard el sıkışması tamamlandı -> ${activeEndpoint?.hostString}:${activeEndpoint?.port}",
+                    )
+                    return true
+                }
+                1 -> {
+                    val eph2 = ByteArray(32).also { rng.nextBytes(it) }
+                    Native.wgHandshakeInit(h, eph2, buildTai64n())?.let { retryPkt ->
+                        dp.socketAddress?.let { ep ->
+                            runCatching { s.send(DatagramPacket(retryPkt, retryPkt.size, ep)) }
+                        }
+                    }
+                }
+            }
+        }
+        logger?.invoke("WarpTunnel", "WARP WireGuard UDP el sıkışması zaman aşımına uğradı")
+        close()
+        return false
+    }
+
+    fun startLoops(onDecryptedIpPacket: (ByteArray) -> Unit) {
+        val s = socket ?: return
+        runCatching { s.soTimeout = 30_000 }
+        recvThread = Thread({
+            val buf = ByteArray(4096)
+            while (!closed.get() && established) {
+                val dp = DatagramPacket(buf, buf.size)
+                try {
+                    s.receive(dp)
+                    if (dp.length < 32) continue
+                    val h = wgHandle.get()
+                    if (h <= 0L) break
+                    val dec = Native.wgDecrypt(h, buf.copyOf(dp.length)) ?: continue
+                    lastRxMs = System.currentTimeMillis()
+                    if (dec.isNotEmpty()) {
+                        onDecryptedIpPacket(dec)
+                    }
+                } catch (_: SocketTimeoutException) {
+                    if (System.currentTimeMillis() - lastRxMs > 125_000L) {
+                        rekeyOnce()
+                    }
+                } catch (_: Throwable) {
+                    if (!closed.get()) break
+                }
+            }
+        }, "freedom-wg-rx").apply {
+            isDaemon = true
+            start()
+        }
+        keepaliveThread = Thread({
+            while (!closed.get() && established) {
+                try {
+                    Thread.sleep(22_000L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (closed.get() || !established) break
+                if (System.currentTimeMillis() - lastTxMs >= 20_000L) {
+                    sendIpPacket(ByteArray(0))
+                }
+            }
+        }, "freedom-wg-keepalive").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun rekeyOnce() {
+        val h = wgHandle.get()
+        val s = socket ?: return
+        val ep = activeEndpoint ?: return
+        if (h <= 0L || closed.get()) return
+        val eph = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        val initPkt = Native.wgHandshakeInit(h, eph, buildTai64n()) ?: return
+        runCatching { s.send(DatagramPacket(initPkt, initPkt.size, ep)) }
+    }
+
+    fun sendIpPacket(ipPacket: ByteArray): Boolean {
+        val h = wgHandle.get()
+        val s = socket
+        val ep = activeEndpoint
+        if (h <= 0L || s == null || ep == null || !established || closed.get()) return false
+        val wg = Native.wgEncrypt(h, ipPacket) ?: return false
+        return try {
+            s.send(DatagramPacket(wg, wg.size, ep))
+            lastTxMs = System.currentTimeMillis()
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun reprotect() {
+        socket?.let { runCatching { protectDatagram(it) } }
+    }
+
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        established = false
+        runCatching { recvThread?.interrupt() }
+        runCatching { keepaliveThread?.interrupt() }
+        runCatching { socket?.close() }
+        socket = null
+        val h = wgHandle.getAndSet(0L)
+        if (h > 0L) runCatching { Native.wgDestroy(h) }
+    }
+}
+
 /**
- * Freedom Network User-Mode TUN -> Protected Socket Bridge (`tun2socks` + Happy Eyeballs DoH3 +
- * Privacy/Tracker Shield + Strict Kill Switch + Universal TCP/TLS/ECH Desync + Low-Latency UDP NAT).
+ * Freedom Network User-Mode TUN -> Protected Socket Bridge (`tun2socks` + Built-in Auto-WARP WireGuard +
+ * Happy Eyeballs DoH3 + Privacy/Tracker Shield + Strict Kill Switch + Universal TCP/TLS/ECH Desync +
+ * Low-Latency UDP NAT).
  *
  * Bridges raw IPv4/IPv6 packets from the TUN descriptor (`0.0.0.0/0` + `::/0`) to real outbound
- * TCP/UDP sockets protected with `VpnService.protect()`:
- * 1. **Encrypted DNS & Tracker Shield (UDP/TCP 53)**: Resolves via parallel Happy Eyeballs
- *    RFC 8484 DoH3/DoH (`DohClient`), strips ISP DNS poisoning, and optionally blocks telemetry/ad
- *    trackers (`blockTrackers`) and plaintext UDP fallback (`strictKillSwitch`).
- * 2. **Universal TCP + TLS 1.3 / ECH / PQ Desync**: Terminates the local TUN TCP handshake,
- *    fragments `SNI`/`ECH`/`Host:` across TLS records and TCP segments via the Rust+SIMD
- *    `desyncPacket` engine (`REALITY` + `X25519MLKEM768` + `xtls-rprx-vision`), with `TCP_NODELAY`
- *    and `IPTOS_LOWDELAY` socket tuning.
- * 3. **Universal UDP NAT & Leak Protection**: Maintains per-flow NAT bindings for real-time audio,
- *    video, QUIC, and interactive UDP streams, while optionally blocking STUN IP-discovery leaks.
+ * encrypted WireGuard WARP or `VpnService.protect()`ed TCP/UDP sockets:
+ * 1. **Built-in Zero-Config Public IP Masking**: Automatically provisions and connects a pure-Rust
+ *    WireGuard WARP tunnel (with Tor SOCKS5 `:9050` auto-detection and Direct DPI fallback) unless an
+ *    explicit Exit Relay is specified.
+ * 2. **Encrypted DNS & Tracker Shield (UDP/TCP 53)**: Resolves via parallel Happy Eyeballs
+ *    RFC 8484 DoH3/DoH (`DohClient`), strips ISP DNS poisoning & DNS-rebinding private answers,
+ *    suppresses unbridged `AAAA` probes, and blocks telemetry/ad/geo-beacon domains (`blockTrackers`).
+ * 3. **Universal TCP + TLS 1.3 / ECH / PQ Desync + Device Identity Spoofing**: Fragments `SNI`/`ECH`
+ *    across TLS records via Rust+SIMD `desyncPacket` in direct DPI mode and rewrites plaintext HTTP
+ *    device headers to a non-existent [DevicePersona] (`iPhone 19 Beta`, `Android 19 Quantum`).
+ * 4. **Universal UDP NAT & Leak Protection**: Routes/NATs UDP streams while blocking STUN/WebRTC/mDNS/SSDP leaks.
  */
 class TunBridge(
     private val session: DiagnosticSession,
@@ -2375,6 +3155,12 @@ class TunBridge(
     private val hardenStunLeaks: Boolean = false,
     private val logger: ((String, String) -> Unit)? = null,
     private val exitRelayUri: String = "",
+    private val autoWarp: Boolean = false,
+    private val initialWarpIdentity: WarpIdentity? = null,
+    private val devicePersona: DevicePersona = DevicePersona.OFF,
+    private val suppressIpv6Dns: Boolean = true,
+    private val onWarpIdentityReady: ((WarpIdentity) -> Unit)? = null,
+    private val onRouteChanged: ((String, Boolean) -> Unit)? = null,
 ) : AutoCloseable {
     private fun log(tag: String, msg: String) {
         logger?.invoke(tag, msg)
@@ -2382,7 +3168,16 @@ class TunBridge(
 
     private data class FlowKey(val srcIp: Int, val srcPort: Int, val dstIp: Int, val dstPort: Int)
 
-    private val exitRelay: ExitRelayConfig? = ExitRelayConfig.parse(exitRelayUri)
+    @Volatile private var activeExitRelay: ExitRelayConfig? = ExitRelayConfig.parse(exitRelayUri)
+    private val exitRelay: ExitRelayConfig? get() = activeExitRelay
+    @Volatile private var warpTunnel: WarpTunnel? = null
+    @Volatile private var warpClientIpInt: Int = 0
+    private val tunClientIpInt: Int = IpPackets.parseIpLiteral(VPN_CLIENT_IP) ?: 0x0AD7AD01
+    private val warpBootstrapping = AtomicBoolean(false)
+    @Volatile private var routeMasked: Boolean = activeExitRelay != null
+    @Volatile private var routeLabel: String = activeExitRelay?.label()
+        ?: if (autoWarp) "WARP WireGuard Bağlanıyor..." else "Doğrudan (Yerel DPI)"
+
     private val running = AtomicBoolean(false)
     private val writeLock = Any()
     private val ioPool: ExecutorService = Executors.newCachedThreadPool { r ->
@@ -2396,8 +3191,11 @@ class TunBridge(
     private val dnsCache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
     @Volatile private var preferredDoh = 0
 
-    val isExitRelayActive: Boolean get() = exitRelay != null
-    val activeExitRelayLabel: String get() = exitRelay?.label() ?: "Doğrudan (Yerel DPI)"
+    val isExitRelayActive: Boolean get() = activeExitRelay != null
+    val isWarpActive: Boolean get() = warpTunnel?.established == true
+    val isIpMasked: Boolean get() = routeMasked || isWarpActive || isExitRelayActive
+    val activeExitRelayLabel: String get() = routeLabel
+    val activeDevicePersona: DevicePersona get() = devicePersona
 
     val tcpFlows = AtomicInteger(0)
     val udpFlows = AtomicInteger(0)
@@ -2411,17 +3209,22 @@ class TunBridge(
     val tlsRecordFragmented = AtomicInteger(0)
     val dnsCacheHits = AtomicInteger(0)
     val ipv6Rejected = AtomicInteger(0)
+    val aaaaSuppressed = AtomicInteger(0)
     val trackersBlocked = AtomicInteger(0)
     val leaksBlocked = AtomicInteger(0)
+    val httpHeadersSpoofed = AtomicInteger(0)
+    val warpPacketsOut = java.util.concurrent.atomic.AtomicLong(0)
+    val warpPacketsIn = java.util.concurrent.atomic.AtomicLong(0)
     val bytesUp = java.util.concurrent.atomic.AtomicLong(0)
     val bytesDown = java.util.concurrent.atomic.AtomicLong(0)
 
     /**
      * Handles seamless Wi-Fi <-> Mobile Data (LTE/5G) roaming by refreshing ephemeral UDP NAT
-     * bindings and re-protecting active sockets without tearing down the TUN interface.
+     * bindings and re-protecting active sockets + WireGuard UDP socket without tearing down TUN.
      */
     fun rebindActiveSessions() {
         roamingRebinds.incrementAndGet()
+        warpTunnel?.reprotect()
         for (u in udpTable.values) {
             u.socket?.let { runCatching { protectDatagram(it) } }
         }
@@ -2430,12 +3233,94 @@ class TunBridge(
         }
     }
 
+    private fun isLocalPortOpen(host: String, port: Int, timeoutMs: Int = 500): Boolean = runCatching {
+        Socket().use { s ->
+            s.connect(InetSocketAddress(InetAddress.getByName(host), port), timeoutMs)
+        }
+        true
+    }.getOrDefault(false)
+
+    private fun onWarpInbound(dec: ByteArray) {
+        if (dec.size < 20 || ((dec[0].toInt() ushr 4) and 0x0F) != 4) return
+        val nat = IpPackets.rewriteIpv4Nat(dec, newDstIp = tunClientIpInt) ?: return
+        warpPacketsIn.incrementAndGet()
+        bytesDown.addAndGet(nat.size.toLong())
+        writeTun(nat)
+    }
+
+    private fun initAutoRoute() {
+        try {
+            var id = initialWarpIdentity?.takeIf { it.isValid() }
+            var freshRegistered = false
+            if (id == null) {
+                id = WarpProvisioner.register(protectSocket, logger)
+                freshRegistered = id != null
+                if (id != null) onWarpIdentityReady?.invoke(id)
+            }
+            if (id != null && running.get()) {
+                val wt = WarpTunnel(id, protectDatagram, logger)
+                if (wt.connect(3200)) {
+                    warpClientIpInt = id.clientIpInt() ?: 0
+                    warpTunnel = wt
+                    routeMasked = true
+                    routeLabel = "WARP WireGuard (${wt.activeEndpoint?.hostString ?: id.endpointHost}:${wt.activeEndpoint?.port ?: id.endpointPort})"
+                    wt.startLoops { dec -> onWarpInbound(dec) }
+                    warpBootstrapping.set(false)
+                    log("TunBridge", "Otomatik rota seçildi: $routeLabel")
+                    onRouteChanged?.invoke(routeLabel, true)
+                    return
+                }
+                wt.close()
+                if (!freshRegistered && running.get()) {
+                    val refreshed = WarpProvisioner.register(protectSocket, logger)
+                    if (refreshed != null) {
+                        onWarpIdentityReady?.invoke(refreshed)
+                        val wt2 = WarpTunnel(refreshed, protectDatagram, logger)
+                        if (wt2.connect(3200)) {
+                            warpClientIpInt = refreshed.clientIpInt() ?: 0
+                            warpTunnel = wt2
+                            routeMasked = true
+                            routeLabel = "WARP WireGuard (${wt2.activeEndpoint?.hostString ?: refreshed.endpointHost}:${wt2.activeEndpoint?.port ?: refreshed.endpointPort})"
+                            wt2.startLoops { dec -> onWarpInbound(dec) }
+                            warpBootstrapping.set(false)
+                            log("TunBridge", "Otomatik rota seçildi (yenilenen anahtar): $routeLabel")
+                            onRouteChanged?.invoke(routeLabel, true)
+                            return
+                        }
+                        wt2.close()
+                    }
+                }
+            }
+            if (running.get() && isLocalPortOpen("127.0.0.1", 9050, 450)) {
+                activeExitRelay = ExitRelayConfig("socks5", "127.0.0.1", 9050)
+                routeMasked = true
+                routeLabel = "Tor / Orbot (127.0.0.1:9050)"
+                warpBootstrapping.set(false)
+                log("TunBridge", "WARP UDP engelli; otomatik Tor/Orbot yedeğine geçildi")
+                onRouteChanged?.invoke(routeLabel, true)
+                return
+            }
+        } catch (t: Throwable) {
+            log("TunBridge", "Otomatik WARP başlatma hatası: ${t.message}")
+        } finally {
+            warpBootstrapping.set(false)
+        }
+        routeMasked = false
+        routeLabel = "Doğrudan DPI + DoH3 (IP Maskesiz)"
+        log("TunBridge", "Otomatik yedek rota: $routeLabel")
+        onRouteChanged?.invoke(routeLabel, false)
+    }
+
     fun start() {
         if (!running.compareAndSet(false, true)) return
         log(
             "TunBridge",
-            "Freedom Network TunBridge başlatıldı (DoH=${dohEndpoints.size}, relay=${activeExitRelayLabel}, killSwitch=$strictKillSwitch, trackers=$blockTrackers, stunShield=$hardenStunLeaks)",
+            "Freedom Network TunBridge başlatıldı (DoH=${dohEndpoints.size}, autoWarp=$autoWarp, relay=${activeExitRelayLabel}, persona=${devicePersona.id}, killSwitch=$strictKillSwitch, trackers=$blockTrackers, stunShield=$hardenStunLeaks)",
         )
+        if (activeExitRelay == null && autoWarp) {
+            warpBootstrapping.set(true)
+            ioPool.execute { initAutoRoute() }
+        }
         readerThread = Thread({ readLoop() }, "freedom-tun-reader").apply {
             isDaemon = true
             start()
@@ -2716,21 +3601,13 @@ class TunBridge(
                 val udp = IpPackets.parseUdp(raw, ip) ?: return
                 if (udp.dstPort == 53) {
                     handleDnsUdp(udp)
-                } else if (blockQuic && udp.dstPort == 443) {
-                    // When QUIC fallback protection is enabled, steer QUIC to fragmented TLS/TCP
-                    // so ISP SNI/ECH inspection cannot drop the session.
-                    quicFallbacks.incrementAndGet()
-                    IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
-                } else if (hardenStunLeaks && (IpPackets.isStunBindingRequest(udp.payload) || IpPackets.isLeakRiskUdpPort(udp.dstPort))) {
+                    return
+                }
+                if (hardenStunLeaks && (IpPackets.isStunBindingRequest(udp.payload) || IpPackets.isLeakRiskUdpPort(udp.dstPort))) {
                     // Prevent WebRTC/STUN/mDNS/SSDP IP discovery probes from exposing local/ISP IP addresses.
                     leaksBlocked.incrementAndGet()
                     IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
-                } else if (exitRelay != null && strictKillSwitch) {
-                    // Never leak direct UDP datagrams around the TCP Exit Relay when Kill Switch is active.
-                    leaksBlocked.incrementAndGet()
-                    IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
-                } else {
-                    handleUdp(udp)
+                    return
                 }
             }
             IpPackets.PROTO_TCP -> {
@@ -2753,9 +3630,45 @@ class TunBridge(
                             ),
                         )
                     }
-                } else {
-                    handleTcp(tcp)
+                    return
                 }
+            }
+        }
+
+        // Prevent pre-handshake real-IP leaks while automatic WARP WireGuard is negotiating.
+        if (warpBootstrapping.get()) return
+
+        // Built-in L3 WireGuard WARP route: masks public IP, encrypts all TCP/UDP/HTTP3/ICMP packets.
+        val wt = warpTunnel
+        val warpIp = warpClientIpInt
+        if (wt != null && wt.established && warpIp != 0) {
+            val natOut = IpPackets.rewriteIpv4Nat(raw, newSrcIp = warpIp, clampMss = 1240) ?: return
+            if (wt.sendIpPacket(natOut)) {
+                warpPacketsOut.incrementAndGet()
+                bytesUp.addAndGet(natOut.size.toLong())
+            }
+            return
+        }
+
+        when (ip.proto) {
+            IpPackets.PROTO_UDP -> {
+                val udp = IpPackets.parseUdp(raw, ip) ?: return
+                if (blockQuic && udp.dstPort == 443) {
+                    // When QUIC fallback protection is enabled, steer QUIC to fragmented TLS/TCP
+                    // so ISP SNI/ECH inspection cannot drop the session.
+                    quicFallbacks.incrementAndGet()
+                    IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
+                } else if (exitRelay != null && strictKillSwitch) {
+                    // Never leak direct UDP datagrams around the TCP Exit Relay when Kill Switch is active.
+                    leaksBlocked.incrementAndGet()
+                    IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
+                } else {
+                    handleUdp(udp)
+                }
+            }
+            IpPackets.PROTO_TCP -> {
+                val tcp = IpPackets.parseTcp(raw, ip) ?: return
+                handleTcp(tcp)
             }
         }
     }
@@ -2794,6 +3707,11 @@ class TunBridge(
         if (blockTrackers && qname != null && IpPackets.isTrackerOrAdDomain(qname)) {
             trackersBlocked.incrementAndGet()
             return IpPackets.buildDnsNxdomain(query)
+        }
+        // 0b) Suppress unbridged IPv6 AAAA lookups to eliminate dual-stack IPv6 leaks
+        if (suppressIpv6Dns && IpPackets.parseDnsQuestionType(query) == 28) {
+            aaaaSuppressed.incrementAndGet()
+            return IpPackets.buildDnsNodataAaaa(query)
         }
         // 1) TTL-bounded cache keyed by the query without its ID
         val cacheKey = query.copyOfRange(2, query.size).joinToString("") { "%02x".format(it) }
@@ -3174,9 +4092,16 @@ class TunBridge(
                             }
                             helloBuf = null
                             firstPayloadDone = true
-                            val cleanData = IpPackets.stripPlainHttpClientIpHeaders(data)
+                            val cleanData = IpPackets.sanitizePlainHttpHeaders(
+                                data,
+                                persona = devicePersona,
+                                stripGeoHeaders = devicePersona != DevicePersona.OFF,
+                            )
                             if (cleanData !== data) {
                                 leaksBlocked.incrementAndGet()
+                                if (devicePersona != DevicePersona.OFF) {
+                                    httpHeadersSpoofed.incrementAndGet()
+                                }
                             }
                             if (exitRelay != null) {
                                 out.write(cleanData)
@@ -3351,6 +4276,8 @@ class TunBridge(
 
     override fun close() {
         if (running.compareAndSet(true, false)) {
+            runCatching { warpTunnel?.close() }
+            warpTunnel = null
             runCatching { tunInput.close() }
             runCatching { tunOutput.close() }
             readerThread?.interrupt()
@@ -3894,10 +4821,178 @@ class AndroidDohClient(
 }
 
 /**
- * Local on-device Android VpnService that captures system-wide device traffic (`0.0.0.0/0`)
- * via a local TUN interface and bridges it to external networks through [TunBridge]:
- * - Happy Eyeballs Encrypted DNS (DoH3/DoH) + Privacy Tracker Guard + Strict Kill Switch
- * - Universal TCP/TLS 1.3 & ECH Active Desync (`SNI`/`ECH`/`Host:` segmentation)
+ * NullIslandLocationShield:
+ * When enabled and selected as the system Mock Location app in Android Developer Options,
+ * injects Null Island (0.0°, 0.0°) synthetic coordinates across GPS, Network, and API 31+ Fused
+ * providers every 2 seconds so location-seeking apps cannot read real GNSS/Wi-Fi coordinates.
+ * Fails cleanly (without crashing) if Developer Options mock permission has not yet been granted.
+ */
+object NullIslandLocationShield {
+    private val active = AtomicBoolean(false)
+    @Volatile var lastStatusText: String = "Kapalı (gerçek konum sistem kontrolünde)"
+        private set
+    @Volatile var needsDeveloperPermission: Boolean = false
+        private set
+    private var workerThread: Thread? = null
+
+    val isActive: Boolean get() = active.get()
+
+    @android.annotation.TargetApi(31)
+    private fun addAndPushProvider31(lm: android.location.LocationManager, provider: String) {
+        val props = android.location.provider.ProviderProperties.Builder()
+            .setHasAltitudeSupport(true)
+            .setHasBearingSupport(true)
+            .setHasSpeedSupport(true)
+            .setPowerUsage(android.location.provider.ProviderProperties.POWER_USAGE_LOW)
+            .setAccuracy(android.location.provider.ProviderProperties.ACCURACY_FINE)
+            .build()
+        runCatching { lm.removeTestProvider(provider) }
+        lm.addTestProvider(provider, props)
+        lm.setTestProviderEnabled(provider, true)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun addAndPushProviderLegacy(lm: android.location.LocationManager, provider: String) {
+        runCatching { lm.removeTestProvider(provider) }
+        lm.addTestProvider(
+            provider,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+            true,
+            android.location.Criteria.POWER_LOW,
+            android.location.Criteria.ACCURACY_FINE,
+        )
+        lm.setTestProviderEnabled(provider, true)
+    }
+
+    private fun pushNullIsland(lm: android.location.LocationManager, provider: String) {
+        val loc = android.location.Location(provider).apply {
+            latitude = 0.0
+            longitude = 0.0
+            altitude = 0.0
+            accuracy = 1.0f
+            bearing = 0.0f
+            speed = 0.0f
+            time = System.currentTimeMillis()
+            elapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos()
+        }
+        lm.setTestProviderLocation(provider, loc)
+    }
+
+    fun start(context: Context): Boolean {
+        if (active.get()) return true
+        val lm = context.getSystemService(android.location.LocationManager::class.java) ?: run {
+            lastStatusText = "Konum servisi bulunamadı"
+            return false
+        }
+        val providers = if (Build.VERSION.SDK_INT >= 31) {
+            listOf(
+                android.location.LocationManager.GPS_PROVIDER,
+                android.location.LocationManager.NETWORK_PROVIDER,
+                "fused",
+            )
+        } else {
+            listOf(
+                android.location.LocationManager.GPS_PROVIDER,
+                android.location.LocationManager.NETWORK_PROVIDER,
+            )
+        }
+        var registeredAny = false
+        var securityDenied = false
+        for (p in providers) {
+            try {
+                if (Build.VERSION.SDK_INT >= 31) {
+                    addAndPushProvider31(lm, p)
+                } else {
+                    addAndPushProviderLegacy(lm, p)
+                }
+                pushNullIsland(lm, p)
+                registeredAny = true
+            } catch (_: SecurityException) {
+                securityDenied = true
+            } catch (t: Throwable) {
+                CrashLogger.log("NullIslandLocationShield", "Sağlayıcı ($p) uyarısı: ${t.message}")
+            }
+        }
+        if (!registeredAny) {
+            needsDeveloperPermission = securityDenied
+            lastStatusText = if (securityDenied) {
+                "Geliştirici Seçenekleri'nden 'Sahte Konum Uygulaması' olarak Freedom Network seçin"
+            } else {
+                "Konum kalkanı başlatılamadı"
+            }
+            return false
+        }
+        needsDeveloperPermission = false
+        active.set(true)
+        lastStatusText = "Aktif · 0.0000°, 0.0000° (Null Island)"
+        CrashLogger.log("NullIslandLocationShield", "Null Island (0.0, 0.0) konum kalkanı başlatıldı")
+        workerThread = Thread({
+            while (active.get()) {
+                for (p in providers) {
+                    runCatching { pushNullIsland(lm, p) }
+                }
+                try {
+                    Thread.sleep(2000L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }, "freedom-null-island").apply {
+            isDaemon = true
+            start()
+        }
+        return true
+    }
+
+    fun stop(context: Context) {
+        if (!active.compareAndSet(true, false)) {
+            if (!needsDeveloperPermission) {
+                lastStatusText = "Kapalı (gerçek konum sistem kontrolünde)"
+            }
+            return
+        }
+        runCatching { workerThread?.interrupt() }
+        workerThread = null
+        val lm = context.getSystemService(android.location.LocationManager::class.java)
+        val providers = if (Build.VERSION.SDK_INT >= 31) {
+            listOf(
+                android.location.LocationManager.GPS_PROVIDER,
+                android.location.LocationManager.NETWORK_PROVIDER,
+                "fused",
+            )
+        } else {
+            listOf(
+                android.location.LocationManager.GPS_PROVIDER,
+                android.location.LocationManager.NETWORK_PROVIDER,
+            )
+        }
+        for (p in providers) {
+            runCatching { lm?.removeTestProvider(p) }
+        }
+        lastStatusText = "Kapalı (gerçek konum sistem kontrolünde)"
+        CrashLogger.log("NullIslandLocationShield", "Null Island konum kalkanı durduruldu")
+    }
+
+    fun openDeveloperOptions(activity: Activity) {
+        val devIntent = Intent(android.provider.Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
+        val fallbackIntent = Intent(android.provider.Settings.ACTION_SETTINGS)
+        runCatching { activity.startActivity(devIntent) }.onFailure {
+            runCatching { activity.startActivity(fallbackIntent) }
+        }
+    }
+}
+
+/**
+ * Local on-device Android VpnService that captures system-wide device traffic (`0.0.0.0/0` + `::/0`)
+ * via a local TUN interface and bridges it through [TunBridge]:
+ * - Built-in zero-config Cloudflare WARP WireGuard (auto-fallback to local Tor SOCKS5 `:9050` or Direct DPI+DoH3)
+ * - Happy Eyeballs Encrypted DNS (DoH3/DoH) + DNS-Rebinding Filter + AAAA Suppression + Privacy Tracker Guard + Strict Kill Switch
+ * - Universal TCP/TLS 1.3 & ECH Active Desync + HTTP DevicePersona / Geo-Header Sanitization
  * - Low-latency UDP NAT forwarding over `protect()`ed `DatagramSocket`s with WebRTC/STUN leak protection.
  */
 class FreedomVpnService : VpnService() {
@@ -3927,8 +5022,20 @@ class FreedomVpnService : VpnService() {
         val stunShield = intent?.getBooleanExtra(EXTRA_STUN_SHIELD, true) ?: true
         val quicPassthrough = intent?.getBooleanExtra(EXTRA_QUIC_PASSTHROUGH, false) ?: false
         val exitRelay = intent?.getStringExtra(EXTRA_EXIT_RELAY)?.trim().orEmpty()
+        val mockLocation = intent?.getBooleanExtra(EXTRA_MOCK_LOCATION, false) ?: false
+        val personaId = intent?.getStringExtra(EXTRA_PERSONA).orEmpty()
         if (running.compareAndSet(false, true)) {
-            startTunnel(customDoh, customDns, killSwitch, blockTrackers, stunShield, quicPassthrough, exitRelay)
+            startTunnel(
+                customDoh = customDoh,
+                customDns = customDns,
+                killSwitch = killSwitch,
+                blockTrackers = blockTrackers,
+                stunShield = stunShield,
+                quicPassthrough = quicPassthrough,
+                exitRelay = exitRelay,
+                mockLocation = mockLocation,
+                persona = DevicePersona.fromId(personaId),
+            )
         }
         return START_STICKY
     }
@@ -3939,7 +5046,7 @@ class FreedomVpnService : VpnService() {
             "Freedom Network Özgür Ağ Tüneli",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Freedom Network sistem geneli şifreli TUN köprüsü ve sansür kalkanı"
+            description = "Freedom Network sistem geneli şifreli TUN köprüsü ve gizlilik kalkanı"
             setShowBadge(false)
         }
         val nm = getSystemService(NotificationManager::class.java)
@@ -3973,6 +5080,19 @@ class FreedomVpnService : VpnService() {
             .build()
     }
 
+    private fun updateRouteNotification(routeLabel: String, masked: Boolean) {
+        if (!running.get()) return
+        val msg = if (masked) {
+            "IP Gizli ($routeLabel) · DoH3 + Kalkan"
+        } else {
+            "$routeLabel · Sansür Kalkanı Aktif"
+        }
+        runCatching {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.notify(NOTIFICATION_ID, buildNotification(msg))
+        }
+    }
+
     @android.annotation.SuppressLint("InlinedApi")
     private fun startTunnel(
         customDoh: List<String>,
@@ -3982,17 +5102,23 @@ class FreedomVpnService : VpnService() {
         stunShield: Boolean,
         quicPassthrough: Boolean,
         exitRelay: String,
+        mockLocation: Boolean,
+        persona: DevicePersona,
     ) {
         val parsedRelay = ExitRelayConfig.parse(exitRelay)
+        val useAutoWarp = parsedRelay == null
+        val prefs = getSharedPreferences("freedom_prefs", Context.MODE_PRIVATE)
+        val savedWarp = WarpIdentity.deserialize(prefs.getString(PREF_WARP_IDENTITY, null))
+
         CrashLogger.log(
             "FreedomVpnService",
-            "startTunnel başlatılıyor... (doh=${customDoh.size}, killSwitch=$killSwitch, trackers=$blockTrackers, stunShield=$stunShield, relay=${parsedRelay?.label() ?: "yok"})",
+            "startTunnel başlatılıyor... (autoWarp=$useAutoWarp, cachedWarp=${savedWarp != null}, persona=${persona.id}, mockLoc=$mockLocation, killSwitch=$killSwitch, trackers=$blockTrackers, stunShield=$stunShield, relay=${parsedRelay?.label() ?: "yok"})",
         )
         createNotificationChannel()
-        val notifText = if (parsedRelay != null) {
-            "Çıkış IP Gizli (${parsedRelay.label()}) + DoH3 + Kalkan"
-        } else {
-            "Sistem Geneli DPI & DoH3 Tüneli Aktif (Kalkan)"
+        val notifText = when {
+            parsedRelay != null -> "Çıkış IP Gizli (${parsedRelay.label()}) + DoH3"
+            useAutoWarp -> "WARP WireGuard Tüneli Bağlanıyor + DoH3"
+            else -> "Sistem Geneli DPI & DoH3 Tüneli Aktif"
         }
         val notif = buildNotification(notifText)
         try {
@@ -4004,6 +5130,12 @@ class FreedomVpnService : VpnService() {
             CrashLogger.log("FreedomVpnService", "startForeground başarıyla çağrıldı (Foreground Service aktif).")
         } catch (e: Throwable) {
             CrashLogger.log("FreedomVpnService", "startForeground uyarı/hata: ${e.message}", e)
+        }
+
+        if (mockLocation) {
+            NullIslandLocationShield.start(this)
+        } else {
+            NullIslandLocationShield.stop(this)
         }
 
         try {
@@ -4021,7 +5153,7 @@ class FreedomVpnService : VpnService() {
             }
             val disResult = runCatching { builder.addDisallowedApplication(packageName) }
             CrashLogger.log("FreedomVpnService", "addDisallowedApplication($packageName) -> ${if (disResult.isSuccess) "başarılı" else disResult.exceptionOrNull()?.message}")
-            if (parsedRelay?.isLoopback() == true) {
+            if (parsedRelay?.isLoopback() == true || useAutoWarp) {
                 runCatching { builder.addDisallowedApplication("org.torproject.android") }
                 runCatching { builder.addDisallowedApplication("org.torproject.android.beta") }
             }
@@ -4035,8 +5167,8 @@ class FreedomVpnService : VpnService() {
             tun = pfd
             if (pfd != null) {
                 CrashLogger.log("FreedomVpnService", "TUN arabirimi başarıyla açıldı (fd=${pfd.fd})")
-                // Sockets inside DirectDohClient and TunBridge are explicitly protected with protect(),
-                // and com.freedom.network is excluded from VPN routing via addDisallowedApplication.
+                // Sockets inside DirectDohClient, WarpProvisioner, WarpTunnel, and TunBridge are explicitly
+                // protected with protect(), and com.freedom.network is excluded via addDisallowedApplication.
                 val doh = DirectDohClient(
                     protectSocket = { sock ->
                         val ok = protect(sock)
@@ -4073,6 +5205,16 @@ class FreedomVpnService : VpnService() {
                     hardenStunLeaks = stunShield,
                     logger = { tag, msg -> CrashLogger.log(tag, msg) },
                     exitRelayUri = exitRelay,
+                    autoWarp = useAutoWarp,
+                    initialWarpIdentity = savedWarp,
+                    devicePersona = persona,
+                    suppressIpv6Dns = true,
+                    onWarpIdentityReady = { newId ->
+                        prefs.edit().putString(PREF_WARP_IDENTITY, newId.serialize()).apply()
+                    },
+                    onRouteChanged = { label, masked ->
+                        updateRouteNotification(label, masked)
+                    },
                 )
                 bridge = b
                 ActiveBridgeHolder.current = b
@@ -4123,6 +5265,7 @@ class FreedomVpnService : VpnService() {
         running.set(false)
         isRunning.set(false)
         ActiveBridgeHolder.current = null
+        NullIslandLocationShield.stop(this)
         roamingCallback?.let { cb ->
             val cm = getSystemService(ConnectivityManager::class.java)
             runCatching { cm?.unregisterNetworkCallback(cb) }
@@ -4162,6 +5305,9 @@ class FreedomVpnService : VpnService() {
         const val EXTRA_STUN_SHIELD = "com.freedom.network.EXTRA_STUN_SHIELD"
         const val EXTRA_QUIC_PASSTHROUGH = "com.freedom.network.EXTRA_QUIC_PASSTHROUGH"
         const val EXTRA_EXIT_RELAY = "com.freedom.network.EXTRA_EXIT_RELAY"
+        const val EXTRA_MOCK_LOCATION = "com.freedom.network.EXTRA_MOCK_LOCATION"
+        const val EXTRA_PERSONA = "com.freedom.network.EXTRA_PERSONA"
+        private const val PREF_WARP_IDENTITY = "pref_warp_identity"
         const val NOTIFICATION_CHANNEL_ID = "freedom_vpn_channel"
         const val NOTIFICATION_ID = 2026
         val isRunning = AtomicBoolean(false)
@@ -5009,7 +6155,18 @@ class MainActivity : Activity() {
     private lateinit var cardUdp: ModernMetricCard
     private lateinit var cardDns: ModernMetricCard
 
-    // 2026-2027 Security & Speed Shield Toggles + Exit Relay
+    // 2026-2027 Simplified Privacy Cards & Collapsible Advanced Controls
+    private lateinit var ipCardStatus: TextView
+    private lateinit var switchMockLocation: Switch
+    private lateinit var locationStatusView: TextView
+    private lateinit var btnDevOptions: Button
+    private lateinit var btnPersonaCycle: Button
+    private lateinit var personaDescView: TextView
+    private var selectedPersona: DevicePersona = DevicePersona.IPHONE_19_BETA
+    private lateinit var advancedToggleBtn: TextView
+    private lateinit var advancedContainer: LinearLayout
+    private var advancedExpanded = false
+
     private lateinit var switchKillSwitch: Switch
     private lateinit var switchTrackerGuard: Switch
     private lateinit var switchQuicPassthrough: Switch
@@ -5322,35 +6479,266 @@ class MainActivity : Activity() {
         }
         panelControl.addView(statusPill)
 
+        // 1) IP Gizliliği Kartı (Otomatik WARP WireGuard -> Tor -> Doğrudan)
+        val ipPrivacyCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createCardShape("#0B1220", borderColor = "#1E293B", cornerDp = 14f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), dp(2), dp(4), dp(6))
+            }
+        }
+        val ipCardTitle = TextView(this).apply {
+            text = "IP GİZLİLİĞİ (OTOMATİK WARP WIREGUARD)"
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#10B981"))
+        }
+        ipCardStatus = TextView(this).apply {
+            text = "Hazır · Başlatıldığında otomatik WARP WireGuard şifreli çıkışı + AAAA/WebRTC/STUN koruması devreye girer."
+            textSize = 11f
+            setTextColor(Color.parseColor("#E2E8F0"))
+            setPadding(0, dp(3), 0, 0)
+        }
+        ipPrivacyCard.addView(ipCardTitle)
+        ipPrivacyCard.addView(ipCardStatus)
+        panelControl.addView(ipPrivacyCard)
+
+        // 2) Konum Gizliliği Kartı (0.0000°, 0.0000° Null Island + Tek Dokunuş Geliştirici Ayarı)
+        val locCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createCardShape("#0B1220", borderColor = "#1E293B", cornerDp = 14f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), 0, dp(4), dp(6))
+            }
+        }
+        val locTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val locTextCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, 0, dp(8), 0)
+            }
+        }
+        val locTitle = TextView(this).apply {
+            text = "KONUM GİZLİLİĞİ (NULL ISLAND · 0.0°, 0.0°)"
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#38BDF8"))
+        }
+        locationStatusView = TextView(this).apply {
+            text = "Açıldığında GPS, Ağ ve Fused sağlayıcılara 0.0°, 0.0° (hiçbir yerde olmayan koordinat) bildirir."
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(2), 0, 0)
+        }
+        locTextCol.addView(locTitle)
+        locTextCol.addView(locationStatusView)
+
+        btnDevOptions = Button(this).apply {
+            text = "Sahte Konum Ayarını Aç"
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#FDE68A"))
+            background = createCardShape("#451A03", borderColor = "#D97706", cornerDp = 8f)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(6), 0, 0)
+            }
+            setOnClickListener {
+                NullIslandLocationShield.openDeveloperOptions(this@MainActivity)
+            }
+        }
+
+        switchMockLocation = createToggleSwitch(prefs.getBoolean(PREF_MOCK_LOCATION, false)) { v ->
+            prefs.edit().putBoolean(PREF_MOCK_LOCATION, v).apply()
+            if (v) {
+                val ok = NullIslandLocationShield.start(applicationContext)
+                locationStatusView.text = NullIslandLocationShield.lastStatusText
+                btnDevOptions.visibility = if (!ok && NullIslandLocationShield.needsDeveloperPermission) View.VISIBLE else View.GONE
+            } else {
+                NullIslandLocationShield.stop(applicationContext)
+                locationStatusView.text = NullIslandLocationShield.lastStatusText
+                btnDevOptions.visibility = View.GONE
+            }
+        }
+        locTopRow.addView(locTextCol)
+        locTopRow.addView(switchMockLocation)
+        locCard.addView(locTopRow)
+        locCard.addView(btnDevOptions)
+        panelControl.addView(locCard)
+
+        // 3) Cihaz Gizliliği Kartı (iPhone 19 Beta / Android 19 Quantum / Pixel 14 Ultra)
+        selectedPersona = DevicePersona.fromId(
+            state?.getString(KEY_PERSONA) ?: prefs.getString(PREF_PERSONA, DevicePersona.IPHONE_19_BETA.id),
+        )
+        val deviceCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createCardShape("#0B1220", borderColor = "#1E293B", cornerDp = 14f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), 0, dp(4), dp(8))
+            }
+        }
+        val devTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val devTextCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, 0, dp(8), 0)
+            }
+        }
+        val devTitle = TextView(this).apply {
+            text = "CİHAZ GİZLİLİĞİ (GELECEK KİMLİK)"
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#A78BFA"))
+        }
+        personaDescView = TextView(this).apply {
+            text = if (selectedPersona == DevicePersona.OFF) {
+                "Kapalı · Yalnızca temel IP sızıntı başlıkları temizlenir."
+            } else {
+                "Aktif Kimlik: ${selectedPersona.shortLabel} (Ağ başlıkları + OEM/telemetri engel; yerel Build.MODEL root olmadan değişmez)."
+            }
+            textSize = 10f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(2), 0, 0)
+        }
+        devTextCol.addView(devTitle)
+        devTextCol.addView(personaDescView)
+
+        btnPersonaCycle = Button(this).apply {
+            text = selectedPersona.shortLabel
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#DDD6FE"))
+            background = createCardShape("#2E1065", borderColor = "#7C3AED", cornerDp = 8f)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setOnClickListener {
+                val all = DevicePersona.entries
+                val nextIdx = (all.indexOf(selectedPersona) + 1) % all.size
+                selectedPersona = all[nextIdx]
+                prefs.edit().putString(PREF_PERSONA, selectedPersona.id).apply()
+                text = selectedPersona.shortLabel
+                personaDescView.text = if (selectedPersona == DevicePersona.OFF) {
+                    "Kapalı · Yalnızca temel IP sızıntı başlıkları temizlenir."
+                } else {
+                    "Aktif Kimlik: ${selectedPersona.shortLabel} (Ağ başlıkları + OEM/telemetri engel; yerel Build.MODEL root olmadan değişmez)."
+                }
+            }
+        }
+        devTopRow.addView(devTextCol)
+        devTopRow.addView(btnPersonaCycle)
+        deviceCard.addView(devTopRow)
+        panelControl.addView(deviceCard)
+
+        // Tek Dokunuş Genel Çıkış IP & Sızıntı Testi
+        val leakCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createCardShape("#0B1220", borderColor = "#1E293B", cornerDp = 12f)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), 0, dp(4), dp(8))
+            }
+        }
+        btnCheckPublicIp = Button(this).apply {
+            text = "Gizlilik & Sızıntı Testini Çalıştır"
+            textSize = 11f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#38BDF8"))
+            background = createCardShape("#0F1B2E", borderColor = "#1D4ED8", cornerDp = 8f)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            setOnClickListener { runPublicIpLeakCheck() }
+        }
+        ipPrivacyResult = TextView(this).apply {
+            text = "IPv6/AAAA Red · STUN/WebRTC Engel · DNS-Rebinding Filtre · HTTP Kimlik Koruma hazır"
+            textSize = 9.5f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(5), 0, 0)
+        }
+        leakCard.addView(btnCheckPublicIp)
+        leakCard.addView(ipPrivacyResult)
+        panelControl.addView(leakCard)
+
+        // Quick Hero Action Button
+        heroActionButton = Button(this).apply {
+            text = "ÖZGÜR AĞI BAŞLAT (WARP + Tam Gizlilik)"
+            textSize = 13.5f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#070B14"))
+            background = createCardShape("#10B981", cornerDp = 14f)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), dp(2), dp(4), dp(8))
+            }
+            setOnClickListener {
+                it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                toggleDesync()
+            }
+        }
+        panelControl.addView(heroActionButton)
+
+        // Collapsible "Gelişmiş Ayarlar & Canlı Trafik" Accordion
+        advancedToggleBtn = TextView(this).apply {
+            text = "Gelişmiş Ayarlar & Canlı Trafik ▾"
+            textSize = 11f
+            gravity = Gravity.CENTER
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#94A3B8"))
+            background = createCardShape("#0C1322", borderColor = "#1E293B", cornerDp = 10f)
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), dp(2), dp(4), dp(6))
+            }
+            setOnClickListener {
+                advancedExpanded = !advancedExpanded
+                advancedContainer.visibility = if (advancedExpanded) View.VISIBLE else View.GONE
+                text = if (advancedExpanded) "Gelişmiş Ayarlar & Canlı Trafik ▴" else "Gelişmiş Ayarlar & Canlı Trafik ▾"
+            }
+        }
+        panelControl.addView(advancedToggleBtn)
+
+        advancedContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+
         // Real-Time Network Speed & Throughput Waveform
         sparklineView = ThroughputSparklineView(this).apply {
             background = createCardShape("#0A101D", borderColor = "#1E293B", cornerDp = 12f)
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(84)).apply {
-                setMargins(0, 0, 0, dp(8))
+                setMargins(dp(4), 0, dp(4), dp(8))
             }
         }
-        panelControl.addView(sparklineView)
+        advancedContainer.addView(sparklineView)
 
         // 4 Live Metric Cards (2x2 Grid — Universal Censorship Bypass, Privacy & Speed)
         val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         }
-        cardTcp = ModernMetricCard(this, iconType = 0, titleText = "TCP DESYNC & SPLICE", heroColor = Color.parseColor("#10B981"))
-        cardTls = ModernMetricCard(this, iconType = 1, titleText = "TLS / ECH KALKAN", heroColor = Color.parseColor("#38BDF8"))
+        cardTcp = ModernMetricCard(this, iconType = 0, titleText = "WARP / TCP DESYNC", heroColor = Color.parseColor("#10B981"))
+        cardTls = ModernMetricCard(this, iconType = 1, titleText = "TLS / KİMLİK KALKAN", heroColor = Color.parseColor("#38BDF8"))
         row1.addView(cardTcp)
         row1.addView(cardTls)
-        panelControl.addView(row1)
+        advancedContainer.addView(row1)
 
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         }
-        cardUdp = ModernMetricCard(this, iconType = 2, titleText = "GERÇEK ZAMANLI UDP", heroColor = Color.parseColor("#A78BFA"))
-        cardDns = ModernMetricCard(this, iconType = 3, titleText = "ŞİFRELİ DoH3 / GİZLİLİK", heroColor = Color.parseColor("#FBBF24"))
+        cardUdp = ModernMetricCard(this, iconType = 2, titleText = "UDP / SIZINTI KORUMA", heroColor = Color.parseColor("#A78BFA"))
+        cardDns = ModernMetricCard(this, iconType = 3, titleText = "ŞİFRELİ DoH3 / AAAA", heroColor = Color.parseColor("#FBBF24"))
         row2.addView(cardUdp)
         row2.addView(cardDns)
-        panelControl.addView(row2)
+        advancedContainer.addView(row2)
 
         // 2026-2027 Security & Speed Shield Switches Card
         val shieldCard = LinearLayout(this).apply {
@@ -5419,35 +6807,35 @@ class MainActivity : Activity() {
 
         buildSwitchRow(
             "Sıkı Kill Switch & WebRTC IP Kalkanı",
-            "Şifresiz DNS geri düşüşünü ve STUN yerel IP sızıntılarını engeller",
+            "Şifresiz DNS geri düşüşünü ve STUN/mDNS/SSDP sızıntılarını engeller",
             switchKillSwitch,
             addBottomDivider = true,
         )
         buildSwitchRow(
-            "İzleyici & Telemetri DNS Filtresi",
-            "Reklam ve gizlilik ihlal eden alan adlarını cihazda engeller",
+            "İzleyici, OEM & Telemetri DNS Filtresi",
+            "Reklam, OEM parmak izi ve konum telemetri alan adlarını engeller",
             switchTrackerGuard,
             addBottomDivider = true,
         )
         buildSwitchRow(
             "HTTP/3 QUIC Doğrudan Geçiş (Düşük Gecikme)",
-            "QUIC engellenmeyen ağlarda doğrudan UDP/443 akışı sağlar",
+            "WARP kapalıyken QUIC engellenmeyen ağlarda doğrudan UDP/443 akışı",
             switchQuicPassthrough,
             addBottomDivider = false,
         )
-        panelControl.addView(shieldCard)
+        advancedContainer.addView(shieldCard)
 
-        // Exit Relay & Public IP Masking Card (Tor/Orbot, SOCKS5, HTTP, HTTPS CONNECT)
+        // Optional Manual Exit Relay Override Card
         val relayCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = createCardShape("#0B1220", borderColor = "#1E293B", cornerDp = 14f)
             setPadding(dp(12), dp(10), dp(12), dp(10))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(dp(4), dp(8), dp(4), dp(4))
+                setMargins(dp(4), dp(8), dp(4), dp(8))
             }
         }
         val relayHeader = TextView(this).apply {
-            text = "ÇIKIŞ IP GİZLEME & RÖLE (TOR / SOCKS5 / HTTPS)"
+            text = "İSTEĞE BAĞLI MANUEL RÖLE GEÇERSİZ KILMA"
             textSize = 10f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#A78BFA"))
@@ -5456,7 +6844,7 @@ class MainActivity : Activity() {
         relayCard.addView(relayHeader)
 
         val relayHintDesc = TextView(this).apply {
-            text = "DPI Aşma + DoH3 sansürü kendi hattınızda kırar. Genel IP adresinizi web sitelerinden tamamen gizlemek için Tor/Orbot veya kendi SOCKS5/HTTPS sunucunuzu girin."
+            text = "Boş bırakıldığında dahili Cloudflare WARP WireGuard (yedek: yerel Tor :9050 -> Doğrudan DPI) otomatik seçilir."
             textSize = 9.5f
             setTextColor(Color.parseColor("#94A3B8"))
             setPadding(0, 0, 0, dp(6))
@@ -5468,7 +6856,7 @@ class MainActivity : Activity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             textSize = 11.5f
             setTextColor(Color.WHITE)
-            hint = "Örn: tor · socks5://127.0.0.1:9050 · https://sunucu:443"
+            hint = "Boş = Otomatik WARP · Örn: socks5://127.0.0.1:9050"
             setHintTextColor(Color.parseColor("#475569"))
             background = createCardShape("#070B14", borderColor = "#1E293B", cornerDp = 8f)
             setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -5485,11 +6873,11 @@ class MainActivity : Activity() {
         val presetRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, dp(6), 0, dp(6))
+                setMargins(0, dp(6), 0, 0)
             }
         }
         val btnPresetDirect = Button(this).apply {
-            text = "Doğrudan (DPI + DoH3)"
+            text = "Otomatik (WARP)"
             textSize = 10f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#E2E8F0"))
@@ -5501,7 +6889,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 exitRelayInput.setText("")
                 prefs.edit().putString(PREF_EXIT_RELAY, "").apply()
-                ipPrivacyResult.text = "Mod: Doğrudan DPI & Şifreli DoH3 (hızlı hat, genel IP doğrudan operatör hattıdır)."
+                ipPrivacyResult.text = "Mod: Otomatik WARP WireGuard (boş röle)"
             }
         }
         val btnPresetTor = Button(this).apply {
@@ -5529,7 +6917,7 @@ class MainActivity : Activity() {
                         ipPrivacyResult.text = if (reachable) {
                             "Tor/Orbot (127.0.0.1:9050) dinlemede ve hazır! Korumayı (yeniden) başlatın."
                         } else {
-                            "127.0.0.1:9050 kapalı — önce cihazda Orbot/Tor'u çalıştırın veya başka bir SOCKS5/HTTPS rölesi girin."
+                            "127.0.0.1:9050 kapalı — önce cihazda Orbot/Tor'u çalıştırın veya Otomatik WARP'a geçin."
                         }
                     }
                 }
@@ -5538,45 +6926,8 @@ class MainActivity : Activity() {
         presetRow.addView(btnPresetDirect)
         presetRow.addView(btnPresetTor)
         relayCard.addView(presetRow)
-
-        btnCheckPublicIp = Button(this).apply {
-            text = "Genel Çıkış IP & Sızıntı Testi"
-            textSize = 10.5f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            setTextColor(Color.parseColor("#38BDF8"))
-            background = createCardShape("#0F1B2E", borderColor = "#1D4ED8", cornerDp = 8f)
-            setPadding(dp(8), dp(7), dp(8), dp(7))
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            setOnClickListener { runPublicIpLeakCheck() }
-        }
-        relayCard.addView(btnCheckPublicIp)
-
-        ipPrivacyResult = TextView(this).apply {
-            text = "Sızıntı Testi: Hazır (IPv6 Red · STUN/WebRTC Engel · TCP-53 Kill Switch etkin)"
-            textSize = 9.5f
-            setTextColor(Color.parseColor("#94A3B8"))
-            setPadding(0, dp(6), 0, 0)
-        }
-        relayCard.addView(ipPrivacyResult)
-        panelControl.addView(relayCard)
-
-        // Quick Bottom Action Button
-        heroActionButton = Button(this).apply {
-            text = "ÖZGÜR AĞI BAŞLAT (Tam Koruma + DPI Aşma)"
-            textSize = 13.5f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            setTextColor(Color.parseColor("#070B14"))
-            background = createCardShape("#10B981", cornerDp = 14f)
-            setPadding(dp(16), dp(14), dp(16), dp(14))
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(dp(4), dp(10), dp(4), dp(8))
-            }
-            setOnClickListener {
-                it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                toggleDesync()
-            }
-        }
-        panelControl.addView(heroActionButton)
+        advancedContainer.addView(relayCard)
+        panelControl.addView(advancedContainer)
 
         val scrollControl = ScrollView(this).apply {
             isFillViewport = true
@@ -5597,10 +6948,22 @@ class MainActivity : Activity() {
             background = createCardShape("#0E182A", borderColor = "#1E293B", cornerDp = 10f)
             setPadding(dp(10), dp(8), dp(10), dp(8))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, 0, 0, dp(8))
+                setMargins(0, 0, 0, dp(6))
             }
         }
         panelDiag.addView(noticeCard)
+
+        val android17Notice = TextView(this).apply {
+            text = "Android 16 QPR1+ / 17 Ağ Koruması: Ani ağ geçişlerinde QUIC soket kapanışı ve Wi-Fi ↔ 5G otomatik oturum + WireGuard soket koruması desteklenir."
+            textSize = 10f
+            setTextColor(Color.parseColor("#7DD3FC"))
+            background = createCardShape("#0A1A2F", borderColor = "#1D4ED8", cornerDp = 10f)
+            setPadding(dp(10), dp(7), dp(10), dp(7))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 0, 0, dp(8))
+            }
+        }
+        panelDiag.addView(android17Notice)
 
         fun inputLabel(t: String) = TextView(this).apply {
             text = t
@@ -5874,40 +7237,62 @@ class MainActivity : Activity() {
     private fun updateDashboardMetrics(isVpn: Boolean, p: ProxyStatus?, b: TunBridge?) {
         val tcp = b?.tcpFlows?.get() ?: 0
         val desync = b?.desyncedFlows?.get() ?: 0
-        val vision = b?.visionSplicedFlows?.get() ?: 0
-        cardTcp.update("$tcp Akış", "Desync: $desync · Splice: $vision")
+        val warpOut = b?.warpPacketsOut?.get() ?: 0L
+        val warpIn = b?.warpPacketsIn?.get() ?: 0L
+        if (b?.isWarpActive == true) {
+            cardTcp.update("${warpOut + warpIn} WARP", "Şifreli TX/RX: $warpOut/$warpIn")
+        } else {
+            cardTcp.update("$tcp Akış", "Desync: $desync · Splice: ${b?.visionSplicedFlows?.get() ?: 0}")
+        }
 
         val tlsFrag = b?.tlsRecordFragmented?.get() ?: 0
-        val tlsSplit = p?.tlsSplit ?: 0
-        cardTls.update("$tlsFrag Kayıt", "TLS Bölme: $tlsSplit · RST: ${p?.rstDropped ?: 0}")
+        val spoofed = b?.httpHeadersSpoofed?.get() ?: 0
+        cardTls.update("$tlsFrag Kayıt", "Kimlik Başlık: $spoofed · RST: ${p?.rstDropped ?: 0}")
 
         val udp = b?.udpFlows?.get() ?: 0
         val quicFall = b?.quicFallbacks?.get() ?: 0
         val leaks = b?.leaksBlocked?.get() ?: 0
-        cardUdp.update("$udp Akış", "NAT UDP · QUIC: $quicFall · IP Sızıntı: $leaks")
+        cardUdp.update("$leaks Sızıntı", "UDP: $udp · QUIC: $quicFall")
 
         val dns = b?.dnsQueries?.get() ?: 0
         val doh = b?.dohResolved?.get() ?: 0
-        val poison = b?.poisonedDnsBlocked?.get() ?: 0
+        val aaaa = b?.aaaaSuppressed?.get() ?: 0
         val trackers = b?.trackersBlocked?.get() ?: 0
-        cardDns.update("$dns Sorgu", "DoH3: $doh · Zehir/İz: $poison/$trackers")
+        cardDns.update("$dns Sorgu", "DoH3: $doh · AAAA: $aaaa · İz: $trackers")
 
         val isFreedomActive = isVpn || (p?.active == true)
         if (isFreedomActive) {
             if (isVpn) {
-                if (b?.isExitRelayActive == true) {
-                    statusPill.text = "ÇIKIŞ IP GİZLİ (${b.activeExitRelayLabel}) · DoH3 + KALKAN"
-                    statusPill.setTextColor(Color.parseColor("#10B981"))
-                    statusPill.background = createCardShape("#064E3B", borderColor = "#059669", cornerDp = 20f)
-                } else {
-                    statusPill.text = "DPI AŞMA + DoH3 AKTİF · GENEL IP DOĞRUDAN (Röle Yok)"
-                    statusPill.setTextColor(Color.parseColor("#38BDF8"))
-                    statusPill.background = createCardShape("#0B2942", borderColor = "#0284C7", cornerDp = 20f)
+                when {
+                    b?.isWarpActive == true -> {
+                        statusPill.text = "WARP WIREGUARD AKTİF · IP GİZLİ + DoH3"
+                        statusPill.setTextColor(Color.parseColor("#10B981"))
+                        statusPill.background = createCardShape("#064E3B", borderColor = "#059669", cornerDp = 20f)
+                        ipCardStatus.text = "Aktif Rota: ${b.activeExitRelayLabel} — Tüm cihaz trafiği Cloudflare WireGuard üzerinden şifrelenir."
+                    }
+                    b?.isIpMasked == true -> {
+                        statusPill.text = "IP GİZLİ (${b.activeExitRelayLabel}) · DoH3 + KALKAN"
+                        statusPill.setTextColor(Color.parseColor("#A78BFA"))
+                        statusPill.background = createCardShape("#2E1065", borderColor = "#7C3AED", cornerDp = 20f)
+                        ipCardStatus.text = "Aktif Rota: ${b.activeExitRelayLabel} (Genel çıkış IP maskeleniyor)."
+                    }
+                    else -> {
+                        val lbl = b?.activeExitRelayLabel ?: "WARP Bağlanıyor..."
+                        statusPill.text = lbl.uppercase(java.util.Locale.US)
+                        statusPill.setTextColor(Color.parseColor("#38BDF8"))
+                        statusPill.background = createCardShape("#0B2942", borderColor = "#0284C7", cornerDp = 20f)
+                        ipCardStatus.text = "Aktif Rota: $lbl · Şifreli DoH3 + TLS/ECH kalkanı açık."
+                    }
                 }
             } else {
                 statusPill.text = "YEREL VEKİL AKTİF (127.0.0.1:${p?.port ?: 0})"
                 statusPill.setTextColor(Color.parseColor("#10B981"))
                 statusPill.background = createCardShape("#064E3B", borderColor = "#059669", cornerDp = 20f)
+            }
+
+            if (switchMockLocation.isChecked) {
+                locationStatusView.text = NullIslandLocationShield.lastStatusText
+                btnDevOptions.visibility = if (NullIslandLocationShield.needsDeveloperPermission) View.VISIBLE else View.GONE
             }
 
             heroActionButton.text = "KORUMAYI DURDUR (Özgür Ağ Tünelini Kapat)"
@@ -5917,8 +7302,9 @@ class MainActivity : Activity() {
             statusPill.text = "KORUMA DEVRE DIŞI · DOKUNARAK BAĞLANIN"
             statusPill.setTextColor(Color.parseColor("#94A3B8"))
             statusPill.background = createCardShape("#0E1626", borderColor = "#1E293B", cornerDp = 20f)
+            ipCardStatus.text = "Hazır · Başlatıldığında otomatik WARP WireGuard şifreli çıkışı + AAAA/WebRTC/STUN koruması devreye girer."
 
-            heroActionButton.text = "ÖZGÜR AĞI BAŞLAT (Tam Koruma + DPI Aşma)"
+            heroActionButton.text = "ÖZGÜR AĞI BAŞLAT (WARP + Tam Gizlilik)"
             heroActionButton.setTextColor(Color.parseColor("#070B14"))
             heroActionButton.background = createCardShape("#10B981", cornerDp = 12f)
         }
@@ -5980,6 +7366,7 @@ class MainActivity : Activity() {
         outState.putString(KEY_ALT, altDns.text.toString())
         outState.putString(KEY_DOH, dohEndpoints.text.toString())
         outState.putString(KEY_EXIT_RELAY, exitRelayInput.text.toString())
+        outState.putString(KEY_PERSONA, selectedPersona.id)
         outState.putBoolean(KEY_AUTO, auto.isChecked)
         outState.putString(KEY_OUTPUT, diagOutput.text.toString().take(64 * 1024))
     }
@@ -6137,8 +7524,8 @@ class MainActivity : Activity() {
         val relayRaw = exitRelayInput.text.toString().trim()
         val relay = ExitRelayConfig.parse(relayRaw)
         btnCheckPublicIp.isEnabled = false
-        ipPrivacyResult.text = "Çıkış IP ve sızıntı kalkanı test ediliyor..."
-        CrashLogger.log("MainActivity", "Genel Çıkış IP & Sızıntı testi başlatıldı (relay=${relay?.label() ?: "yok"})")
+        ipPrivacyResult.text = "Çıkış IP, DNS sızıntı ve kimlik kalkanı test ediliyor..."
+        CrashLogger.log("MainActivity", "Genel Çıkış IP & Sızıntı testi başlatıldı (relay=${relay?.label() ?: "otomatik"})")
         worker.execute {
             val directRes = runCatching { fetchPublicIpDirect() }
             val relayRes = if (relay != null) runCatching { fetchPublicIpViaRelay(relay) } else null
@@ -6151,16 +7538,20 @@ class MainActivity : Activity() {
                     } else {
                         append("Röle Hatası (${relay.label()}): ${relayRes.exceptionOrNull()?.message ?: "bağlanılamadı"}")
                     }
-                    directRes.getOrNull()?.let { append(" · Doğrudan Hat IP: $it") }
+                    directRes.getOrNull()?.let { append(" · Ham Hat IP: $it") }
+                } else if (b?.isWarpActive == true) {
+                    val dirIp = directRes.getOrNull() ?: "ölçülemedi"
+                    append("WARP WIREGUARD AKTİF (${b.activeExitRelayLabel}) · Cihaz trafiği Cloudflare çıkışı ile maskelenir (Ham ISP hat IP: $dirIp)")
                 } else {
                     val dirIp = directRes.getOrNull() ?: "ölçülemedi (${directRes.exceptionOrNull()?.message})"
-                    append("Doğrudan Hat IP: $dirIp · DPI + DoH3 aktif; genel IP gizlemek için Tor/SOCKS5 rölesi girin")
+                    append("Rota: ${b?.activeExitRelayLabel ?: "Koruma Kapalı"} · Ham Hat IP: $dirIp")
                 }
+                append("\nKonum: ${if (NullIslandLocationShield.isActive) "0.0°, 0.0° Aktif" else "Kapalı"} · Kimlik: ${selectedPersona.shortLabel}")
                 if (b != null) {
-                    append("\nKalkan Sayaçları: IPv6 Red=${b.ipv6Rejected.get()} · Sızıntı/STUN/Port Engel=${b.leaksBlocked.get()} · Zehirli DNS=${b.poisonedDnsBlocked.get()}")
+                    append("\nKalkan: IPv6=${b.ipv6Rejected.get()} · AAAA=${b.aaaaSuppressed.get()} · Sızıntı/STUN=${b.leaksBlocked.get()} · Zehir=${b.poisonedDnsBlocked.get()} · Başlık=${b.httpHeadersSpoofed.get()}")
                 }
             }
-            CrashLogger.log("MainActivity", "IP Test Sonucu: $summary")
+            CrashLogger.log("MainActivity", "Gizlilik & Sızıntı Test Sonucu: $summary")
             ui {
                 btnCheckPublicIp.isEnabled = true
                 ipPrivacyResult.text = summary
@@ -6339,14 +7730,17 @@ class MainActivity : Activity() {
         val killSwitchEnabled = switchKillSwitch.isChecked
         val trackersEnabled = switchTrackerGuard.isChecked
         val quicEnabled = switchQuicPassthrough.isChecked
+        val mockLocationEnabled = switchMockLocation.isChecked
         val exitRelayStr = exitRelayInput.text.toString().trim()
         getSharedPreferences("freedom_prefs", Context.MODE_PRIVATE).edit()
             .putString(PREF_EXIT_RELAY, exitRelayStr)
+            .putString(PREF_PERSONA, selectedPersona.id)
+            .putBoolean(PREF_MOCK_LOCATION, mockLocationEnabled)
             .apply()
         val exitRelayLabel = ExitRelayConfig.parse(exitRelayStr)?.label() ?: ""
         CrashLogger.log(
             "MainActivity",
-            "activateEngelsizMod çağrıldı (vpnGranted=$vpnGranted, killSwitch=$killSwitchEnabled, trackers=$trackersEnabled, quic=$quicEnabled, relay=$exitRelayLabel)",
+            "activateEngelsizMod çağrıldı (vpnGranted=$vpnGranted, killSwitch=$killSwitchEnabled, trackers=$trackersEnabled, quic=$quicEnabled, mockLoc=$mockLocationEnabled, persona=${selectedPersona.id}, relay=$exitRelayLabel)",
         )
         val dohList = ArrayList(split(dohEndpoints.text.toString()))
         val dnsList = ArrayList(split(altDns.text.toString()))
@@ -6360,6 +7754,8 @@ class MainActivity : Activity() {
                     .putExtra(FreedomVpnService.EXTRA_STUN_SHIELD, killSwitchEnabled)
                     .putExtra(FreedomVpnService.EXTRA_QUIC_PASSTHROUGH, quicEnabled)
                     .putExtra(FreedomVpnService.EXTRA_EXIT_RELAY, exitRelayStr)
+                    .putExtra(FreedomVpnService.EXTRA_MOCK_LOCATION, mockLocationEnabled)
+                    .putExtra(FreedomVpnService.EXTRA_PERSONA, selectedPersona.id)
                 startForegroundService(vpnIntent)
                 CrashLogger.log("MainActivity", "FreedomVpnService startForegroundService çağrıldı")
             }.onFailure {
@@ -6389,6 +7785,11 @@ class MainActivity : Activity() {
                     leaksBlocked = b?.leaksBlocked?.get() ?: 0,
                     killSwitch = killSwitchEnabled,
                     exitRelayLabel = exitRelayLabel,
+                    isWarpActive = b?.isWarpActive ?: false,
+                    warpEndpoint = b?.activeExitRelayLabel ?: "",
+                    personaName = selectedPersona.shortLabel,
+                    aaaaSuppressed = b?.aaaaSuppressed?.get() ?: 0,
+                    httpHeadersSpoofed = b?.httpHeadersSpoofed?.get() ?: 0,
                 )
                 ui {
                     diagOutput.text = text + "\n" + diagOutput.text.toString()
@@ -6398,7 +7799,7 @@ class MainActivity : Activity() {
                         diagStatus.text = if (exitRelayLabel.isNotEmpty()) {
                             "Freedom Network etkin: Çıkış IP Gizli ($exitRelayLabel) + DoH3"
                         } else {
-                            "Freedom Network etkin: Tüm Ağ (DoH3 + ECH/REALITY + UDP) + 127.0.0.1:${next.port}"
+                            "Freedom Network etkin: WARP WireGuard Bağlanıyor + DoH3 (${selectedPersona.shortLabel})"
                         }
                     } else {
                         diagStatus.text = "VPN izni verilmedi; yalnızca yerel proxy etkin (127.0.0.1:${next.port})"
@@ -6436,11 +7837,14 @@ class MainActivity : Activity() {
         const val KEY_ALT = "alt"
         const val KEY_DOH = "doh"
         const val KEY_EXIT_RELAY = "exit_relay"
+        const val KEY_PERSONA = "device_persona"
         const val KEY_AUTO = "auto"
         const val KEY_OUTPUT = "output"
         const val PREF_KILL_SWITCH = "pref_kill_switch"
         const val PREF_BLOCK_TRACKERS = "pref_block_trackers"
         const val PREF_QUIC_PASSTHROUGH = "pref_quic_passthrough"
         const val PREF_EXIT_RELAY = "pref_exit_relay"
+        const val PREF_MOCK_LOCATION = "pref_mock_location"
+        const val PREF_PERSONA = "pref_device_persona"
     }
 }

@@ -1060,6 +1060,154 @@ fun main() {
         }
     }
 
+    // ------------------------------------------------------------------ 28. Native WireGuard RFC 7748 + JNI handshake lifecycle
+    test("28. Native WireGuard RFC 7748 public key and JNI handle lifecycle") {
+        // RFC 7748 Section 6.1 test vector for Curve25519 scalar multiplication
+        val rfcPrivHex = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
+        val rfcPubHex = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+        val priv = rfcPrivHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val expectedPub = rfcPubHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val computedPub = Native.wgPublicKey(priv)
+        expect(computedPub != null && computedPub.contentEquals(expectedPub)) { "wgPublicKey must match RFC 7748 basepoint vector" }
+
+        val peerPriv = ByteArray(32) { i -> (0x41 + i).toByte() }
+        val peerPub = Native.wgPublicKey(peerPriv)!!
+        val h = Native.wgCreate(priv, peerPub)
+        expect(h != 0L) { "wgCreate must return a non-zero handle" }
+        try {
+            val ephPriv = ByteArray(32) { i -> (0x11 + i).toByte() }
+            val tai64n = ByteArray(12) { i -> (i + 1).toByte() }
+            val initPkt = Native.wgHandshakeInit(h, ephPriv, tai64n)
+            expect(initPkt != null && initPkt.size == 148 && initPkt[0].toInt() == 1) {
+                "WireGuard Handshake Initiation must be 148 bytes starting with type 1"
+            }
+        } finally {
+            eq(Native.wgDestroy(h), Codes.OK, "wgDestroy")
+        }
+    }
+
+    // ------------------------------------------------------------------ 29. IpPackets.rewriteIpv4Nat & TCP SYN MSS clamping
+    test("29. IpPackets.rewriteIpv4Nat updates src/dst, clamps MSS to 1240, and preserves valid checksums") {
+        val oldSrc = IpPackets.parseIpLiteral("10.89.0.2")!!
+        val newSrc = IpPackets.parseIpLiteral("172.16.0.2")!!
+        val dst = IpPackets.parseIpLiteral("93.184.216.34")!!
+        val syn = IpPackets.buildIpv4Tcp(oldSrc, dst, 44321, 443, 1000L, 0L, IpPackets.TCP_SYN, mssOption = 1460)
+        val natted = IpPackets.rewriteIpv4Nat(syn, newSrcIp = newSrc, clampMss = 1240)!!
+
+        val ipHdr = IpPackets.parseIpv4(natted)!!
+        eq(ipHdr.srcIp, newSrc, "NAT must rewrite source IPv4")
+        eq(ipHdr.dstIp, dst, "NAT preserves destination IPv4")
+        eq(IpPackets.ipv4Checksum(natted, 0, ipHdr.ihl), 0, "IPv4 checksum must validate to 0")
+        eq(IpPackets.transportChecksumV4(ipHdr.srcIp, ipHdr.dstIp, IpPackets.PROTO_TCP, natted, ipHdr.ihl, ipHdr.totalLen - ipHdr.ihl), 0, "TCP checksum must validate to 0")
+
+        // Verify MSS option bytes (kind=2, len=4, val=1240)
+        val clampedMss = IpPackets.u16(natted, ipHdr.ihl + 22)
+        eq(clampedMss, 1240, "SYN MSS option must be clamped to 1240")
+    }
+
+    // ------------------------------------------------------------------ 30. DevicePersona HTTP spoofing & geo-header stripping
+    test("30. IpPackets.sanitizePlainHttpHeaders injects futuristic DevicePersona and strips leak headers") {
+        val raw = (
+            "GET /who HTTP/1.1\r\n" +
+                "Host: check.local\r\n" +
+                "User-Agent: Dalvik/2.1.0 (Linux; Android 17; SM-S911B)\r\n" +
+                "Sec-CH-UA-Model: \"SM-S911B\"\r\n" +
+                "X-Forwarded-For: 192.0.2.55\r\n" +
+                "X-Geo-Location: 41.01,28.97\r\n" +
+                "Accept-Language: tr-TR,tr;q=0.9\r\n\r\n"
+            ).toByteArray(Charsets.ISO_8859_1)
+
+        val spoofed = String(IpPackets.sanitizePlainHttpHeaders(raw, DevicePersona.IPHONE_19_BETA, stripGeoHeaders = true), Charsets.ISO_8859_1)
+        expect("SM-S911B" !in spoofed) { "Real device model must be stripped" }
+        expect("192.0.2.55" !in spoofed) { "X-Forwarded-For must be stripped" }
+        expect("41.01,28.97" !in spoofed) { "X-Geo-Location must be stripped" }
+        expect("iPhone19,3" in spoofed && "iPhone OS 21_0" in spoofed) { "Futuristic iPhone 19 Beta UA must be injected" }
+        expect("en-US" in spoofed && "tr-TR" !in spoofed) { "Accept-Language should normalize to en-US under persona" }
+
+        val untouched = IpPackets.sanitizePlainHttpHeaders(raw, DevicePersona.OFF, stripGeoHeaders = false)
+        expect("SM-S911B" in String(untouched, Charsets.ISO_8859_1)) { "DevicePersona.OFF must preserve User-Agent" }
+    }
+
+    // ------------------------------------------------------------------ 31. DNS AAAA query detection, NODATA synthesis & DNS rebinding protection
+    test("31. DNS QTYPE parsing, AAAA NODATA synthesis, and DNS-rebinding private-range detection") {
+        val aaaaQuery = Doh.query("example.com", qtype = 28)!!
+        eq(IpPackets.parseDnsQuestionType(aaaaQuery), 28, "parseDnsQuestionType must return 28 for AAAA")
+        val nodata = IpPackets.buildDnsNodataAaaa(aaaaQuery)
+        expect((nodata[3].toInt() and 0x0F) == 0 && IpPackets.u16(nodata, 6) == 0) {
+            "buildDnsNodataAaaa must set RCODE=0 (NOERROR) and ANCOUNT=0"
+        }
+
+        fun fakeDnsReply(aBytes: ByteArray): ByteArray {
+            val qFull = Doh.query("rebind.test")!!
+            val qLen = if (IpPackets.u16(qFull, 10) > 0) qFull.size - 11 else qFull.size
+            val out = ByteArray(qLen + 16)
+            System.arraycopy(qFull, 0, out, 0, qLen)
+            out[2] = 0x81.toByte(); out[3] = 0x80.toByte()
+            out[7] = 1 // ANCOUNT = 1
+            out[10] = 0; out[11] = 0 // ARCOUNT = 0
+            var p = qLen
+            out[p++] = 0xC0.toByte(); out[p++] = 12 // ptr to QNAME
+            out[p++] = 0; out[p++] = 1 // TYPE A
+            out[p++] = 0; out[p++] = 1 // CLASS IN
+            out[p++] = 0; out[p++] = 0; out[p++] = 0; out[p++] = 60 // TTL 60
+            out[p++] = 0; out[p++] = 4 // RDLENGTH 4
+            System.arraycopy(aBytes, 0, out, p, 4)
+            return out
+        }
+
+        expect(IpPackets.containsPoisonedDns(fakeDnsReply(byteArrayOf(192.toByte(), 168.toByte(), 1, 1)))) { "192.168.1.1 rebinding must be caught" }
+        expect(IpPackets.containsPoisonedDns(fakeDnsReply(byteArrayOf(10, 0, 0, 1)))) { "10.0.0.1 rebinding must be caught" }
+        expect(IpPackets.containsPoisonedDns(fakeDnsReply(byteArrayOf(169.toByte(), 254.toByte(), 169.toByte(), 254.toByte())))) { "169.254.169.254 metadata SSRF must be caught" }
+        expect(!IpPackets.containsPoisonedDns(fakeDnsReply(byteArrayOf(1, 1, 1, 1)))) { "1.1.1.1 public IP must be allowed" }
+    }
+
+    // ------------------------------------------------------------------ 32. Expanded OEM/Geo/Fingerprint tracker sinkhole
+    test("32. Expanded telemetry, location-beacon & fingerprinting domains blocked") {
+        expect(IpPackets.isTrackerOrAdDomain("location.services.mozilla.com")) { "Mozilla geo beacon must be blocked" }
+        expect(IpPackets.isTrackerOrAdDomain("diagmon.samsung.com")) { "OEM telemetry must be blocked" }
+        expect(IpPackets.isTrackerOrAdDomain("cdn.fpjs.io")) { "FingerprintJS must be blocked" }
+        expect(!IpPackets.isTrackerOrAdDomain("api.github.com")) { "Clean API domain must not be blocked" }
+    }
+
+    // ------------------------------------------------------------------ 33. WarpIdentity serialization & WarpProvisioner JSON parser
+    test("33. WarpIdentity round-trip serialization and WarpProvisioner registration JSON parser") {
+        val priv = ByteArray(32) { i -> (i + 3).toByte() }
+        val peerPub = ByteArray(32) { i -> (i + 9).toByte() }
+        val privB64 = java.util.Base64.getEncoder().encodeToString(priv)
+        val peerPubB64 = java.util.Base64.getEncoder().encodeToString(peerPub)
+
+        val sampleJson = """
+            {
+              "id": "dev-1234",
+              "token": "tok-secret-99",
+              "warp_enabled": false,
+              "config": {
+                "peers": [
+                  {
+                    "public_key": "$peerPubB64",
+                    "endpoint": { "v4": "162.159.192.1:2408", "v6": "[2606:4700:d0::a29f:c001]:2408" }
+                  }
+                ],
+                "interface": {
+                  "addresses": { "v4": "172.16.0.2/32", "v6": "2606:4700:110::/128" }
+                }
+              }
+            }
+        """.trimIndent()
+
+        val parsed = WarpProvisioner.parseRegistrationJson(sampleJson, privB64)
+        expect(parsed != null && parsed.isValid()) { "WARP registration JSON must parse into a valid WarpIdentity" }
+        eq(parsed!!.clientIpv4, "172.16.0.2", "clientIpv4")
+        eq(parsed.endpointHost, "162.159.192.1", "endpointHost")
+        eq(parsed.endpointPort, 2408, "endpointPort")
+        eq(parsed.deviceId, "dev-1234", "deviceId")
+
+        val roundTrip = WarpIdentity.deserialize(parsed.serialize())
+        eq(roundTrip?.privateKeyB64, parsed.privateKeyB64, "serialized privateKeyB64")
+        eq(roundTrip?.peerPublicKeyB64, parsed.peerPublicKeyB64, "serialized peerPublicKeyB64")
+        eq(roundTrip?.clientIpv4, parsed.clientIpv4, "serialized clientIpv4")
+    }
+
     println()
     println("RESULT: $passed passed, ${failures.size} failed")
     if (failures.isNotEmpty()) {

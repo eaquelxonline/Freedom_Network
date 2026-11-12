@@ -4492,6 +4492,1150 @@ pub mod oblivious {
 }
 
 // ---------------------------------------------------------------------------
+// wireguard — zero-dependency Pure-Rust WireGuard (Noise_IKpsk2 + X25519 + ChaChaPoly + BLAKE2s)
+// ---------------------------------------------------------------------------
+
+/// Self-contained RFC 7748 X25519, RFC 7693 BLAKE2s, RFC 8439 ChaCha20-Poly1305 / XChaCha20-Poly1305,
+/// and WireGuard `Noise_IKpsk2` handshake + Layer-3 transport state machine.
+pub mod wireguard {
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+    const IDENTIFIER: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
+    const LABEL_MAC1: &[u8] = b"mac1----";
+    const LABEL_COOKIE: &[u8] = b"cookie--";
+
+    const BLAKE2S_IV: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+
+    const BLAKE2S_SIGMA: [[usize; 16]; 10] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+        [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+        [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+        [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+        [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+        [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+        [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+        [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+        [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+    ];
+
+    fn blake2s_g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+        v[d] = (v[d] ^ v[a]).rotate_right(16);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(12);
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+        v[d] = (v[d] ^ v[a]).rotate_right(8);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(7);
+    }
+
+    fn blake2s_compress(h: &mut [u32; 8], block: &[u8; 64], t: u64, last: bool) {
+        let mut v = [0u32; 16];
+        v[..8].copy_from_slice(h);
+        v[8..16].copy_from_slice(&BLAKE2S_IV);
+        v[12] ^= t as u32;
+        v[13] ^= (t >> 32) as u32;
+        if last {
+            v[14] = !v[14];
+        }
+        let mut m = [0u32; 16];
+        for (i, dst) in m.iter_mut().enumerate() {
+            let off = i * 4;
+            *dst = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        }
+        for sigma in &BLAKE2S_SIGMA {
+            blake2s_g(&mut v, 0, 4, 8, 12, m[sigma[0]], m[sigma[1]]);
+            blake2s_g(&mut v, 1, 5, 9, 13, m[sigma[2]], m[sigma[3]]);
+            blake2s_g(&mut v, 2, 6, 10, 14, m[sigma[4]], m[sigma[5]]);
+            blake2s_g(&mut v, 3, 7, 11, 15, m[sigma[6]], m[sigma[7]]);
+            blake2s_g(&mut v, 0, 5, 10, 15, m[sigma[8]], m[sigma[9]]);
+            blake2s_g(&mut v, 1, 6, 11, 12, m[sigma[10]], m[sigma[11]]);
+            blake2s_g(&mut v, 2, 7, 8, 13, m[sigma[12]], m[sigma[13]]);
+            blake2s_g(&mut v, 3, 4, 9, 14, m[sigma[14]], m[sigma[15]]);
+        }
+        for i in 0..8 {
+            h[i] ^= v[i] ^ v[i + 8];
+        }
+    }
+
+    /// RFC 7693 BLAKE2s with configurable digest output length (1..=32) and optional key (<= 32).
+    pub fn blake2s_var(key: &[u8], data: &[u8], out: &mut [u8]) {
+        let out_len = out.len().clamp(1, 32);
+        let key_len = key.len().min(32);
+        let mut h = BLAKE2S_IV;
+        h[0] ^= 0x0101_0000 ^ ((key_len as u32) << 8) ^ (out_len as u32);
+
+        let mut buf = [0u8; 64];
+        let mut buf_len = 0usize;
+        let mut total: u64 = 0;
+
+        if key_len > 0 {
+            buf[..key_len].copy_from_slice(&key[..key_len]);
+            buf_len = 64;
+        }
+
+        for &b in data {
+            if buf_len == 64 {
+                total = total.wrapping_add(64);
+                blake2s_compress(&mut h, &buf, total, false);
+                buf = [0u8; 64];
+                buf_len = 0;
+            }
+            buf[buf_len] = b;
+            buf_len += 1;
+        }
+
+        total = total.wrapping_add(buf_len as u64);
+        blake2s_compress(&mut h, &buf, total, true);
+
+        let mut digest = [0u8; 32];
+        for (i, w) in h.iter().enumerate() {
+            digest[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out[..out_len].copy_from_slice(&digest[..out_len]);
+    }
+
+    pub fn blake2s(data: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        blake2s_var(&[], data, &mut out);
+        out
+    }
+
+    pub fn blake2s_two(a: &[u8], b: &[u8]) -> [u8; 32] {
+        let mut v = Vec::with_capacity(a.len() + b.len());
+        v.extend_from_slice(a);
+        v.extend_from_slice(b);
+        blake2s(&v)
+    }
+
+    pub fn mac128(key: &[u8], data: &[u8]) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        blake2s_var(key, data, &mut out);
+        out
+    }
+
+    pub fn hmac_blake2s(key: &[u8], data: &[u8]) -> [u8; 32] {
+        let mut k = [0u8; 64];
+        if key.len() <= 64 {
+            k[..key.len()].copy_from_slice(key);
+        } else {
+            let hashed = blake2s(key);
+            k[..32].copy_from_slice(&hashed);
+        }
+        let mut ipad = Vec::with_capacity(64 + data.len());
+        let mut opad = Vec::with_capacity(64 + 32);
+        for &b in &k {
+            ipad.push(b ^ 0x36);
+            opad.push(b ^ 0x5c);
+        }
+        ipad.extend_from_slice(data);
+        let inner = blake2s(&ipad);
+        opad.extend_from_slice(&inner);
+        blake2s(&opad)
+    }
+
+    fn kdf1(key: &[u8; 32], input: &[u8]) -> [u8; 32] {
+        let prk = hmac_blake2s(key, input);
+        hmac_blake2s(&prk, &[0x01])
+    }
+
+    fn kdf2(key: &[u8; 32], input: &[u8]) -> ([u8; 32], [u8; 32]) {
+        let prk = hmac_blake2s(key, input);
+        let t1 = hmac_blake2s(&prk, &[0x01]);
+        let mut in2 = [0u8; 33];
+        in2[..32].copy_from_slice(&t1);
+        in2[32] = 0x02;
+        let t2 = hmac_blake2s(&prk, &in2);
+        (t1, t2)
+    }
+
+    fn kdf3(key: &[u8; 32], input: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
+        let prk = hmac_blake2s(key, input);
+        let t1 = hmac_blake2s(&prk, &[0x01]);
+        let mut in2 = [0u8; 33];
+        in2[..32].copy_from_slice(&t1);
+        in2[32] = 0x02;
+        let t2 = hmac_blake2s(&prk, &in2);
+        let mut in3 = [0u8; 33];
+        in3[..32].copy_from_slice(&t2);
+        in3[32] = 0x03;
+        let t3 = hmac_blake2s(&prk, &in3);
+        (t1, t2, t3)
+    }
+
+    // ---- RFC 7748 X25519 (GF(2^255 - 19), 16x16-bit limbs in i64) ----
+
+    type Fe = [i64; 16];
+
+    const FE_ZERO: Fe = [0; 16];
+    const FE_ONE: Fe = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const FE_121665: Fe = [0xdb41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    fn fe_car(o: &mut Fe) {
+        for i in 0..16 {
+            o[i] += 1 << 16;
+            let c = o[i] >> 16;
+            let next = (i + 1) % 16;
+            o[next] += c - 1 + if i == 15 { 37 * (c - 1) } else { 0 };
+            o[i] -= c << 16;
+        }
+    }
+
+    fn fe_sel(p: &mut Fe, q: &mut Fe, b: i64) {
+        let c = !(b - 1);
+        for i in 0..16 {
+            let t = c & (p[i] ^ q[i]);
+            p[i] ^= t;
+            q[i] ^= t;
+        }
+    }
+
+    fn fe_add(a: &Fe, b: &Fe) -> Fe {
+        let mut o = FE_ZERO;
+        for i in 0..16 {
+            o[i] = a[i] + b[i];
+        }
+        o
+    }
+
+    fn fe_sub(a: &Fe, b: &Fe) -> Fe {
+        let mut o = FE_ZERO;
+        for i in 0..16 {
+            o[i] = a[i] - b[i];
+        }
+        o
+    }
+
+    fn fe_mul(a: &Fe, b: &Fe) -> Fe {
+        let mut t = [0i64; 31];
+        for i in 0..16 {
+            for j in 0..16 {
+                t[i + j] += a[i] * b[j];
+            }
+        }
+        for i in 0..15 {
+            t[i] += 38 * t[i + 16];
+        }
+        let mut o = FE_ZERO;
+        o.copy_from_slice(&t[..16]);
+        fe_car(&mut o);
+        fe_car(&mut o);
+        o
+    }
+
+    fn fe_sq(a: &Fe) -> Fe {
+        fe_mul(a, a)
+    }
+
+    fn fe_inv(z: &Fe) -> Fe {
+        let mut w = *z;
+        for a in (0..=253).rev() {
+            w = fe_sq(&w);
+            if a != 2 && a != 4 {
+                w = fe_mul(&w, z);
+            }
+        }
+        w
+    }
+
+    fn fe_unpack(n: &[u8; 32]) -> Fe {
+        let mut o = FE_ZERO;
+        for i in 0..16 {
+            o[i] = i64::from(n[2 * i]) + (i64::from(n[2 * i + 1]) << 8);
+        }
+        o[15] &= 0x7fff;
+        o
+    }
+
+    fn fe_pack(n: &Fe) -> [u8; 32] {
+        let mut t = *n;
+        fe_car(&mut t);
+        fe_car(&mut t);
+        fe_car(&mut t);
+        let mut m = FE_ZERO;
+        for _ in 0..2 {
+            m[0] = t[0] - 0xffed;
+            for i in 1..15 {
+                m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1);
+                m[i - 1] &= 0xffff;
+            }
+            m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
+            let b = (m[15] >> 16) & 1;
+            m[14] &= 0xffff;
+            fe_sel(&mut t, &mut m, 1 - b);
+        }
+        let mut o = [0u8; 32];
+        for i in 0..16 {
+            o[2 * i] = (t[i] & 0xff) as u8;
+            o[2 * i + 1] = ((t[i] >> 8) & 0xff) as u8;
+        }
+        o
+    }
+
+    /// RFC 7748 X25519 scalar multiplication `scalar * u_coord`.
+    pub fn x25519(scalar: &[u8; 32], u_coord: &[u8; 32]) -> [u8; 32] {
+        let mut z = *scalar;
+        z[0] &= 248;
+        z[31] = (z[31] & 127) | 64;
+        let x = fe_unpack(u_coord);
+        let mut a = FE_ONE;
+        let mut b = x;
+        let mut c = FE_ZERO;
+        let mut d = FE_ONE;
+        for i in (0..=254).rev() {
+            let r = i64::from((z[i >> 3] >> (i & 7)) & 1);
+            fe_sel(&mut a, &mut b, r);
+            fe_sel(&mut c, &mut d, r);
+            let mut e = fe_add(&a, &c);
+            a = fe_sub(&a, &c);
+            c = fe_add(&b, &d);
+            b = fe_sub(&b, &d);
+            d = fe_sq(&e);
+            let f = fe_sq(&a);
+            a = fe_mul(&c, &a);
+            c = fe_mul(&b, &e);
+            e = fe_add(&a, &c);
+            a = fe_sub(&a, &c);
+            b = fe_sq(&a);
+            c = fe_sub(&d, &f);
+            a = fe_mul(&c, &FE_121665);
+            a = fe_add(&a, &d);
+            c = fe_mul(&c, &a);
+            a = fe_mul(&d, &f);
+            d = fe_mul(&b, &x);
+            b = fe_sq(&e);
+            fe_sel(&mut a, &mut b, r);
+            fe_sel(&mut c, &mut d, r);
+        }
+        let c_inv = fe_inv(&c);
+        fe_pack(&fe_mul(&a, &c_inv))
+    }
+
+    /// Derives the X25519 public key from a 32-byte private scalar.
+    pub fn x25519_public(priv_key: &[u8; 32]) -> [u8; 32] {
+        let mut base = [0u8; 32];
+        base[0] = 9;
+        x25519(priv_key, &base)
+    }
+
+    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
+
+    fn is_all_zero(a: &[u8]) -> bool {
+        let mut acc = 0u8;
+        for &b in a {
+            acc |= b;
+        }
+        acc == 0
+    }
+
+    // ---- RFC 8439 ChaCha20-Poly1305 & XChaCha20-Poly1305 ----
+
+    fn chacha_qr(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        s[a] = s[a].wrapping_add(s[b]);
+        s[d] = (s[d] ^ s[a]).rotate_left(16);
+        s[c] = s[c].wrapping_add(s[d]);
+        s[b] = (s[b] ^ s[c]).rotate_left(12);
+        s[a] = s[a].wrapping_add(s[b]);
+        s[d] = (s[d] ^ s[a]).rotate_left(8);
+        s[c] = s[c].wrapping_add(s[d]);
+        s[b] = (s[b] ^ s[c]).rotate_left(7);
+    }
+
+    fn chacha_rounds(s: &mut [u32; 16]) {
+        for _ in 0..10 {
+            chacha_qr(s, 0, 4, 8, 12);
+            chacha_qr(s, 1, 5, 9, 13);
+            chacha_qr(s, 2, 6, 10, 14);
+            chacha_qr(s, 3, 7, 11, 15);
+            chacha_qr(s, 0, 5, 10, 15);
+            chacha_qr(s, 1, 6, 11, 12);
+            chacha_qr(s, 2, 7, 8, 13);
+            chacha_qr(s, 3, 4, 9, 14);
+        }
+    }
+
+    fn chacha_init(key: &[u8; 32], words12: [u32; 4]) -> [u32; 16] {
+        let mut s = [0u32; 16];
+        s[0] = 0x6170_7865;
+        s[1] = 0x3320_646e;
+        s[2] = 0x7962_2d32;
+        s[3] = 0x6b20_6574;
+        for i in 0..8 {
+            let o = i * 4;
+            s[4 + i] = u32::from_le_bytes([key[o], key[o + 1], key[o + 2], key[o + 3]]);
+        }
+        s[12] = words12[0];
+        s[13] = words12[1];
+        s[14] = words12[2];
+        s[15] = words12[3];
+        s
+    }
+
+    pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+        let n0 = u32::from_le_bytes([nonce[0], nonce[1], nonce[2], nonce[3]]);
+        let n1 = u32::from_le_bytes([nonce[4], nonce[5], nonce[6], nonce[7]]);
+        let n2 = u32::from_le_bytes([nonce[8], nonce[9], nonce[10], nonce[11]]);
+        let init = chacha_init(key, [counter, n0, n1, n2]);
+        let mut s = init;
+        chacha_rounds(&mut s);
+        let mut out = [0u8; 64];
+        for i in 0..16 {
+            let w = s[i].wrapping_add(init[i]);
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn hchacha20(key: &[u8; 32], nonce16: &[u8; 16]) -> [u8; 32] {
+        let n0 = u32::from_le_bytes([nonce16[0], nonce16[1], nonce16[2], nonce16[3]]);
+        let n1 = u32::from_le_bytes([nonce16[4], nonce16[5], nonce16[6], nonce16[7]]);
+        let n2 = u32::from_le_bytes([nonce16[8], nonce16[9], nonce16[10], nonce16[11]]);
+        let n3 = u32::from_le_bytes([nonce16[12], nonce16[13], nonce16[14], nonce16[15]]);
+        let mut s = chacha_init(key, [n0, n1, n2, n3]);
+        chacha_rounds(&mut s);
+        let mut out = [0u8; 32];
+        for (idx, src) in [s[0], s[1], s[2], s[3], s[12], s[13], s[14], s[15]]
+            .iter()
+            .enumerate()
+        {
+            out[idx * 4..idx * 4 + 4].copy_from_slice(&src.to_le_bytes());
+        }
+        out
+    }
+
+    fn chacha20_xor(key: &[u8; 32], start_counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
+        let mut counter = start_counter;
+        for chunk in data.chunks_mut(64) {
+            let ks = chacha20_block(key, counter, nonce);
+            for (b, &k) in chunk.iter_mut().zip(ks.iter()) {
+                *b ^= k;
+            }
+            counter = counter.wrapping_add(1);
+        }
+    }
+
+    struct Poly1305 {
+        r: [u64; 5],
+        s: [u64; 5],
+        h: [u64; 5],
+        pad: [u32; 4],
+    }
+
+    impl Poly1305 {
+        fn new(key: &[u8; 32]) -> Self {
+            let t0 = u32::from_le_bytes([key[0], key[1], key[2], key[3]]) & 0x0fff_ffff;
+            let t1 = u32::from_le_bytes([key[4], key[5], key[6], key[7]]) & 0x0fff_fffc;
+            let t2 = u32::from_le_bytes([key[8], key[9], key[10], key[11]]) & 0x0fff_fffc;
+            let t3 = u32::from_le_bytes([key[12], key[13], key[14], key[15]]) & 0x0fff_fffc;
+            let r = [
+                u64::from(t0 & 0x03ff_ffff),
+                u64::from(((t0 >> 26) | (t1 << 6)) & 0x03ff_ffff),
+                u64::from(((t1 >> 20) | (t2 << 12)) & 0x03ff_ffff),
+                u64::from(((t2 >> 14) | (t3 << 18)) & 0x03ff_ffff),
+                u64::from(t3 >> 8),
+            ];
+            let s = [0, r[1] * 5, r[2] * 5, r[3] * 5, r[4] * 5];
+            let pad = [
+                u32::from_le_bytes([key[16], key[17], key[18], key[19]]),
+                u32::from_le_bytes([key[20], key[21], key[22], key[23]]),
+                u32::from_le_bytes([key[24], key[25], key[26], key[27]]),
+                u32::from_le_bytes([key[28], key[29], key[30], key[31]]),
+            ];
+            Self {
+                r,
+                s,
+                h: [0; 5],
+                pad,
+            }
+        }
+
+        fn block(&mut self, b: &[u8], full: bool) {
+            let mut tmp = [0u8; 17];
+            let len = b.len().min(16);
+            tmp[..len].copy_from_slice(&b[..len]);
+            if !full && len < 16 {
+                tmp[len] = 1;
+            }
+            let hibit = if full { 1u64 << 24 } else { 0u64 };
+
+            let d0 = u32::from_le_bytes([tmp[0], tmp[1], tmp[2], tmp[3]]);
+            let d1 = u32::from_le_bytes([tmp[4], tmp[5], tmp[6], tmp[7]]);
+            let d2 = u32::from_le_bytes([tmp[8], tmp[9], tmp[10], tmp[11]]);
+            let d3 = u32::from_le_bytes([tmp[12], tmp[13], tmp[14], tmp[15]]);
+
+            self.h[0] += u64::from(d0 & 0x03ff_ffff);
+            self.h[1] += u64::from(((d0 >> 26) | (d1 << 6)) & 0x03ff_ffff);
+            self.h[2] += u64::from(((d1 >> 20) | (d2 << 12)) & 0x03ff_ffff);
+            self.h[3] += u64::from(((d2 >> 14) | (d3 << 18)) & 0x03ff_ffff);
+            self.h[4] += u64::from(d3 >> 8) | hibit;
+
+            let (r, s, h) = (self.r, self.s, self.h);
+            let mut t0 = u128::from(h[0]) * u128::from(r[0])
+                + u128::from(h[1]) * u128::from(s[4])
+                + u128::from(h[2]) * u128::from(s[3])
+                + u128::from(h[3]) * u128::from(s[2])
+                + u128::from(h[4]) * u128::from(s[1]);
+            let mut t1 = u128::from(h[0]) * u128::from(r[1])
+                + u128::from(h[1]) * u128::from(r[0])
+                + u128::from(h[2]) * u128::from(s[4])
+                + u128::from(h[3]) * u128::from(s[3])
+                + u128::from(h[4]) * u128::from(s[2]);
+            let mut t2 = u128::from(h[0]) * u128::from(r[2])
+                + u128::from(h[1]) * u128::from(r[1])
+                + u128::from(h[2]) * u128::from(r[0])
+                + u128::from(h[3]) * u128::from(s[4])
+                + u128::from(h[4]) * u128::from(s[3]);
+            let mut t3 = u128::from(h[0]) * u128::from(r[3])
+                + u128::from(h[1]) * u128::from(r[2])
+                + u128::from(h[2]) * u128::from(r[1])
+                + u128::from(h[3]) * u128::from(r[0])
+                + u128::from(h[4]) * u128::from(s[4]);
+            let mut t4 = u128::from(h[0]) * u128::from(r[4])
+                + u128::from(h[1]) * u128::from(r[3])
+                + u128::from(h[2]) * u128::from(r[2])
+                + u128::from(h[3]) * u128::from(r[1])
+                + u128::from(h[4]) * u128::from(r[0]);
+
+            t1 += t0 >> 26;
+            t0 &= 0x03ff_ffff;
+            t2 += t1 >> 26;
+            t1 &= 0x03ff_ffff;
+            t3 += t2 >> 26;
+            t2 &= 0x03ff_ffff;
+            t4 += t3 >> 26;
+            t3 &= 0x03ff_ffff;
+            t0 += (t4 >> 26) * 5;
+            t4 &= 0x03ff_ffff;
+            t1 += t0 >> 26;
+            t0 &= 0x03ff_ffff;
+
+            self.h = [t0 as u64, t1 as u64, t2 as u64, t3 as u64, t4 as u64];
+        }
+
+        fn update_padded(&mut self, data: &[u8]) {
+            for chunk in data.chunks(16) {
+                self.block(chunk, true);
+            }
+        }
+
+        fn finish(mut self) -> [u8; 16] {
+            let mut h0 = self.h[0];
+            let mut h1 = self.h[1];
+            let mut h2 = self.h[2];
+            let mut h3 = self.h[3];
+            let mut h4 = self.h[4];
+
+            h2 += h1 >> 26;
+            h1 &= 0x03ff_ffff;
+            h3 += h2 >> 26;
+            h2 &= 0x03ff_ffff;
+            h4 += h3 >> 26;
+            h3 &= 0x03ff_ffff;
+            h0 += (h4 >> 26) * 5;
+            h4 &= 0x03ff_ffff;
+            h1 += h0 >> 26;
+            h0 &= 0x03ff_ffff;
+
+            let mut g0 = h0 + 5;
+            let mut g1 = h1 + (g0 >> 26);
+            g0 &= 0x03ff_ffff;
+            let mut g2 = h2 + (g1 >> 26);
+            g1 &= 0x03ff_ffff;
+            let mut g3 = h3 + (g2 >> 26);
+            g2 &= 0x03ff_ffff;
+            let g4 = h4.wrapping_add(g3 >> 26).wrapping_sub(1 << 26);
+            g3 &= 0x03ff_ffff;
+
+            let mask = (g4 >> 63).wrapping_sub(1);
+            g0 &= mask;
+            g1 &= mask;
+            g2 &= mask;
+            g3 &= mask;
+            let g4m = g4 & mask;
+            let nmask = !mask;
+            self.h[0] = (h0 & nmask) | g0;
+            self.h[1] = (h1 & nmask) | g1;
+            self.h[2] = (h2 & nmask) | g2;
+            self.h[3] = (h3 & nmask) | g3;
+            self.h[4] = (h4 & nmask) | g4m;
+
+            let f0 = ((self.h[0]) | (self.h[1] << 26)) as u32;
+            let f1 = ((self.h[1] >> 6) | (self.h[2] << 20)) as u32;
+            let f2 = ((self.h[2] >> 12) | (self.h[3] << 14)) as u32;
+            let f3 = ((self.h[3] >> 18) | (self.h[4] << 8)) as u32;
+
+            let mut c = u64::from(f0) + u64::from(self.pad[0]);
+            let o0 = c as u32;
+            c = u64::from(f1) + u64::from(self.pad[1]) + (c >> 32);
+            let o1 = c as u32;
+            c = u64::from(f2) + u64::from(self.pad[2]) + (c >> 32);
+            let o2 = c as u32;
+            let o3 = (u64::from(f3) + u64::from(self.pad[3]) + (c >> 32)) as u32;
+
+            let mut tag = [0u8; 16];
+            tag[0..4].copy_from_slice(&o0.to_le_bytes());
+            tag[4..8].copy_from_slice(&o1.to_le_bytes());
+            tag[8..12].copy_from_slice(&o2.to_le_bytes());
+            tag[12..16].copy_from_slice(&o3.to_le_bytes());
+            tag
+        }
+    }
+
+    fn poly_tag(otk: &[u8; 32], aad: &[u8], ct: &[u8]) -> [u8; 16] {
+        let mut p = Poly1305::new(otk);
+        p.update_padded(aad);
+        p.update_padded(ct);
+        let mut lens = [0u8; 16];
+        lens[0..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+        lens[8..16].copy_from_slice(&(ct.len() as u64).to_le_bytes());
+        p.block(&lens, true);
+        p.finish()
+    }
+
+    /// RFC 8439 ChaCha20-Poly1305 AEAD encryption. Returns `ciphertext || 16B tag`.
+    pub fn aead_encrypt(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+        let block0 = chacha20_block(key, 0, nonce);
+        let mut otk = [0u8; 32];
+        otk.copy_from_slice(&block0[..32]);
+        let mut out = Vec::with_capacity(plaintext.len() + 16);
+        out.extend_from_slice(plaintext);
+        chacha20_xor(key, 1, nonce, &mut out);
+        let tag = poly_tag(&otk, aad, &out);
+        out.extend_from_slice(&tag);
+        out
+    }
+
+    /// RFC 8439 ChaCha20-Poly1305 AEAD decryption of `ciphertext || 16B tag`.
+    pub fn aead_decrypt(
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        ct_and_tag: &[u8],
+        aad: &[u8],
+    ) -> Option<Vec<u8>> {
+        if ct_and_tag.len() < 16 {
+            return None;
+        }
+        let split = ct_and_tag.len() - 16;
+        let ct = &ct_and_tag[..split];
+        let tag = &ct_and_tag[split..];
+        let block0 = chacha20_block(key, 0, nonce);
+        let mut otk = [0u8; 32];
+        otk.copy_from_slice(&block0[..32]);
+        let expected = poly_tag(&otk, aad, ct);
+        if !ct_eq(&expected, tag) {
+            return None;
+        }
+        let mut pt = ct.to_vec();
+        chacha20_xor(key, 1, nonce, &mut pt);
+        Some(pt)
+    }
+
+    pub fn xaead_decrypt(
+        key: &[u8; 32],
+        nonce24: &[u8; 24],
+        ct_and_tag: &[u8],
+        aad: &[u8],
+    ) -> Option<Vec<u8>> {
+        let mut n16 = [0u8; 16];
+        n16.copy_from_slice(&nonce24[..16]);
+        let subkey = hchacha20(key, &n16);
+        let mut n12 = [0u8; 12];
+        n12[4..12].copy_from_slice(&nonce24[16..24]);
+        aead_decrypt(&subkey, &n12, ct_and_tag, aad)
+    }
+
+    fn wg_nonce(counter: u64) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[4..12].copy_from_slice(&counter.to_le_bytes());
+        n
+    }
+
+    // ---- Anti-replay 64-packet sliding window ----
+
+    #[derive(Debug, Clone, Default)]
+    struct ReplayWindow {
+        highest: u64,
+        bitmap: u64,
+        has_seen: bool,
+    }
+
+    impl ReplayWindow {
+        fn check_and_update(&mut self, seq: u64) -> bool {
+            if !self.has_seen {
+                self.has_seen = true;
+                self.highest = seq;
+                self.bitmap = 1;
+                return true;
+            }
+            if seq > self.highest {
+                let diff = seq - self.highest;
+                self.bitmap = if diff < 64 {
+                    (self.bitmap << diff) | 1
+                } else {
+                    1
+                };
+                self.highest = seq;
+                true
+            } else {
+                let diff = self.highest - seq;
+                if diff >= 64 {
+                    return false;
+                }
+                let bit = 1u64 << diff;
+                if (self.bitmap & bit) != 0 {
+                    return false;
+                }
+                self.bitmap |= bit;
+                true
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PendingHandshake {
+        sender_index: u32,
+        ephemeral_priv: [u8; 32],
+        ck: [u8; 32],
+        h: [u8; 32],
+        mac1: [u8; 16],
+    }
+
+    #[derive(Debug, Clone)]
+    struct TransportKeys {
+        send_key: [u8; 32],
+        recv_key: [u8; 32],
+        local_index: u32,
+        remote_index: u32,
+        send_counter: u64,
+        replay: ReplayWindow,
+    }
+
+    #[derive(Debug)]
+    pub struct WgPeer {
+        static_priv: [u8; 32],
+        static_pub: [u8; 32],
+        peer_static_pub: [u8; 32],
+        psk: [u8; 32],
+        cookie: Option<[u8; 16]>,
+        next_index: u32,
+        pending: Option<PendingHandshake>,
+        transport: Option<TransportKeys>,
+    }
+
+    impl WgPeer {
+        pub fn new(static_priv: [u8; 32], peer_static_pub: [u8; 32]) -> Self {
+            let static_pub = x25519_public(&static_priv);
+            Self {
+                static_priv,
+                static_pub,
+                peer_static_pub,
+                psk: [0u8; 32],
+                cookie: None,
+                next_index: 0x4652_0001,
+                pending: None,
+                transport: None,
+            }
+        }
+
+        /// Initiator step 1: generates a 148-byte WireGuard Type 1 Handshake Initiation packet.
+        pub fn build_initiation(
+            &mut self,
+            ephemeral_priv: [u8; 32],
+            tai64n12: &[u8; 12],
+        ) -> Option<[u8; 148]> {
+            let mut ck = blake2s(CONSTRUCTION);
+            let h0 = blake2s_two(&ck, IDENTIFIER);
+            let mut h = blake2s_two(&h0, &self.peer_static_pub);
+
+            let eph_pub = x25519_public(&ephemeral_priv);
+            ck = kdf1(&ck, &eph_pub);
+            h = blake2s_two(&h, &eph_pub);
+
+            let ss_es = x25519(&ephemeral_priv, &self.peer_static_pub);
+            if is_all_zero(&ss_es) {
+                return None;
+            }
+            let (new_ck, k1) = kdf2(&ck, &ss_es);
+            ck = new_ck;
+            let enc_static = aead_encrypt(&k1, &[0u8; 12], &self.static_pub, &h);
+            h = blake2s_two(&h, &enc_static);
+
+            let ss_ss = x25519(&self.static_priv, &self.peer_static_pub);
+            if is_all_zero(&ss_ss) {
+                return None;
+            }
+            let (new_ck2, k2) = kdf2(&ck, &ss_ss);
+            ck = new_ck2;
+            let enc_ts = aead_encrypt(&k2, &[0u8; 12], tai64n12, &h);
+            h = blake2s_two(&h, &enc_ts);
+
+            let sender_idx = self.next_index;
+            self.next_index = self.next_index.wrapping_add(1).max(1);
+
+            let mut pkt = [0u8; 148];
+            pkt[0] = 1;
+            pkt[4..8].copy_from_slice(&sender_idx.to_le_bytes());
+            pkt[8..40].copy_from_slice(&eph_pub);
+            pkt[40..88].copy_from_slice(&enc_static);
+            pkt[88..116].copy_from_slice(&enc_ts);
+
+            let mac1_key = blake2s_two(LABEL_MAC1, &self.peer_static_pub);
+            let mac1 = mac128(&mac1_key, &pkt[..116]);
+            pkt[116..132].copy_from_slice(&mac1);
+            if let Some(cookie) = self.cookie {
+                let mac2 = mac128(&cookie, &pkt[..132]);
+                pkt[132..148].copy_from_slice(&mac2);
+            }
+
+            self.pending = Some(PendingHandshake {
+                sender_index: sender_idx,
+                ephemeral_priv,
+                ck,
+                h,
+                mac1,
+            });
+            Some(pkt)
+        }
+
+        /// Initiator step 2 / Cookie handler: consumes a Type 2 Response (92B) or Type 3 Cookie (64B).
+        /// Returns `Some(true)` when transport keys become active, `Some(false)` when a Type 3 cookie was updated.
+        pub fn consume_server_packet(&mut self, pkt: &[u8]) -> Option<bool> {
+            if pkt.len() == 64 && pkt[0] == 3 {
+                let pending = self.pending.as_ref()?;
+                let receiver = u32::from_le_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+                if receiver != pending.sender_index {
+                    return None;
+                }
+                let mut nonce = [0u8; 24];
+                nonce.copy_from_slice(&pkt[8..32]);
+                let cookie_key = blake2s_two(LABEL_COOKIE, &self.peer_static_pub);
+                let dec = xaead_decrypt(&cookie_key, &nonce, &pkt[32..64], &pending.mac1)?;
+                if dec.len() != 16 {
+                    return None;
+                }
+                let mut c = [0u8; 16];
+                c.copy_from_slice(&dec);
+                self.cookie = Some(c);
+                return Some(false);
+            }
+            if pkt.len() != 92 || pkt[0] != 2 {
+                return None;
+            }
+            let pending = self.pending.as_ref()?;
+            let remote_index = u32::from_le_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+            let receiver_index = u32::from_le_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]);
+            if receiver_index != pending.sender_index {
+                return None;
+            }
+            let mut peer_eph = [0u8; 32];
+            peer_eph.copy_from_slice(&pkt[12..44]);
+
+            let mut ck = kdf1(&pending.ck, &peer_eph);
+            let mut h = blake2s_two(&pending.h, &peer_eph);
+
+            let ss_ee = x25519(&pending.ephemeral_priv, &peer_eph);
+            if is_all_zero(&ss_ee) {
+                return None;
+            }
+            ck = kdf1(&ck, &ss_ee);
+
+            let ss_se = x25519(&self.static_priv, &peer_eph);
+            if is_all_zero(&ss_se) {
+                return None;
+            }
+            ck = kdf1(&ck, &ss_se);
+
+            let (new_ck, tau, k) = kdf3(&ck, &self.psk);
+            ck = new_ck;
+            h = blake2s_two(&h, &tau);
+
+            let empty = aead_decrypt(&k, &[0u8; 12], &pkt[44..60], &h)?;
+            if !empty.is_empty() {
+                return None;
+            }
+
+            let (send_key, recv_key) = kdf2(&ck, &[]);
+            self.transport = Some(TransportKeys {
+                send_key,
+                recv_key,
+                local_index: pending.sender_index,
+                remote_index,
+                send_counter: 0,
+                replay: ReplayWindow::default(),
+            });
+            self.pending = None;
+            Some(true)
+        }
+
+        /// Responder helper (used by loopback handshake verification tests):
+        /// Accepts a Type 1 Initiation (148B) from an expected peer static key and produces a 92B Type 2 Response.
+        pub fn respond_initiation(
+            &mut self,
+            pkt: &[u8],
+            ephemeral_priv: [u8; 32],
+        ) -> Option<[u8; 92]> {
+            if pkt.len() != 148 || pkt[0] != 1 {
+                return None;
+            }
+            let sender_idx = u32::from_le_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+            let mut peer_eph = [0u8; 32];
+            peer_eph.copy_from_slice(&pkt[8..40]);
+
+            let mut ck = blake2s(CONSTRUCTION);
+            let h0 = blake2s_two(&ck, IDENTIFIER);
+            let mut h = blake2s_two(&h0, &self.static_pub);
+            ck = kdf1(&ck, &peer_eph);
+            h = blake2s_two(&h, &peer_eph);
+
+            let ss_es = x25519(&self.static_priv, &peer_eph);
+            if is_all_zero(&ss_es) {
+                return None;
+            }
+            let (new_ck, k1) = kdf2(&ck, &ss_es);
+            ck = new_ck;
+            let peer_static = aead_decrypt(&k1, &[0u8; 12], &pkt[40..88], &h)?;
+            if !ct_eq(&peer_static, &self.peer_static_pub) {
+                return None;
+            }
+            h = blake2s_two(&h, &pkt[40..88]);
+
+            let ss_ss = x25519(&self.static_priv, &self.peer_static_pub);
+            if is_all_zero(&ss_ss) {
+                return None;
+            }
+            let (new_ck2, k2) = kdf2(&ck, &ss_ss);
+            ck = new_ck2;
+            let ts = aead_decrypt(&k2, &[0u8; 12], &pkt[88..116], &h)?;
+            if ts.len() != 12 {
+                return None;
+            }
+            h = blake2s_two(&h, &pkt[88..116]);
+
+            // Build Type 2 Response
+            let eph_pub = x25519_public(&ephemeral_priv);
+            ck = kdf1(&ck, &eph_pub);
+            h = blake2s_two(&h, &eph_pub);
+
+            let ss_ee = x25519(&ephemeral_priv, &peer_eph);
+            if is_all_zero(&ss_ee) {
+                return None;
+            }
+            ck = kdf1(&ck, &ss_ee);
+
+            let ss_se = x25519(&ephemeral_priv, &self.peer_static_pub);
+            if is_all_zero(&ss_se) {
+                return None;
+            }
+            ck = kdf1(&ck, &ss_se);
+
+            let (new_ck3, tau, k3) = kdf3(&ck, &self.psk);
+            ck = new_ck3;
+            h = blake2s_two(&h, &tau);
+            let enc_empty = aead_encrypt(&k3, &[0u8; 12], &[], &h);
+
+            let (recv_key, send_key) = kdf2(&ck, &[]);
+            let local_idx = self.next_index;
+            self.next_index = self.next_index.wrapping_add(1).max(1);
+            self.transport = Some(TransportKeys {
+                send_key,
+                recv_key,
+                local_index: local_idx,
+                remote_index: sender_idx,
+                send_counter: 0,
+                replay: ReplayWindow::default(),
+            });
+
+            let mut resp = [0u8; 92];
+            resp[0] = 2;
+            resp[4..8].copy_from_slice(&local_idx.to_le_bytes());
+            resp[8..12].copy_from_slice(&sender_idx.to_le_bytes());
+            resp[12..44].copy_from_slice(&eph_pub);
+            resp[44..60].copy_from_slice(&enc_empty);
+            let mac1_key = blake2s_two(LABEL_MAC1, &self.peer_static_pub);
+            let mac1 = mac128(&mac1_key, &resp[..60]);
+            resp[60..76].copy_from_slice(&mac1);
+            Some(resp)
+        }
+
+        /// Encrypts an IP packet (or empty slice for keepalive) into a WireGuard Type 4 Transport packet.
+        pub fn encrypt_packet(&mut self, ip_packet: &[u8]) -> Option<Vec<u8>> {
+            let t = self.transport.as_mut()?;
+            let counter = t.send_counter;
+            t.send_counter = t.send_counter.checked_add(1)?;
+
+            let padded_len = if ip_packet.is_empty() {
+                0
+            } else {
+                (ip_packet.len() + 15) & !15
+            };
+            let mut padded = vec![0u8; padded_len];
+            if !ip_packet.is_empty() {
+                padded[..ip_packet.len()].copy_from_slice(ip_packet);
+            }
+            let nonce = wg_nonce(counter);
+            let ct = aead_encrypt(&t.send_key, &nonce, &padded, &[]);
+
+            let mut out = Vec::with_capacity(16 + ct.len());
+            out.extend_from_slice(&[4, 0, 0, 0]);
+            out.extend_from_slice(&t.remote_index.to_le_bytes());
+            out.extend_from_slice(&counter.to_le_bytes());
+            out.extend_from_slice(&ct);
+            Some(out)
+        }
+
+        /// Decrypts a WireGuard Type 4 Transport packet and trims WireGuard 16B zero padding.
+        pub fn decrypt_packet(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
+            if pkt.len() < 32 || pkt[0] != 4 {
+                return None;
+            }
+            let t = self.transport.as_mut()?;
+            let receiver_idx = u32::from_le_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+            if receiver_idx != t.local_index {
+                return None;
+            }
+            let counter = u64::from_le_bytes([
+                pkt[8], pkt[9], pkt[10], pkt[11], pkt[12], pkt[13], pkt[14], pkt[15],
+            ]);
+            let nonce = wg_nonce(counter);
+            let mut plain = aead_decrypt(&t.recv_key, &nonce, &pkt[16..], &[])?;
+            if !t.replay.check_and_update(counter) {
+                return None;
+            }
+            if plain.is_empty() {
+                return Some(plain);
+            }
+            let ver = plain[0] >> 4;
+            if ver == 4 && plain.len() >= 20 {
+                let total_len = usize::from(u16::from_be_bytes([plain[2], plain[3]]));
+                if total_len >= 20 && total_len <= plain.len() {
+                    plain.truncate(total_len);
+                }
+            } else if ver == 6 && plain.len() >= 40 {
+                let payload_len = usize::from(u16::from_be_bytes([plain[4], plain[5]]));
+                let total_len = 40 + payload_len;
+                if total_len <= plain.len() {
+                    plain.truncate(total_len);
+                }
+            }
+            Some(plain)
+        }
+    }
+
+    // ---- Opaque WireGuard Session Registry for JNI ----
+
+    struct WgRegistry {
+        next: i64,
+        items: Vec<(i64, Arc<Mutex<WgPeer>>)>,
+    }
+
+    static WG_REGISTRY: Mutex<WgRegistry> = Mutex::new(WgRegistry {
+        next: 1,
+        items: Vec::new(),
+    });
+
+    fn lock_reg() -> MutexGuard<'static, WgRegistry> {
+        WG_REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn create_session(priv_key: &[u8], peer_pub: &[u8]) -> i64 {
+        if priv_key.len() != 32 || peer_pub.len() != 32 {
+            return -1;
+        }
+        let mut s_priv = [0u8; 32];
+        let mut p_pub = [0u8; 32];
+        s_priv.copy_from_slice(priv_key);
+        p_pub.copy_from_slice(peer_pub);
+        let mut r = lock_reg();
+        if r.items.len() >= 32 {
+            return -5;
+        }
+        let h = r.next;
+        let Some(next) = h.checked_add(1) else {
+            return -5;
+        };
+        r.next = next;
+        r.items
+            .push((h, Arc::new(Mutex::new(WgPeer::new(s_priv, p_pub)))));
+        h
+    }
+
+    pub fn destroy_session(handle: i64) -> i32 {
+        let mut r = lock_reg();
+        let before = r.items.len();
+        r.items.retain(|(k, _)| *k != handle);
+        if r.items.len() != before { 0 } else { -2 }
+    }
+
+    fn get_peer(handle: i64) -> Option<Arc<Mutex<WgPeer>>> {
+        if handle <= 0 {
+            return None;
+        }
+        lock_reg()
+            .items
+            .iter()
+            .find(|(k, _)| *k == handle)
+            .map(|(_, p)| Arc::clone(p))
+    }
+
+    pub fn handshake_init(handle: i64, eph_priv: &[u8], tai64n12: &[u8]) -> Option<Vec<u8>> {
+        if eph_priv.len() != 32 || tai64n12.len() != 12 {
+            return None;
+        }
+        let mut ep = [0u8; 32];
+        let mut ts = [0u8; 12];
+        ep.copy_from_slice(eph_priv);
+        ts.copy_from_slice(tai64n12);
+        let peer = get_peer(handle)?;
+        let mut guard = peer.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.build_initiation(ep, &ts).map(|a| a.to_vec())
+    }
+
+    pub fn consume_response(handle: i64, pkt: &[u8]) -> i32 {
+        let Some(peer) = get_peer(handle) else {
+            return -2;
+        };
+        let mut guard = peer.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.consume_server_packet(pkt) {
+            Some(true) => 0,
+            Some(false) => 1, // cookie updated, resend initiation
+            None => -3,
+        }
+    }
+
+    pub fn encrypt_data(handle: i64, ip_pkt: &[u8]) -> Option<Vec<u8>> {
+        let peer = get_peer(handle)?;
+        let mut guard = peer.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.encrypt_packet(ip_pkt)
+    }
+
+    pub fn decrypt_data(handle: i64, wg_pkt: &[u8]) -> Option<Vec<u8>> {
+        let peer = get_peer(handle)?;
+        let mut guard = peer.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.decrypt_packet(wg_pkt)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // probe — bounded measurements
 // ---------------------------------------------------------------------------
 
@@ -8178,6 +9322,150 @@ mod exports {
         // SAFETY: JVM-provided env.
         jni::guard(null_mut(), || unsafe {
             respond(env, &api::proxy_stats(handle))
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_wgPublicKey(
+        env: EnvPtr,
+        _class: JClass,
+        priv_key: JByteArray,
+    ) -> JByteArray {
+        jni::guard(null_mut(), || {
+            // SAFETY: JVM-provided env and array.
+            let Ok(k) = (unsafe { input(env, priv_key) }) else {
+                return null_mut();
+            };
+            if k.len() != 32 {
+                return null_mut();
+            }
+            let mut sk = [0u8; 32];
+            sk.copy_from_slice(&k);
+            let pk = crate::wireguard::x25519_public(&sk);
+            // SAFETY: JVM-provided env.
+            unsafe { respond(env, &pk) }
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_wgCreate(
+        env: EnvPtr,
+        _class: JClass,
+        priv_key: JByteArray,
+        peer_pub: JByteArray,
+    ) -> JLong {
+        jni::guard(i64::from(code::PANIC), || {
+            // SAFETY: JVM-provided env and arrays.
+            let Ok(sk) = (unsafe { input(env, priv_key) }) else {
+                return -1;
+            };
+            // SAFETY: JVM-provided env and arrays.
+            let Ok(pk) = (unsafe { input(env, peer_pub) }) else {
+                return -1;
+            };
+            crate::wireguard::create_session(&sk, &pk)
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_freedom_network_Native_wgDestroy(
+        _env: EnvPtr,
+        _class: JClass,
+        wg_handle: JLong,
+    ) -> JInt {
+        jni::guard(code::PANIC, || crate::wireguard::destroy_session(wg_handle))
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_wgHandshakeInit(
+        env: EnvPtr,
+        _class: JClass,
+        wg_handle: JLong,
+        eph_priv: JByteArray,
+        tai64n: JByteArray,
+    ) -> JByteArray {
+        jni::guard(null_mut(), || {
+            // SAFETY: JVM-provided env and arrays.
+            let Ok(ep) = (unsafe { input(env, eph_priv) }) else {
+                return null_mut();
+            };
+            // SAFETY: JVM-provided env and arrays.
+            let Ok(ts) = (unsafe { input(env, tai64n) }) else {
+                return null_mut();
+            };
+            match crate::wireguard::handshake_init(wg_handle, &ep, &ts) {
+                // SAFETY: JVM-provided env.
+                Some(out) => unsafe { respond(env, &out) },
+                None => null_mut(),
+            }
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_wgConsumeResponse(
+        env: EnvPtr,
+        _class: JClass,
+        wg_handle: JLong,
+        pkt: JByteArray,
+    ) -> JInt {
+        jni::guard(code::PANIC, || {
+            // SAFETY: JVM-provided env and array.
+            let Ok(b) = (unsafe { input(env, pkt) }) else {
+                return -1;
+            };
+            crate::wireguard::consume_response(wg_handle, &b)
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_wgEncrypt(
+        env: EnvPtr,
+        _class: JClass,
+        wg_handle: JLong,
+        ip_pkt: JByteArray,
+    ) -> JByteArray {
+        jni::guard(null_mut(), || {
+            // SAFETY: JVM-provided env and array.
+            let Ok(b) = (unsafe { input(env, ip_pkt) }) else {
+                return null_mut();
+            };
+            match crate::wireguard::encrypt_data(wg_handle, &b) {
+                // SAFETY: JVM-provided env.
+                Some(out) => unsafe { respond(env, &out) },
+                None => null_mut(),
+            }
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_wgDecrypt(
+        env: EnvPtr,
+        _class: JClass,
+        wg_handle: JLong,
+        wg_pkt: JByteArray,
+    ) -> JByteArray {
+        jni::guard(null_mut(), || {
+            // SAFETY: JVM-provided env and array.
+            let Ok(b) = (unsafe { input(env, wg_pkt) }) else {
+                return null_mut();
+            };
+            match crate::wireguard::decrypt_data(wg_handle, &b) {
+                // SAFETY: JVM-provided env.
+                Some(out) => unsafe { respond(env, &out) },
+                None => null_mut(),
+            }
         })
     }
 }

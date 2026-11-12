@@ -3529,3 +3529,130 @@ fn oblivious_ohttp_odoh_framing_header_stripping_and_udp_mimicry() {
         assert_eq!(j[0] & 0xc0, 0x40);
     }
 }
+
+#[test]
+fn wireguard_crypto_rfc_vectors_and_tunnel_loopback() {
+    use crate::wireguard;
+
+    // 1) RFC 7748 Section 6.1 X25519 Diffie-Hellman test vector
+    let alice_priv: [u8; 32] = [
+        0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66,
+        0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9,
+        0x2c, 0x2a,
+    ];
+    let bob_priv: [u8; 32] = [
+        0x5d, 0xab, 0x08, 0x7e, 0x62, 0x4a, 0x8a, 0x4b, 0x79, 0xe1, 0x7f, 0x8b, 0x83, 0x80, 0x0e,
+        0xe6, 0x6f, 0x3b, 0xb1, 0x29, 0x26, 0x18, 0xb6, 0xfd, 0x1c, 0x2f, 0x8b, 0x27, 0xff, 0x88,
+        0xe0, 0xeb,
+    ];
+    let expected_alice_pub: [u8; 32] = [
+        0x85, 0x20, 0xf0, 0x09, 0x89, 0x30, 0xa7, 0x54, 0x74, 0x8b, 0x7d, 0xdc, 0xb4, 0x3e, 0xf7,
+        0x5a, 0x0d, 0xbf, 0x3a, 0x0d, 0x26, 0x38, 0x1a, 0xf4, 0xeb, 0xa4, 0xa9, 0x8e, 0xaa, 0x9b,
+        0x4e, 0x6a,
+    ];
+    let expected_bob_pub: [u8; 32] = [
+        0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4, 0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4, 0x35,
+        0x37, 0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d, 0xad, 0xfc, 0x7e, 0x14, 0x6f, 0x88,
+        0x2b, 0x4f,
+    ];
+    let expected_shared: [u8; 32] = [
+        0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1, 0x72, 0x8e, 0x3b, 0xf4, 0x80, 0x35, 0x0f,
+        0x25, 0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33, 0x76, 0xf0, 0x9b, 0x3c, 0x1e, 0x16,
+        0x17, 0x42,
+    ];
+    let a_pub = wireguard::x25519_public(&alice_priv);
+    let b_pub = wireguard::x25519_public(&bob_priv);
+    assert_eq!(a_pub, expected_alice_pub);
+    assert_eq!(b_pub, expected_bob_pub);
+    assert_eq!(wireguard::x25519(&alice_priv, &b_pub), expected_shared);
+    assert_eq!(wireguard::x25519(&bob_priv, &a_pub), expected_shared);
+
+    // 2) RFC 7693 Appendix A BLAKE2s-256("abc")
+    let blake_abc = wireguard::blake2s(b"abc");
+    let expected_blake_abc: [u8; 32] = [
+        0x50, 0x8c, 0x5e, 0x8c, 0x32, 0x7c, 0x14, 0xe2, 0xe1, 0xa7, 0x2b, 0xa3, 0x4e, 0xeb, 0x45,
+        0x2f, 0x37, 0x45, 0x8b, 0x20, 0x9e, 0xd6, 0x3a, 0x29, 0x4d, 0x99, 0x9b, 0x4c, 0x86, 0x67,
+        0x59, 0x82,
+    ];
+    assert_eq!(blake_abc, expected_blake_abc);
+
+    // 3) RFC 8439 Section 2.8.2 ChaCha20-Poly1305 AEAD vector
+    let key: [u8; 32] = [
+        0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e,
+        0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d,
+        0x9e, 0x9f,
+    ];
+    let nonce: [u8; 12] = [
+        0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+    ];
+    let aad: [u8; 12] = [
+        0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
+    ];
+    let pt = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    let ct = wireguard::aead_encrypt(&key, &nonce, pt, &aad);
+    let expected_tag: [u8; 16] = [
+        0x1a, 0xe1, 0x0b, 0x59, 0x4f, 0x09, 0xe2, 0x6a, 0x7e, 0x90, 0x2e, 0xcb, 0xd0, 0x60, 0x06,
+        0x91,
+    ];
+    assert_eq!(&ct[pt.len()..], &expected_tag);
+    assert_eq!(
+        wireguard::aead_decrypt(&key, &nonce, &ct, &aad).unwrap(),
+        pt
+    );
+
+    // 4) Full Noise_IKpsk2 loopback handshake + Type 4 transport + padding + replay guard
+    let mut responder = wireguard::WgPeer::new(bob_priv, a_pub);
+    let init_handle = wireguard::create_session(&alice_priv, &b_pub);
+    assert!(init_handle > 0);
+    let tai: [u8; 12] = [0x40, 0, 0, 0, 0x69, 0x10, 0, 1, 0, 0, 0, 42];
+    let mut eph_i = [0x33u8; 32];
+    eph_i[0] = 0x55;
+    let init_pkt = wireguard::handshake_init(init_handle, &eph_i, &tai).expect("type 1");
+    assert_eq!(init_pkt.len(), 148);
+    assert_eq!(init_pkt[0], 1);
+
+    let mut eph_r = [0x44u8; 32];
+    eph_r[0] = 0x66;
+    let resp_pkt = responder
+        .respond_initiation(&init_pkt, eph_r)
+        .expect("type 2");
+    assert_eq!(resp_pkt.len(), 92);
+    assert_eq!(resp_pkt[0], 2);
+    assert_eq!(wireguard::consume_response(init_handle, &resp_pkt), 0);
+
+    // Craft minimal IPv4 TCP-like payload (version 4, total_len = 28)
+    let mut ip_pkt = vec![
+        0x45, 0x00, 0x00, 0x1c, 0, 1, 0x40, 0, 64, 6, 0, 0, 172, 16, 0, 2, 1, 1, 1, 1,
+    ];
+    ip_pkt.extend_from_slice(b"FRDMNET!");
+    let wg_msg = wireguard::encrypt_data(init_handle, &ip_pkt).expect("type 4 encrypt");
+    assert_eq!(wg_msg[0], 4);
+    assert_eq!(wg_msg.len() % 16, 0);
+    let decrypted = responder
+        .decrypt_packet(&wg_msg)
+        .expect("responder decrypt");
+    assert_eq!(decrypted, ip_pkt);
+
+    // Anti-replay must reject duplicate Type 4 packet
+    assert!(responder.decrypt_packet(&wg_msg).is_none());
+
+    // Responder -> Initiator direction
+    let mut reply_ip = vec![
+        0x45, 0x00, 0x00, 0x18, 0, 2, 0x40, 0, 64, 17, 0, 0, 1, 1, 1, 1, 172, 16, 0, 2,
+    ];
+    reply_ip.extend_from_slice(b"PONG");
+    let reply_wg = responder.encrypt_packet(&reply_ip).expect("reply encrypt");
+    let reply_plain = wireguard::decrypt_data(init_handle, &reply_wg).expect("init decrypt");
+    assert_eq!(reply_plain, reply_ip);
+
+    // Keepalive (empty payload) returns empty vec cleanly
+    let ka_wg = responder.encrypt_packet(&[]).expect("keepalive encrypt");
+    assert!(
+        wireguard::decrypt_data(init_handle, &ka_wg)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_eq!(wireguard::destroy_session(init_handle), 0);
+    assert_eq!(wireguard::destroy_session(init_handle), -2);
+}
