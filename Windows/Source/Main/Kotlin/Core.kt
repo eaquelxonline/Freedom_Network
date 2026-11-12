@@ -1221,6 +1221,9 @@ class MainWindow {
         frame.addWindowListener(object : WindowAdapter() {
             override fun windowClosed(e: WindowEvent) = shutdown()
         })
+        frame.iconImages = listOf(16, 32, 48, 256).mapNotNull { n ->
+            MainWindow::class.java.getResourceAsStream("/icon-$n.png")?.use { javax.imageio.ImageIO.read(it) }
+        }
         frame.minimumSize = Dimension(640, 520)
         frame.setLocationRelativeTo(null)
 

@@ -17,4 +17,9 @@ dependencyResolutionManagement {
 
 rootProject.name = "TheDPI"
 
-include(":Android", ":Windows")
+// `-Pthedpi.windowsOnly=true` builds without the Android module (e.g. on a Windows CI runner).
+if (providers.gradleProperty("thedpi.windowsOnly").orNull == "true") {
+    include(":Windows")
+} else {
+    include(":Android", ":Windows")
+}

@@ -22,7 +22,7 @@ kotlin {
 sourceSets {
     named("main") {
         java.setSrcDirs(emptyList<String>())
-        resources.setSrcDirs(emptyList<String>())
+        resources.setSrcDirs(listOf("Source/Main/Resources"))
     }
     named("test") {
         java.setSrcDirs(emptyList<String>())
@@ -122,6 +122,7 @@ val packageWindows = tasks.register<Exec>("packageWindows") {
         "--input", layout.buildDirectory.dir("package/input").get().asFile.absolutePath,
         "--main-jar", "TheDPI-${project.version}.jar", "--main-class", "thedpi.CoreKt",
         "--java-options", "-Djava.library.path=\$APPDIR",
+        "--icon", layout.projectDirectory.file("Source/Main/Resources/icon.ico").asFile.absolutePath,
         "--dest", out.absolutePath,
     )
 }
