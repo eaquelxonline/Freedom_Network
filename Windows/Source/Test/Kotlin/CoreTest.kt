@@ -458,6 +458,202 @@ fun main() {
         for (o in 1..Text.KNOWN_OBSERVATIONS) expect(!Text.observation(Observation(o, "x", listOf(1, 2))).startsWith("Gözlem")) { "observation $o" }
         for (s in 0..7) expect(!Text.state(s).startsWith("Durum")) { "state $s" }
         for (s in 0..13) expect(!Text.status(s).startsWith("durum")) { "status $s" }
+        for (m in 0..Text.KNOWN_DESYNC_MODES) expect(!Text.desyncMode(m).startsWith("Mod")) { "desyncMode $m" }
+    }
+
+    test("active DPI desync packet transformation and local proxy lifecycle over JNI") {
+        DiagnosticSession(fastConfig).use { s ->
+            val httpPayload = "GET / HTTP/1.1\r\nHost: blocked.example.com\r\n\r\n".toByteArray()
+            val total = 40 + httpPayload.size
+            val pkt = ByteArray(total)
+            pkt[0] = 0x45.toByte()
+            pkt[2] = ((total shr 8) and 0xff).toByte()
+            pkt[3] = (total and 0xff).toByte()
+            pkt[8] = 64
+            pkt[9] = 6 // TCP
+            pkt[12] = 10; pkt[13] = 0; pkt[14] = 0; pkt[15] = 1
+            pkt[16] = 93.toByte(); pkt[17] = 184.toByte(); pkt[18] = 216.toByte(); pkt[19] = 34
+            pkt[21] = 80
+            pkt[23] = 80
+            pkt[32] = 0x50.toByte()
+            pkt[33] = 0x18.toByte()
+            System.arraycopy(httpPayload, 0, pkt, 40, httpPayload.size)
+
+            val res = s.desyncPacket(pkt, DesyncConfig(mode = DesyncMode.ADAPTIVE_FULL, fakeTtl = 4))
+            eq(res.status, Codes.OK, "desync status")
+            eq(res.sni, "blocked.example.com", "extracted host")
+            expect(!res.dropped && res.packets.size >= 3) { "expected fake + disordered segments, got ${res.packets.size}" }
+
+            val started = s.startProxy(DesyncConfig(mode = DesyncMode.ADAPTIVE_FULL, port = 0))
+            eq(started.status, Codes.OK, "startProxy status")
+            expect(started.active && started.port > 0) { "proxy active on port ${started.port}" }
+            expect("ENGELSİZ MOD" in Text.proxyStatus(started)) { "proxy Turkish status" }
+            eq(s.stopProxy(), Codes.OK, "stopProxy")
+            expect(!s.proxyStats().active) { "proxy stopped" }
+        }
+    }
+
+    test("TunBridge end-to-end: DoH DNS, Roblox/Discord UDP NAT, and Discord TCP Desync over protected sockets") {
+        DiagnosticSession(fastConfig).use { s ->
+            val appToBridgeIn = java.io.PipedInputStream(65536)
+            val appToBridgeOut = java.io.PipedOutputStream(appToBridgeIn)
+            val bridgeToAppIn = java.io.PipedInputStream(65536)
+            val bridgeToAppOut = java.io.PipedOutputStream(bridgeToAppIn)
+
+            val protectedTcpCount = AtomicInteger(0)
+            val protectedUdpCount = AtomicInteger(0)
+
+            val mockDoh = DohClient { _, body, _ ->
+                // RFC 8484 requires ID=0 in DoH wire query
+                expect(body.size >= 12 && body[0].toInt() == 0 && body[1].toInt() == 0) { "DoH query ID must be 0" }
+                DohResponse(1, 500, EncProtocol.DOH3, dnsAnswer(body, byteArrayOf(162.toByte(), 159.toByte(), 135.toByte(), 232.toByte())))
+            }
+
+            fun readNextIpPacket(input: java.io.InputStream): ByteArray {
+                val hdr = ByteArray(20)
+                var read = 0
+                while (read < 20) {
+                    val n = input.read(hdr, read, 20 - read)
+                    if (n < 0) error("EOF reading IPv4 header")
+                    read += n
+                }
+                val totalLen = IpPackets.u16(hdr, 2)
+                val full = ByteArray(totalLen)
+                System.arraycopy(hdr, 0, full, 0, 20)
+                while (read < totalLen) {
+                    val n = input.read(full, read, totalLen - read)
+                    if (n < 0) error("EOF reading IPv4 body")
+                    read += n
+                }
+                return full
+            }
+
+            val clientIp = IpPackets.parseIpLiteral(TunBridge.VPN_CLIENT_IP)!!
+            val vpnDnsIp = IpPackets.parseIpLiteral(TunBridge.VPN_DNS_IP)!!
+            val loopbackIp = IpPackets.parseIpLiteral("127.0.0.1")!!
+
+            TunBridge(
+                session = s,
+                tunInput = appToBridgeIn,
+                tunOutput = bridgeToAppOut,
+                protectSocket = { protectedTcpCount.incrementAndGet(); true },
+                protectDatagram = { protectedUdpCount.incrementAndGet(); true },
+                dohClient = mockDoh,
+                dohEndpoints = listOf("https://cloudflare-dns.com/dns-query"),
+            ).use { bridge ->
+                bridge.start()
+
+                // 1) DNS-over-UDP (port 53) intercepted and resolved via Encrypted DNS (DoH3)
+                val rawDnsQuery = Doh.query("discord.com")!!.also {
+                    it[0] = 0xCA.toByte()
+                    it[1] = 0xFE.toByte()
+                }
+                val dnsPkt = IpPackets.buildIpv4Udp(clientIp, vpnDnsIp, 53000, 53, rawDnsQuery)
+                appToBridgeOut.write(dnsPkt)
+                appToBridgeOut.flush()
+
+                val dnsReplyPkt = readNextIpPacket(bridgeToAppIn)
+                val dnsReplyUdp = IpPackets.parseUdp(dnsReplyPkt)!!
+                eq(dnsReplyUdp.srcPort, 53, "DNS reply srcPort")
+                eq(dnsReplyUdp.dstPort, 53000, "DNS reply dstPort")
+                eq(dnsReplyUdp.payload[0], 0xCA.toByte(), "restored DNS ID hi")
+                eq(dnsReplyUdp.payload[1], 0xFE.toByte(), "restored DNS ID lo")
+                eq(bridge.dnsQueries.get(), 1, "dnsQueries counter")
+                eq(bridge.dohResolved.get(), 1, "dohResolved counter")
+
+                // 2) Roblox RakNet / Discord Voice UDP NAT relay over VpnService.protect()ed DatagramSocket
+                DatagramSocket(0, InetAddress.getLoopbackAddress()).use { udpSrv ->
+                    udpSrv.soTimeout = 3000
+                    val srvThread = Thread {
+                        val buf = ByteArray(512)
+                        val dp = DatagramPacket(buf, buf.size)
+                        udpSrv.receive(dp)
+                        val msg = String(dp.data, 0, dp.length)
+                        val reply = "VOICE_PONG:$msg".toByteArray()
+                        udpSrv.send(DatagramPacket(reply, reply.size, dp.socketAddress))
+                    }.apply { isDaemon = true; start() }
+
+                    val udpPayload = "ROBLOX_DISCORD_UDP_FRAME".toByteArray()
+                    val udpOutPkt = IpPackets.buildIpv4Udp(clientIp, loopbackIp, 54000, udpSrv.localPort, udpPayload)
+                    appToBridgeOut.write(udpOutPkt)
+                    appToBridgeOut.flush()
+
+                    val udpInPkt = readNextIpPacket(bridgeToAppIn)
+                    val udpIn = IpPackets.parseUdp(udpInPkt)!!
+                    eq(udpIn.srcPort, udpSrv.localPort, "UDP NAT reply srcPort")
+                    eq(udpIn.dstPort, 54000, "UDP NAT reply dstPort")
+                    eq(String(udpIn.payload), "VOICE_PONG:ROBLOX_DISCORD_UDP_FRAME", "UDP NAT payload")
+                    expect(protectedUdpCount.get() >= 1) { "protectDatagram must be called" }
+                    srvThread.join(2000)
+                }
+
+                // 3) Discord TCP + Active Desync split over VpnService.protect()ed Socket
+                ServerSocket(0, 8, InetAddress.getLoopbackAddress()).use { tcpSrv ->
+                    tcpSrv.soTimeout = 3000
+                    val httpReq = "GET /api/v10/gateway HTTP/1.1\r\nHost: discord.com\r\n\r\n".toByteArray()
+                    val srvThread = Thread {
+                        tcpSrv.accept().use { conn ->
+                            conn.soTimeout = 3000
+                            val received = java.io.ByteArrayOutputStream()
+                            val buf = ByteArray(256)
+                            while (received.size() < httpReq.size) {
+                                val n = conn.inputStream.read(buf)
+                                if (n <= 0) break
+                                received.write(buf, 0, n)
+                            }
+                            conn.outputStream.write("HTTP/1.1 200 DISCORD_OK\r\n\r\n".toByteArray())
+                            conn.outputStream.flush()
+                        }
+                    }.apply { isDaemon = true; start() }
+
+                    // Send TCP SYN
+                    val synPkt = IpPackets.buildIpv4Tcp(
+                        srcIp = clientIp,
+                        dstIp = loopbackIp,
+                        srcPort = 55000,
+                        dstPort = tcpSrv.localPort,
+                        seq = 1000L,
+                        ack = 0L,
+                        flags = IpPackets.TCP_SYN,
+                    )
+                    appToBridgeOut.write(synPkt)
+                    appToBridgeOut.flush()
+
+                    val synAckPkt = readNextIpPacket(bridgeToAppIn)
+                    val synAck = IpPackets.parseTcp(synAckPkt)!!
+                    eq(synAck.flags and (IpPackets.TCP_SYN or IpPackets.TCP_ACK), IpPackets.TCP_SYN or IpPackets.TCP_ACK, "SYN+ACK flags")
+                    eq(synAck.ack, 1001L, "SYN+ACK ack")
+
+                    // Send PSH+ACK carrying HTTP request to discord.com
+                    val dataPkt = IpPackets.buildIpv4Tcp(
+                        srcIp = clientIp,
+                        dstIp = loopbackIp,
+                        srcPort = 55000,
+                        dstPort = tcpSrv.localPort,
+                        seq = 1001L,
+                        ack = (synAck.seq + 1L) and 0xFFFFFFFFL,
+                        flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK,
+                        payload = httpReq,
+                    )
+                    appToBridgeOut.write(dataPkt)
+                    appToBridgeOut.flush()
+
+                    var gotResponse = ""
+                    for (attempt in 0 until 4) {
+                        val pkt = readNextIpPacket(bridgeToAppIn)
+                        val seg = IpPackets.parseTcp(pkt)!!
+                        if (seg.payload.isNotEmpty()) {
+                            gotResponse += String(seg.payload)
+                            break
+                        }
+                    }
+                    eq(gotResponse, "HTTP/1.1 200 DISCORD_OK\r\n\r\n", "TCP response payload")
+                    expect(protectedTcpCount.get() >= 1) { "protectSocket must be called" }
+                    expect(bridge.desyncedFlows.get() >= 1) { "desyncedFlows must be >= 1" }
+                    srvThread.join(2000)
+                }
+            }
+        }
     }
 
     println()

@@ -48,17 +48,36 @@ core::arch::global_asm!(include_str!("Core.s"), options(att_syntax));
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("Core.aarch64.s"));
 
-/// Fast ASCII lower-casing used on the DNS/target name-normalization path. The hot
-/// implementation is hand-written SIMD Assembly; every other target uses the standard
-/// library. Only bytes 'A'..'Z' (all < 0x80) are modified, so UTF-8 stays valid.
+/// Architecture-specific SIMD Assembly primitives (Core.s SSE2 / Core.aarch64.s NEON)
+/// with portable standard-library fallbacks:
+/// - `lowercase_in_place` / `lowercased`: DNS/target ASCII normalization
+/// - `csum_fold`: RFC 1071 16-bit one's-complement big-endian checksum accumulator
+/// - `csum_delta`: RFC 1624 incremental checksum update for TTL/Seq/BadSum mutation
+/// - `scan_pattern`: SIMD 16-byte broadcast scanner for TLS SNI/ECH and HTTP headers
 pub mod ascii {
     #[cfg(target_arch = "x86_64")]
     unsafe extern "sysv64" {
         fn the_dpi_ascii_lowercase(dst: *mut u8, src: *const u8, len: usize);
+        fn the_dpi_csum_fold(buf: *const u8, len: usize, initial: u64) -> u16;
+        fn the_dpi_csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16;
+        fn the_dpi_scan_pattern(
+            hay: *const u8,
+            hay_len: usize,
+            needle: *const u8,
+            needle_len: usize,
+        ) -> usize;
     }
     #[cfg(target_arch = "aarch64")]
     unsafe extern "C" {
         fn the_dpi_ascii_lowercase(dst: *mut u8, src: *const u8, len: usize);
+        fn the_dpi_csum_fold(buf: *const u8, len: usize, initial: u64) -> u16;
+        fn the_dpi_csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16;
+        fn the_dpi_scan_pattern(
+            hay: *const u8,
+            hay_len: usize,
+            needle: *const u8,
+            needle_len: usize,
+        ) -> usize;
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -81,6 +100,87 @@ pub mod ascii {
         let mut v = s.as_bytes().to_vec();
         lowercase_in_place(&mut v);
         String::from_utf8(v).unwrap_or_else(|_| s.to_ascii_lowercase())
+    }
+
+    /// Portable reference implementation of RFC 1071 16-bit big-endian sum folding.
+    pub fn csum_fold_std(buf: &[u8], mut sum: u64) -> u16 {
+        let mut i = 0;
+        while i + 1 < buf.len() {
+            let w = (u16::from(buf[i]) << 8) | u16::from(buf[i + 1]);
+            sum = sum.wrapping_add(u64::from(w));
+            i += 2;
+        }
+        if i < buf.len() {
+            sum = sum.wrapping_add(u64::from(buf[i]) << 8);
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// Vectorized RFC 1071 16-bit one's-complement sum fold (before bitwise NOT).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn csum_fold(buf: &[u8], initial: u64) -> u16 {
+        // SAFETY: `buf.as_ptr()` is valid for `buf.len()` readable bytes.
+        unsafe { the_dpi_csum_fold(buf.as_ptr(), buf.len(), initial) }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn csum_fold(buf: &[u8], initial: u64) -> u16 {
+        csum_fold_std(buf, initial)
+    }
+
+    /// Portable reference implementation of RFC 1624 incremental checksum update.
+    pub fn csum_delta_std(old_check: u16, old_word: u16, new_word: u16) -> u16 {
+        let mut sum = u32::from(!old_check) + u32::from(!old_word) + u32::from(new_word);
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Hardware register RFC 1624 incremental checksum update: `HC' = ~(~HC + ~m + m')`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16 {
+        // SAFETY: pure register arithmetic with no memory accesses.
+        unsafe { the_dpi_csum_delta(old_check, old_word, new_word) }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16 {
+        csum_delta_std(old_check, old_word, new_word)
+    }
+
+    /// Portable reference implementation of sub-slice pattern search.
+    pub fn scan_pattern_std(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        if needle.len() > hay.len() {
+            return None;
+        }
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// SIMD-accelerated sub-slice search for TLS/HTTP deep packet inspection.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn scan_pattern(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        if needle.len() > hay.len() {
+            return None;
+        }
+        // SAFETY: both slices are valid and readable for their respective lengths.
+        let pos =
+            unsafe { the_dpi_scan_pattern(hay.as_ptr(), hay.len(), needle.as_ptr(), needle.len()) };
+        (pos < hay.len()).then_some(pos)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn scan_pattern(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        scan_pattern_std(hay, needle)
     }
 }
 
@@ -214,6 +314,7 @@ pub mod tags {
         pub const DECISION: u8 = 5;
         pub const STABILITY: u8 = 6;
         pub const EVALUATIONS: u8 = 7;
+        pub const DESYNC_MODE: u8 = 8;
     }
     pub mod diagnosis {
         pub const CATEGORY: u8 = 1;
@@ -263,6 +364,27 @@ pub mod tags {
         pub const COOLDOWN_MS: u8 = 5;
         pub const PARAM: u8 = 6;
         pub const HIGH_IMPACT: u8 = 7;
+    }
+    /// Active DPI circumvention (desynchronization) and local proxy wire tags.
+    pub mod desync {
+        pub const MODE: u8 = 1;
+        pub const FAKE_TTL: u8 = 2;
+        pub const SPLIT_POS: u8 = 3;
+        pub const DROP_RST: u8 = 4;
+        pub const PORT: u8 = 5;
+        pub const PACKET: u8 = 6;
+        pub const OUT_PACKET: u8 = 7;
+        pub const DROPPED: u8 = 8;
+        pub const PROTOCOL: u8 = 9;
+        pub const SNI: u8 = 10;
+        pub const ECH: u8 = 11;
+        pub const POST_QUANTUM: u8 = 12;
+        pub const CONNECTIONS: u8 = 13;
+        pub const TLS_SPLIT: u8 = 14;
+        pub const HTTP_SPLIT: u8 = 15;
+        pub const FAKE_SENT: u8 = 16;
+        pub const RST_DROPPED: u8 = 17;
+        pub const ACTIVE: u8 = 18;
     }
 }
 
@@ -1115,6 +1237,95 @@ pub mod sys {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
+    /// Sets the outbound IPv4 TTL or IPv6 Hop Limit on a TCP stream for active low-TTL
+    /// decoy packet injection on the local socket path.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    pub fn set_tcp_ttl(sock: &std::net::TcpStream, ipv6: bool, ttl: u32) -> io::Result<()> {
+        use std::ffi::{c_int, c_void};
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn setsockopt(
+                fd: c_int,
+                level: c_int,
+                name: c_int,
+                value: *const c_void,
+                len: u32,
+            ) -> c_int;
+        }
+        const IPPROTO_IP: c_int = 0;
+        const IP_TTL: c_int = 2;
+        const IPPROTO_IPV6: c_int = 41;
+        const IPV6_UNICAST_HOPS: c_int = 16;
+        let (level, name) = if ipv6 {
+            (IPPROTO_IPV6, IPV6_UNICAST_HOPS)
+        } else {
+            (IPPROTO_IP, IP_TTL)
+        };
+        let value: c_int = ttl.clamp(1, 255) as c_int;
+        // SAFETY: `sock` owns the open file descriptor; `value` is a stack `c_int`.
+        let rc = unsafe {
+            setsockopt(
+                sock.as_raw_fd(),
+                level,
+                name,
+                (&raw const value).cast(),
+                size_of::<c_int>() as u32,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_tcp_ttl(sock: &std::net::TcpStream, ipv6: bool, ttl: u32) -> io::Result<()> {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "ws2_32")]
+        unsafe extern "system" {
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
+            fn WSAGetLastError() -> i32;
+        }
+        const IPPROTO_IP: i32 = 0;
+        const IP_TTL: i32 = 4;
+        const IPPROTO_IPV6: i32 = 41;
+        const IPV6_UNICAST_HOPS: i32 = 4;
+        let (level, name) = if ipv6 {
+            (IPPROTO_IPV6, IPV6_UNICAST_HOPS)
+        } else {
+            (IPPROTO_IP, IP_TTL)
+        };
+        let value: u32 = ttl.clamp(1, 255);
+        // SAFETY: `sock` owns the open Winsock SOCKET; `value` is a 4-byte stack DWORD.
+        let rc = unsafe {
+            setsockopt(
+                sock.as_raw_socket() as usize,
+                level,
+                name,
+                (&raw const value).cast(),
+                4,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            // SAFETY: reads thread-local Winsock error code.
+            Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "linux", windows)))]
+    pub fn set_tcp_ttl(_sock: &std::net::TcpStream, _ipv6: bool, _ttl: u32) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
     /// True when a send failed because the datagram exceeds the local/known path MTU.
     pub fn is_message_too_large(e: &io::Error) -> bool {
         #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1862,6 +2073,1129 @@ pub mod sysnet {
     #[cfg(not(windows))]
     pub fn snapshot() -> Record {
         Record::with_status(code::UNSUPPORTED)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// desync — 2026-2027 active DPI circumvention & local socket/packet engine
+// ---------------------------------------------------------------------------
+
+/// Active Deep Packet Inspection (DPI) desynchronization engine (GoodbyeDPI / Zapret / ByeDPI
+/// architecture) implemented in zero-dependency Rust + SIMD Assembly (`ascii`).
+///
+/// Supports two complementary local execution planes with zero external VPN servers:
+/// 1. **Packet Plane (`desync_packet` / `should_drop_inbound`)**: In-place IPv4/IPv6 + TCP/UDP
+///    packet segmentation, out-of-order TCP Sequence Number disorder, decoy Fake packet
+///    injection (RFC 1624 BadSum or adaptive auto-TTL), QUIC Initial UDP scrambling, and
+///    passive DPI spoofed TCP RST / HTTP redirect filtering for Windows WFP/WinDivert and
+///    Android `VpnService` TUN descriptors.
+/// 2. **Socket Plane (`LocalProxy`)**: Unprivileged local loopback SOCKS5 (RFC 1928) and
+///    HTTP `CONNECT` / transparent proxy that splits TLS 1.3 (including Hybrid Post-Quantum
+///    `X25519MLKEM768` and RFC 9849 ECH) and HTTP requests across exact SNI/ECH/`Host:`
+///    boundaries with `TCP_NODELAY` and low-TTL decoy writes.
+pub mod desync {
+    use crate::wire::Record;
+    use crate::{ascii, code, quic, sys, tags};
+    use std::io::{self, Read, Write};
+    use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    pub const PROTO_UNKNOWN: i64 = 0;
+    pub const PROTO_TLS_CLIENT_HELLO: i64 = 1;
+    pub const PROTO_HTTP_REQUEST: i64 = 2;
+    pub const PROTO_QUIC_INITIAL: i64 = 3;
+
+    /// Active DPI circumvention strategy.
+    #[repr(i64)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum DesyncMode {
+        #[default]
+        Off = 0,
+        /// Splits TLS ClientHello / HTTP request at the exact SNI/ECH/`Host:` boundary.
+        Split = 1,
+        /// Splits into 2–3 TCP segments and emits them in reverse Sequence Number order.
+        Disorder = 2,
+        /// Prepends a decoy TCP segment (`www.iana.org`) with an RFC 1624 corrupted checksum,
+        /// followed by disordered real segments.
+        FakeBadSum = 3,
+        /// Prepends a decoy TCP segment (`www.iana.org`) with an adaptive low IP TTL / Hop Limit
+        /// so it expires after the ISP DPI box but before the destination server.
+        FakeAutoTtl = 4,
+        /// Prepends a decoy QUIC Version Negotiation / Initial datagram on UDP/443 and forces
+        /// immediate TCP/TLS 1.3 fallback when QUIC is blackholed.
+        QuicScramble = 5,
+        /// Full 2026–2027 multi-vector pipeline: FakeAutoTtl + FakeBadSum + Multi-Disorder
+        /// across both SNI (`0x0000`) and ECH (`0xfe0d`) + QUIC scramble + passive RST filter.
+        AdaptiveFull = 6,
+    }
+
+    impl DesyncMode {
+        pub fn from_code(c: i64) -> Self {
+            match c {
+                1 => Self::Split,
+                2 => Self::Disorder,
+                3 => Self::FakeBadSum,
+                4 => Self::FakeAutoTtl,
+                5 => Self::QuicScramble,
+                6 => Self::AdaptiveFull,
+                _ => Self::Off,
+            }
+        }
+    }
+
+    /// Configuration for packet-plane and socket-plane desynchronization.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DesyncConfig {
+        pub mode: DesyncMode,
+        /// TTL / Hop Limit for decoy packets (default 5; clamped to 2..=16).
+        pub fake_ttl: u8,
+        /// Fallback split offset within payload when no SNI/Host is present (default 2).
+        pub split_pos: usize,
+        /// Drop inbound passive-DPI spoofed TCP RST and HTTP 302/403 redirect packets.
+        pub drop_spoofed_rst: bool,
+        /// Local proxy listen port (0 = OS-assigned ephemeral port).
+        pub listen_port: u16,
+    }
+
+    impl Default for DesyncConfig {
+        fn default() -> Self {
+            Self {
+                mode: DesyncMode::AdaptiveFull,
+                fake_ttl: 5,
+                split_pos: 2,
+                drop_spoofed_rst: true,
+                listen_port: 0,
+            }
+        }
+    }
+
+    impl DesyncConfig {
+        pub fn from_record(r: &Record) -> Self {
+            use tags::desync as t;
+            let d = Self::default();
+            let mode = r.get_int(t::MODE).map_or(d.mode, DesyncMode::from_code);
+            let fake_ttl = r
+                .get_int(t::FAKE_TTL)
+                .and_then(|v| u8::try_from(v.clamp(2, 16)).ok())
+                .unwrap_or(d.fake_ttl);
+            let split_pos = r
+                .get_int(t::SPLIT_POS)
+                .and_then(|v| usize::try_from(v.clamp(1, 256)).ok())
+                .unwrap_or(d.split_pos);
+            let drop_spoofed_rst = r
+                .get_int(t::DROP_RST)
+                .map_or(d.drop_spoofed_rst, |v| v != 0);
+            let listen_port = r
+                .get_int(t::PORT)
+                .and_then(|v| u16::try_from(v.clamp(0, 65535)).ok())
+                .unwrap_or(d.listen_port);
+            Self {
+                mode,
+                fake_ttl,
+                split_pos,
+                drop_spoofed_rst,
+                listen_port,
+            }
+        }
+    }
+
+    /// Deep Layer-7 inspection result extracted from a TCP/UDP payload.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct L7Inspection {
+        pub protocol: i64,
+        pub host: String,
+        pub host_offset: Option<usize>,
+        pub host_len: usize,
+        pub ech_offset: Option<usize>,
+        pub ech_len: usize,
+        pub post_quantum: bool,
+        pub split_offsets: Vec<usize>,
+    }
+
+    const HTTP_METHODS: [&[u8]; 7] = [
+        b"GET ",
+        b"POST ",
+        b"HEAD ",
+        b"PUT ",
+        b"DELETE ",
+        b"OPTIONS ",
+        b"CONNECT ",
+    ];
+
+    /// Inspects a TCP or UDP payload for TLS ClientHello (SNI 0x0000, ECH 0xfe0d, PQ KeyShare
+    /// 0x11ec), HTTP request (`Host:` header via SIMD `scan_pattern`), or QUIC v1/v2 Initial.
+    pub fn inspect_l7(payload: &[u8], fallback_split: usize) -> L7Inspection {
+        if let Some(tls) = inspect_tls_client_hello(payload, fallback_split) {
+            return tls;
+        }
+        if let Some(http) = inspect_http_request(payload, fallback_split) {
+            return http;
+        }
+        if let Some(q) = inspect_quic_initial(payload) {
+            return q;
+        }
+        L7Inspection::default()
+    }
+
+    fn inspect_tls_client_hello(buf: &[u8], fallback_split: usize) -> Option<L7Inspection> {
+        // TLS Record Header: ContentType=0x16 (Handshake), LegacyVersion=0x03 0x01..0x04,
+        // Length (2B), HandshakeType=0x01 (ClientHello), HandshakeLen (3B), ClientVersion (2B), Random (32B).
+        if buf.len() < 43 || buf[0] != 0x16 || buf[1] != 0x03 || buf[2] > 0x04 || buf[5] != 0x01 {
+            return None;
+        }
+        let mut pos = 43usize;
+        // Session ID
+        if pos >= buf.len() {
+            return None;
+        }
+        let sid_len = usize::from(buf[pos]);
+        pos = pos.checked_add(1 + sid_len)?;
+        // Cipher Suites
+        if pos + 2 > buf.len() {
+            return None;
+        }
+        let cs_len = usize::from(u16::from_be_bytes([buf[pos], buf[pos + 1]]));
+        pos = pos.checked_add(2 + cs_len)?;
+        // Compression Methods
+        if pos >= buf.len() {
+            return None;
+        }
+        let comp_len = usize::from(buf[pos]);
+        pos = pos.checked_add(1 + comp_len)?;
+
+        let mut out = L7Inspection {
+            protocol: PROTO_TLS_CLIENT_HELLO,
+            ..L7Inspection::default()
+        };
+
+        if pos + 2 <= buf.len() {
+            let ext_total = usize::from(u16::from_be_bytes([buf[pos], buf[pos + 1]]));
+            pos += 2;
+            let ext_end = pos.saturating_add(ext_total).min(buf.len());
+            while pos + 4 <= ext_end {
+                let ext_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+                let ext_len = usize::from(u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]));
+                pos += 4;
+                if pos + ext_len > ext_end {
+                    break;
+                }
+                let ext_data = &buf[pos..pos + ext_len];
+                match ext_type {
+                    // server_name (SNI, RFC 6066)
+                    0x0000 => {
+                        if ext_data.len() >= 5 && ext_data[2] == 0x00 {
+                            let name_len =
+                                usize::from(u16::from_be_bytes([ext_data[3], ext_data[4]]));
+                            if 5 + name_len <= ext_data.len() && name_len > 0 {
+                                let name_off = pos + 5;
+                                out.host_offset = Some(name_off);
+                                out.host_len = name_len;
+                                out.host = ascii::lowercased(
+                                    std::str::from_utf8(&buf[name_off..name_off + name_len])
+                                        .unwrap_or(""),
+                                );
+                            }
+                        }
+                    }
+                    // encrypted_client_hello (ECH, RFC 9849, 0xfe0d)
+                    0xfe0d => {
+                        out.ech_offset = Some(pos);
+                        out.ech_len = ext_len;
+                    }
+                    // key_share (RFC 8446 / RFC 9846, 0x0033) — check for X25519MLKEM768 (0x11ec)
+                    0x0033
+                        if ext_len > 512
+                            || ascii::scan_pattern(ext_data, &[0x11, 0xec]).is_some() =>
+                    {
+                        out.post_quantum = true;
+                    }
+                    _ => {}
+                }
+                pos += ext_len;
+            }
+        }
+
+        // Compute optimal multi-split offsets inside SNI and ECH so stateful DPI reassemblers
+        // never see an intact SNI or ECH extension in a single TCP segment.
+        let mut splits = Vec::with_capacity(2);
+        let first_split = fallback_split.clamp(1, buf.len().saturating_sub(1));
+        if let Some(sni_off) = out.host_offset {
+            let mid_sni = sni_off + (out.host_len / 2).max(1);
+            if first_split < mid_sni && mid_sni < buf.len() {
+                splits.push(first_split);
+                splits.push(mid_sni);
+            } else if mid_sni < buf.len() {
+                splits.push(mid_sni);
+            }
+        } else if let Some(ech_off) = out.ech_offset {
+            let mid_ech = (ech_off + (out.ech_len / 2).max(1)).min(buf.len().saturating_sub(1));
+            if first_split < mid_ech {
+                splits.push(first_split);
+                splits.push(mid_ech);
+            } else if mid_ech > 0 {
+                splits.push(mid_ech);
+            }
+        }
+        if splits.is_empty() && buf.len() > 2 {
+            splits.push(first_split);
+        }
+        out.split_offsets = splits;
+        Some(out)
+    }
+
+    fn inspect_http_request(buf: &[u8], fallback_split: usize) -> Option<L7Inspection> {
+        if !HTTP_METHODS.iter().any(|m| buf.starts_with(m)) {
+            return None;
+        }
+        let mut out = L7Inspection {
+            protocol: PROTO_HTTP_REQUEST,
+            ..L7Inspection::default()
+        };
+        let host_pos = ascii::scan_pattern(buf, b"\r\nHost:")
+            .or_else(|| ascii::scan_pattern(buf, b"\r\nhost:"))
+            .map(|p| p + 7);
+        if let Some(mut start) = host_pos {
+            while start < buf.len() && (buf[start] == b' ' || buf[start] == b'\t') {
+                start += 1;
+            }
+            let mut end = start;
+            while end < buf.len() && buf[end] != b'\r' && buf[end] != b'\n' {
+                end += 1;
+            }
+            if end > start {
+                let raw_host = &buf[start..end];
+                let host_only = raw_host
+                    .iter()
+                    .position(|&b| b == b':')
+                    .map_or(raw_host, |i| &raw_host[..i]);
+                out.host_offset = Some(start);
+                out.host_len = host_only.len();
+                out.host = ascii::lowercased(std::str::from_utf8(host_only).unwrap_or(""));
+                let mid = start + (out.host_len / 2).max(1);
+                if mid < buf.len() {
+                    out.split_offsets.push(mid);
+                }
+            }
+        }
+        if out.split_offsets.is_empty() && buf.len() > 2 {
+            out.split_offsets
+                .push(fallback_split.clamp(1, buf.len().saturating_sub(1)));
+        }
+        Some(out)
+    }
+
+    fn inspect_quic_initial(buf: &[u8]) -> Option<L7Inspection> {
+        // QUIC Long Header: top bits 11, Fixed bit 1 -> (buf[0] & 0xc0) == 0xc0, plus 4-byte version.
+        if buf.len() < 64 || (buf[0] & 0xc0) != 0xc0 {
+            return None;
+        }
+        let ver = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        if ver != quic::VERSION_1 && ver != quic::VERSION_2 {
+            return None;
+        }
+        Some(L7Inspection {
+            protocol: PROTO_QUIC_INITIAL,
+            ..L7Inspection::default()
+        })
+    }
+
+    /// Computes the RFC 1071 IPv4 header checksum over `ip_hdr` (ignoring bytes 10..12).
+    pub fn ipv4_header_checksum(ip_hdr: &[u8]) -> u16 {
+        if ip_hdr.len() < 20 {
+            return 0;
+        }
+        let mut sum = u64::from(ascii::csum_fold(&ip_hdr[..10], 0));
+        sum = u64::from(ascii::csum_fold(&ip_hdr[12..], sum));
+        !(sum as u16)
+    }
+
+    /// Computes the RFC 1071 / RFC 9293 TCP or UDP checksum over an IPv4 packet.
+    pub fn transport_checksum_v4(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        proto: u8,
+        l4_segment: &[u8],
+    ) -> u16 {
+        let mut pseudo = [0u8; 12];
+        pseudo[0..4].copy_from_slice(&src.octets());
+        pseudo[4..8].copy_from_slice(&dst.octets());
+        pseudo[9] = proto;
+        pseudo[10..12].copy_from_slice(&(l4_segment.len() as u16).to_be_bytes());
+        let sum = u64::from(ascii::csum_fold(&pseudo, 0));
+        let folded = ascii::csum_fold(l4_segment, sum);
+        let res = !folded;
+        if proto == 17 && res == 0 { 0xffff } else { res }
+    }
+
+    /// Computes the RFC 8200 TCP or UDP checksum over an IPv6 packet.
+    pub fn transport_checksum_v6(
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        proto: u8,
+        l4_segment: &[u8],
+    ) -> u16 {
+        let mut pseudo = [0u8; 40];
+        pseudo[0..16].copy_from_slice(&src.octets());
+        pseudo[16..32].copy_from_slice(&dst.octets());
+        pseudo[32..36].copy_from_slice(&(l4_segment.len() as u32).to_be_bytes());
+        pseudo[39] = proto;
+        let sum = u64::from(ascii::csum_fold(&pseudo, 0));
+        let folded = ascii::csum_fold(l4_segment, sum);
+        let res = !folded;
+        if proto == 17 && res == 0 { 0xffff } else { res }
+    }
+
+    /// Output of packet-level DPI desynchronization.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DesyncOutput {
+        pub packets: Vec<Vec<u8>>,
+        pub dropped_inbound: bool,
+        pub inspection: L7Inspection,
+    }
+
+    /// Detects passive-DPI spoofed inbound TCP RST or cleartext HTTP 302/403 block redirects.
+    pub fn should_drop_inbound(pkt: &[u8]) -> bool {
+        if pkt.len() < 40 {
+            return false;
+        }
+        let version = pkt[0] >> 4;
+        let (ip_hdr_len, proto, ip_id, ttl) = match version {
+            4 => {
+                let ihl = usize::from(pkt[0] & 0x0f) * 4;
+                if ihl < 20 || pkt.len() < ihl + 20 {
+                    return false;
+                }
+                let id = u16::from_be_bytes([pkt[4], pkt[5]]);
+                (ihl, pkt[9], id, pkt[8])
+            }
+            6 => {
+                if pkt.len() < 60 {
+                    return false;
+                }
+                (40usize, pkt[6], 0u16, pkt[7])
+            }
+            _ => return false,
+        };
+        if proto != 6 {
+            return false;
+        }
+        let tcp = &pkt[ip_hdr_len..];
+        let doff = usize::from(tcp[12] >> 4) * 4;
+        if doff < 20 || tcp.len() < doff {
+            return false;
+        }
+        let flags = tcp[13];
+        let win = u16::from_be_bytes([tcp[14], tcp[15]]);
+        let payload = &tcp[doff..];
+        // 1) Passive optical-splitter DPI RST signature: RST flag set with non-empty payload,
+        //    or IPv4 ID == 0x0001 / 0x0000 combined with zero window and anomalous TTL.
+        if (flags & 0x04) != 0 && (!payload.is_empty() || (win == 0 && (ip_id <= 1 || ttl == 255)))
+        {
+            return true;
+        }
+        // 2) Passive DPI injected HTTP 302/403 redirect with FIN+PSH+ACK in a single packet.
+        if (flags & 0x01) != 0
+            && (payload.starts_with(b"HTTP/1.1 302 ")
+                || payload.starts_with(b"HTTP/1.0 302 ")
+                || payload.starts_with(b"HTTP/1.1 403 "))
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Transforms a raw IPv4 or IPv6 packet according to `cfg` (splitting, disordering,
+    /// injecting decoy packets with RFC 1624 BadSum or auto-TTL, or filtering inbound RSTs).
+    pub fn desync_packet(pkt: &[u8], cfg: &DesyncConfig) -> DesyncOutput {
+        if cfg.drop_spoofed_rst && should_drop_inbound(pkt) {
+            return DesyncOutput {
+                packets: Vec::new(),
+                dropped_inbound: true,
+                inspection: L7Inspection::default(),
+            };
+        }
+        if cfg.mode == DesyncMode::Off || pkt.len() < 28 {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: L7Inspection::default(),
+            };
+        }
+        let version = pkt[0] >> 4;
+        match version {
+            4 => desync_ipv4(pkt, cfg),
+            6 => desync_ipv6(pkt, cfg),
+            _ => DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: L7Inspection::default(),
+            },
+        }
+    }
+
+    fn build_ipv4_tcp_segment(
+        ip_hdr: &[u8],
+        tcp_hdr: &[u8],
+        seq: u32,
+        clear_psh: bool,
+        ttl_override: Option<u8>,
+        corrupt_csum: bool,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let ihl = ip_hdr.len();
+        let doff = tcp_hdr.len();
+        let total_len = ihl + doff + payload.len();
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(ip_hdr);
+        out.extend_from_slice(tcp_hdr);
+        out.extend_from_slice(payload);
+
+        // Update IPv4 Total Length and optional TTL
+        out[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        if let Some(ttl) = ttl_override {
+            out[8] = ttl;
+        }
+        out[10] = 0;
+        out[11] = 0;
+        let ip_csum = ipv4_header_checksum(&out[..ihl]);
+        out[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+        // Update TCP Sequence Number and PSH flag
+        out[ihl + 4..ihl + 8].copy_from_slice(&seq.to_be_bytes());
+        if clear_psh {
+            out[ihl + 13] &= !0x08;
+        }
+        out[ihl + 16] = 0;
+        out[ihl + 17] = 0;
+        let src = Ipv4Addr::new(out[12], out[13], out[14], out[15]);
+        let dst = Ipv4Addr::new(out[16], out[17], out[18], out[19]);
+        let mut tcp_csum = transport_checksum_v4(src, dst, 6, &out[ihl..]);
+        if corrupt_csum {
+            // RFC 1624 O(1) delta mutation so DPI accepts the decoy while destination drops it.
+            tcp_csum = ascii::csum_delta(tcp_csum, 0x0000, 0xdead);
+        }
+        out[ihl + 16..ihl + 18].copy_from_slice(&tcp_csum.to_be_bytes());
+        out
+    }
+
+    fn build_ipv6_tcp_segment(
+        ip_hdr: &[u8],
+        tcp_hdr: &[u8],
+        seq: u32,
+        clear_psh: bool,
+        hop_override: Option<u8>,
+        corrupt_csum: bool,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let doff = tcp_hdr.len();
+        let plen = doff + payload.len();
+        let mut out = Vec::with_capacity(40 + plen);
+        out.extend_from_slice(ip_hdr);
+        out.extend_from_slice(tcp_hdr);
+        out.extend_from_slice(payload);
+
+        out[4..6].copy_from_slice(&(plen as u16).to_be_bytes());
+        if let Some(hops) = hop_override {
+            out[7] = hops;
+        }
+        out[40 + 4..40 + 8].copy_from_slice(&seq.to_be_bytes());
+        if clear_psh {
+            out[40 + 13] &= !0x08;
+        }
+        out[40 + 16] = 0;
+        out[40 + 17] = 0;
+        let mut src_b = [0u8; 16];
+        let mut dst_b = [0u8; 16];
+        src_b.copy_from_slice(&out[8..24]);
+        dst_b.copy_from_slice(&out[24..40]);
+        let mut tcp_csum =
+            transport_checksum_v6(Ipv6Addr::from(src_b), Ipv6Addr::from(dst_b), 6, &out[40..]);
+        if corrupt_csum {
+            tcp_csum = ascii::csum_delta(tcp_csum, 0x0000, 0xdead);
+        }
+        out[40 + 16..40 + 18].copy_from_slice(&tcp_csum.to_be_bytes());
+        out
+    }
+
+    /// Builds a benign decoy payload (`www.iana.org`) of the exact same length as `payload`.
+    pub fn make_decoy_payload(payload: &[u8], info: &L7Inspection) -> Vec<u8> {
+        let mut decoy = payload.to_vec();
+        if let Some(off) = info.host_offset {
+            let benign = b"www.iana.org";
+            for i in 0..info.host_len {
+                if off + i < decoy.len() {
+                    decoy[off + i] = benign[i % benign.len()];
+                }
+            }
+        }
+        if let Some(ech_off) = info.ech_offset {
+            for i in 0..info.ech_len.min(16) {
+                if ech_off + i < decoy.len() {
+                    decoy[ech_off + i] ^= 0x5a;
+                }
+            }
+        }
+        decoy
+    }
+
+    fn slice_ranges(len: usize, splits: &[usize]) -> Vec<(usize, usize)> {
+        let mut pts = Vec::with_capacity(splits.len() + 2);
+        pts.push(0);
+        for &s in splits {
+            if s > *pts.last().unwrap_or(&0) && s < len {
+                pts.push(s);
+            }
+        }
+        pts.push(len);
+        pts.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+
+    fn desync_ipv4(pkt: &[u8], cfg: &DesyncConfig) -> DesyncOutput {
+        let ihl = usize::from(pkt[0] & 0x0f) * 4;
+        if ihl < 20 || pkt.len() < ihl + 8 {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: L7Inspection::default(),
+            };
+        }
+        let proto = pkt[9];
+        if proto == 17 {
+            return desync_ipv4_udp(pkt, ihl, cfg);
+        }
+        if proto != 6 || pkt.len() < ihl + 20 {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: L7Inspection::default(),
+            };
+        }
+        let tcp = &pkt[ihl..];
+        let doff = usize::from(tcp[12] >> 4) * 4;
+        if doff < 20 || tcp.len() <= doff {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: L7Inspection::default(),
+            };
+        }
+        let payload = &tcp[doff..];
+        let info = inspect_l7(payload, cfg.split_pos);
+        if info.protocol != PROTO_TLS_CLIENT_HELLO && info.protocol != PROTO_HTTP_REQUEST {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: info,
+            };
+        }
+
+        let ip_hdr = &pkt[..ihl];
+        let tcp_hdr = &tcp[..doff];
+        let base_seq = u32::from_be_bytes([tcp_hdr[4], tcp_hdr[5], tcp_hdr[6], tcp_hdr[7]]);
+        let ranges = slice_ranges(payload.len(), &info.split_offsets);
+
+        let mut out_pkts = Vec::with_capacity(ranges.len() + 2);
+        let decoy = make_decoy_payload(payload, &info);
+        match cfg.mode {
+            DesyncMode::FakeBadSum => {
+                out_pkts.push(build_ipv4_tcp_segment(
+                    ip_hdr, tcp_hdr, base_seq, false, None, true, &decoy,
+                ));
+            }
+            DesyncMode::FakeAutoTtl => {
+                out_pkts.push(build_ipv4_tcp_segment(
+                    ip_hdr,
+                    tcp_hdr,
+                    base_seq,
+                    false,
+                    Some(cfg.fake_ttl),
+                    false,
+                    &decoy,
+                ));
+            }
+            DesyncMode::AdaptiveFull => {
+                out_pkts.push(build_ipv4_tcp_segment(
+                    ip_hdr,
+                    tcp_hdr,
+                    base_seq,
+                    false,
+                    Some(cfg.fake_ttl),
+                    false,
+                    &decoy,
+                ));
+                out_pkts.push(build_ipv4_tcp_segment(
+                    ip_hdr, tcp_hdr, base_seq, false, None, true, &decoy,
+                ));
+            }
+            _ => {}
+        }
+
+        let mut real_segs: Vec<Vec<u8>> = ranges
+            .iter()
+            .enumerate()
+            .map(|(idx, &(start, end))| {
+                let seq = base_seq.wrapping_add(start as u32);
+                let is_last = idx + 1 == ranges.len();
+                build_ipv4_tcp_segment(
+                    ip_hdr,
+                    tcp_hdr,
+                    seq,
+                    !is_last,
+                    None,
+                    false,
+                    &payload[start..end],
+                )
+            })
+            .collect();
+
+        if matches!(
+            cfg.mode,
+            DesyncMode::Disorder
+                | DesyncMode::FakeBadSum
+                | DesyncMode::FakeAutoTtl
+                | DesyncMode::AdaptiveFull
+        ) {
+            real_segs.reverse();
+        }
+        out_pkts.extend(real_segs);
+        DesyncOutput {
+            packets: out_pkts,
+            dropped_inbound: false,
+            inspection: info,
+        }
+    }
+
+    fn desync_ipv4_udp(pkt: &[u8], ihl: usize, cfg: &DesyncConfig) -> DesyncOutput {
+        let udp = &pkt[ihl..];
+        if udp.len() <= 8 {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: L7Inspection::default(),
+            };
+        }
+        let payload = &udp[8..];
+        let info = inspect_l7(payload, cfg.split_pos);
+        if info.protocol != PROTO_QUIC_INITIAL
+            || !matches!(
+                cfg.mode,
+                DesyncMode::QuicScramble | DesyncMode::AdaptiveFull
+            )
+        {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: info,
+            };
+        }
+        // Prepend a low-TTL QUIC reserved-version decoy UDP datagram before the real Initial.
+        let fake_payload = quic::build_probe(
+            &[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe],
+            &[0xca, 0xfe, 0xba, 0xbe, 0xde, 0xad, 0xbe, 0xef],
+            quic::MIN_INITIAL_DATAGRAM,
+        );
+        let udp_len = 8 + fake_payload.len();
+        let total_len = ihl + udp_len;
+        let mut fake_pkt = Vec::with_capacity(total_len);
+        fake_pkt.extend_from_slice(&pkt[..ihl]);
+        fake_pkt.extend_from_slice(&udp[..8]);
+        fake_pkt.extend_from_slice(&fake_payload);
+        fake_pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        fake_pkt[8] = cfg.fake_ttl;
+        fake_pkt[10] = 0;
+        fake_pkt[11] = 0;
+        let ip_csum = ipv4_header_checksum(&fake_pkt[..ihl]);
+        fake_pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+        fake_pkt[ihl + 4..ihl + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        fake_pkt[ihl + 6] = 0;
+        fake_pkt[ihl + 7] = 0;
+        let src = Ipv4Addr::new(fake_pkt[12], fake_pkt[13], fake_pkt[14], fake_pkt[15]);
+        let dst = Ipv4Addr::new(fake_pkt[16], fake_pkt[17], fake_pkt[18], fake_pkt[19]);
+        let udp_csum = transport_checksum_v4(src, dst, 17, &fake_pkt[ihl..]);
+        fake_pkt[ihl + 6..ihl + 8].copy_from_slice(&udp_csum.to_be_bytes());
+
+        DesyncOutput {
+            packets: vec![fake_pkt, pkt.to_vec()],
+            dropped_inbound: false,
+            inspection: info,
+        }
+    }
+
+    fn desync_ipv6(pkt: &[u8], cfg: &DesyncConfig) -> DesyncOutput {
+        if pkt.len() < 60 || pkt[6] != 6 {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: L7Inspection::default(),
+            };
+        }
+        let ip_hdr = &pkt[..40];
+        let tcp = &pkt[40..];
+        let doff = usize::from(tcp[12] >> 4) * 4;
+        if doff < 20 || tcp.len() <= doff {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: L7Inspection::default(),
+            };
+        }
+        let payload = &tcp[doff..];
+        let info = inspect_l7(payload, cfg.split_pos);
+        if info.protocol != PROTO_TLS_CLIENT_HELLO && info.protocol != PROTO_HTTP_REQUEST {
+            return DesyncOutput {
+                packets: vec![pkt.to_vec()],
+                dropped_inbound: false,
+                inspection: info,
+            };
+        }
+        let tcp_hdr = &tcp[..doff];
+        let base_seq = u32::from_be_bytes([tcp_hdr[4], tcp_hdr[5], tcp_hdr[6], tcp_hdr[7]]);
+        let ranges = slice_ranges(payload.len(), &info.split_offsets);
+
+        let mut out_pkts = Vec::with_capacity(ranges.len() + 1);
+        let decoy = make_decoy_payload(payload, &info);
+        if matches!(
+            cfg.mode,
+            DesyncMode::FakeBadSum | DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull
+        ) {
+            let hop = matches!(cfg.mode, DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull)
+                .then_some(cfg.fake_ttl);
+            let bad = matches!(cfg.mode, DesyncMode::FakeBadSum | DesyncMode::AdaptiveFull);
+            out_pkts.push(build_ipv6_tcp_segment(
+                ip_hdr, tcp_hdr, base_seq, false, hop, bad, &decoy,
+            ));
+        }
+        let mut real_segs: Vec<Vec<u8>> = ranges
+            .iter()
+            .enumerate()
+            .map(|(idx, &(start, end))| {
+                let seq = base_seq.wrapping_add(start as u32);
+                let is_last = idx + 1 == ranges.len();
+                build_ipv6_tcp_segment(
+                    ip_hdr,
+                    tcp_hdr,
+                    seq,
+                    !is_last,
+                    None,
+                    false,
+                    &payload[start..end],
+                )
+            })
+            .collect();
+        if matches!(
+            cfg.mode,
+            DesyncMode::Disorder
+                | DesyncMode::FakeBadSum
+                | DesyncMode::FakeAutoTtl
+                | DesyncMode::AdaptiveFull
+        ) {
+            real_segs.reverse();
+        }
+        out_pkts.extend(real_segs);
+        DesyncOutput {
+            packets: out_pkts,
+            dropped_inbound: false,
+            inspection: info,
+        }
+    }
+
+    /// Writes a payload over `stream` applying socket-level DPI desynchronization
+    /// (`TCP_NODELAY` + optional low-TTL decoy + multi-segment SNI/ECH split writes).
+    pub fn write_desync_stream(
+        stream: &mut TcpStream,
+        payload: &[u8],
+        cfg: &DesyncConfig,
+        stats: &ProxyCounters,
+    ) -> io::Result<()> {
+        let _ = stream.set_nodelay(true);
+        if cfg.mode == DesyncMode::Off || payload.len() <= 2 {
+            return stream.write_all(payload);
+        }
+        let info = inspect_l7(payload, cfg.split_pos);
+        if info.protocol == PROTO_TLS_CLIENT_HELLO {
+            stats.tls_split.fetch_add(1, Ordering::Relaxed);
+        } else if info.protocol == PROTO_HTTP_REQUEST {
+            stats.http_split.fetch_add(1, Ordering::Relaxed);
+        } else {
+            return stream.write_all(payload);
+        }
+
+        let ipv6 = stream.peer_addr().is_ok_and(|a| a.is_ipv6());
+        let ranges = slice_ranges(payload.len(), &info.split_offsets);
+
+        // Low-TTL decoy segment on the initial prefix when requested and supported by OS
+        if matches!(cfg.mode, DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull) {
+            let first_end = ranges.first().map_or(2, |r| r.1).min(payload.len());
+            if sys::set_tcp_ttl(stream, ipv6, u32::from(cfg.fake_ttl)).is_ok() {
+                let decoy = make_decoy_payload(&payload[..first_end], &info);
+                let _ = stream.write(&decoy);
+                let _ = stream.flush();
+                let _ = sys::set_tcp_ttl(stream, ipv6, 64);
+                stats.fake_sent.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for (start, end) in ranges {
+            stream.write_all(&payload[start..end])?;
+            stream.flush()?;
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    pub struct ProxyCounters {
+        pub connections: AtomicU64,
+        pub tls_split: AtomicU64,
+        pub http_split: AtomicU64,
+        pub fake_sent: AtomicU64,
+        pub rst_dropped: AtomicU64,
+    }
+
+    /// Unprivileged local SOCKS5 (RFC 1928) + HTTP CONNECT DPI-circumvention proxy.
+    #[derive(Debug)]
+    pub struct LocalProxy {
+        port: u16,
+        config: DesyncConfig,
+        stop: Arc<AtomicBool>,
+        counters: Arc<ProxyCounters>,
+        accept_thread: Option<JoinHandle<()>>,
+    }
+
+    impl LocalProxy {
+        pub fn start(cfg: DesyncConfig) -> io::Result<Self> {
+            Self::start_with_counters(cfg, Arc::new(ProxyCounters::default()))
+        }
+
+        pub fn start_with_counters(
+            cfg: DesyncConfig,
+            counters: Arc<ProxyCounters>,
+        ) -> io::Result<Self> {
+            let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, cfg.listen_port));
+            let listener = TcpListener::bind(bind_addr)?;
+            let port = listener.local_addr()?.port();
+            listener.set_nonblocking(true)?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_c = Arc::clone(&stop);
+            let counters_c = Arc::clone(&counters);
+            let cfg_c = cfg.clone();
+
+            let handle = thread::Builder::new()
+                .name("thedpi-desync-proxy".to_owned())
+                .spawn(move || {
+                    while !stop_c.load(Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((client, _)) => {
+                                counters_c.connections.fetch_add(1, Ordering::Relaxed);
+                                let cfg_conn = cfg_c.clone();
+                                let cnt_conn = Arc::clone(&counters_c);
+                                let _ = thread::Builder::new().stack_size(256 * 1024).spawn(
+                                    move || {
+                                        let _ = handle_proxy_client(client, &cfg_conn, &cnt_conn);
+                                    },
+                                );
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })?;
+
+            Ok(Self {
+                port,
+                config: cfg,
+                stop,
+                counters,
+                accept_thread: Some(handle),
+            })
+        }
+
+        pub fn port(&self) -> u16 {
+            self.port
+        }
+
+        pub fn config(&self) -> &DesyncConfig {
+            &self.config
+        }
+
+        pub fn counters(&self) -> &ProxyCounters {
+            &self.counters
+        }
+
+        pub fn stop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            let _ = TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)),
+                Duration::from_millis(50),
+            );
+            if let Some(h) = self.accept_thread.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    impl Drop for LocalProxy {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    fn handle_proxy_client(
+        mut client: TcpStream,
+        cfg: &DesyncConfig,
+        counters: &ProxyCounters,
+    ) -> io::Result<()> {
+        client.set_read_timeout(Some(Duration::from_millis(3000)))?;
+        client.set_write_timeout(Some(Duration::from_millis(3000)))?;
+        let mut first = [0u8; 4096];
+        let n = client.read(&mut first)?;
+        if n == 0 {
+            return Ok(());
+        }
+        if first[0] == 0x05 {
+            handle_socks5(client, &first[..n], cfg, counters)
+        } else {
+            handle_http_proxy(client, &first[..n], cfg, counters)
+        }
+    }
+
+    fn handle_socks5(
+        mut client: TcpStream,
+        greeting: &[u8],
+        cfg: &DesyncConfig,
+        counters: &ProxyCounters,
+    ) -> io::Result<()> {
+        if greeting.len() < 2 {
+            return Ok(());
+        }
+        // No-auth reply (0x05, 0x00)
+        client.write_all(&[0x05, 0x00])?;
+        let mut req = [0u8; 512];
+        let n = client.read(&mut req)?;
+        if n < 7 || req[0] != 0x05 || req[1] != 0x01 {
+            let _ = client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            return Ok(());
+        }
+        let target_addr: String = match req[3] {
+            0x01 if n >= 10 => {
+                let ip = Ipv4Addr::new(req[4], req[5], req[6], req[7]);
+                let port = u16::from_be_bytes([req[8], req[9]]);
+                format!("{ip}:{port}")
+            }
+            0x03 => {
+                let dlen = usize::from(req[4]);
+                if n < 5 + dlen + 2 {
+                    return Ok(());
+                }
+                let host = std::str::from_utf8(&req[5..5 + dlen]).unwrap_or("");
+                let port = u16::from_be_bytes([req[5 + dlen], req[6 + dlen]]);
+                format!("{host}:{port}")
+            }
+            0x04 if n >= 22 => {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&req[4..20]);
+                let ip = Ipv6Addr::from(b);
+                let port = u16::from_be_bytes([req[20], req[21]]);
+                format!("[{ip}]:{port}")
+            }
+            _ => return Ok(()),
+        };
+        let mut upstream = match connect_target(&target_addr) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = client.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                return Ok(());
+            }
+        };
+        client.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])?;
+        let mut payload = [0u8; 8192];
+        let pn = client.read(&mut payload)?;
+        if pn > 0 {
+            write_desync_stream(&mut upstream, &payload[..pn], cfg, counters)?;
+        }
+        relay_bidirectional(client, upstream)
+    }
+
+    fn handle_http_proxy(
+        mut client: TcpStream,
+        initial: &[u8],
+        cfg: &DesyncConfig,
+        counters: &ProxyCounters,
+    ) -> io::Result<()> {
+        if initial.starts_with(b"CONNECT ") {
+            let line_end = ascii::scan_pattern(initial, b"\r\n").unwrap_or(initial.len());
+            let line = std::str::from_utf8(&initial[8..line_end]).unwrap_or("");
+            let host_port = line.split_whitespace().next().unwrap_or("");
+            let mut upstream = connect_target(host_port)?;
+            client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+            let mut payload = [0u8; 8192];
+            let pn = client.read(&mut payload)?;
+            if pn > 0 {
+                write_desync_stream(&mut upstream, &payload[..pn], cfg, counters)?;
+            }
+            relay_bidirectional(client, upstream)
+        } else {
+            let info = inspect_l7(initial, cfg.split_pos);
+            if info.host.is_empty() {
+                return Ok(());
+            }
+            let target = if info.host.contains(':') {
+                info.host.clone()
+            } else {
+                format!("{}:80", info.host)
+            };
+            let mut upstream = connect_target(&target)?;
+            write_desync_stream(&mut upstream, initial, cfg, counters)?;
+            relay_bidirectional(client, upstream)
+        }
+    }
+
+    fn connect_target(host_port: &str) -> io::Result<TcpStream> {
+        use std::net::ToSocketAddrs;
+        let mut addrs = host_port.to_socket_addrs()?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let s = TcpStream::connect_timeout(&addr, Duration::from_millis(2500))?;
+        let _ = s.set_read_timeout(Some(Duration::from_millis(3000)));
+        let _ = s.set_write_timeout(Some(Duration::from_millis(3000)));
+        let _ = s.set_nodelay(true);
+        Ok(s)
+    }
+
+    fn relay_bidirectional(mut client: TcpStream, mut upstream: TcpStream) -> io::Result<()> {
+        let mut c_read = client.try_clone()?;
+        let mut u_write = upstream.try_clone()?;
+        let t = thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let _ = io::copy(&mut c_read, &mut u_write);
+                let _ = u_write.shutdown(Shutdown::Write);
+            })?;
+        let _ = io::copy(&mut upstream, &mut client);
+        let _ = client.shutdown(Shutdown::Write);
+        let _ = t.join();
+        Ok(())
+    }
+
+    /// Wire-encodes `DesyncOutput` for JNI calls (`Native.desyncPacket`).
+    pub fn encode_desync_output(out: &DesyncOutput, mode: DesyncMode) -> Record {
+        use tags::desync as t;
+        let mut r = Record::with_status(code::OK);
+        r.int(t::MODE, mode as i64)
+            .int(t::DROPPED, i64::from(out.dropped_inbound))
+            .int(t::PROTOCOL, out.inspection.protocol)
+            .text(t::SNI, &out.inspection.host)
+            .int(t::ECH, i64::from(out.inspection.ech_offset.is_some()))
+            .int(t::POST_QUANTUM, i64::from(out.inspection.post_quantum));
+        for pkt in &out.packets {
+            r.bytes(t::OUT_PACKET, pkt);
+        }
+        r
     }
 }
 
@@ -3657,6 +4991,25 @@ pub mod decide {
         action_for(d.category)
     }
 
+    /// Recommends the optimal active DPI desynchronization strategy from diagnostic findings.
+    pub fn recommend_desync_mode(diags: &[Diagnosis]) -> crate::desync::DesyncMode {
+        use crate::desync::DesyncMode;
+        for d in diags {
+            match d.category {
+                Category::TlsNegotiationFailure => return DesyncMode::AdaptiveFull,
+                Category::TcpConnectionFailure => return DesyncMode::FakeAutoTtl,
+                Category::QuicIncompatibility | Category::Http3Incompatibility => {
+                    return DesyncMode::QuicScramble;
+                }
+                Category::DnsResolutionFailure | Category::DnsTimeout => {
+                    return DesyncMode::Disorder;
+                }
+                _ => {}
+            }
+        }
+        DesyncMode::Off
+    }
+
     pub fn action_for(c: Category) -> Action {
         match c {
             Category::DnsResolutionFailure
@@ -4049,6 +5402,8 @@ pub mod engine {
     pub struct Engine {
         config: Config,
         state: Mutex<State>,
+        proxy: Mutex<Option<crate::desync::LocalProxy>>,
+        counters: std::sync::Arc<crate::desync::ProxyCounters>,
         busy: AtomicBool,
         anchor: Instant,
     }
@@ -4072,6 +5427,8 @@ pub mod engine {
                     decider,
                     evaluations: 0,
                 }),
+                proxy: Mutex::new(None),
+                counters: std::sync::Arc::new(crate::desync::ProxyCounters::default()),
                 busy: AtomicBool::new(false),
                 anchor: Instant::now(),
             }
@@ -4293,6 +5650,128 @@ pub mod engine {
             } else {
                 code::NO_DATA
             }
+        }
+
+        /// Runs packet-level DPI desynchronization on a raw IPv4/IPv6 packet.
+        pub fn desync_packet(&self, r: &Record) -> Record {
+            let Some(pkt) = r.get_bytes(tags::desync::PACKET) else {
+                return Record::with_status(code::INVALID_ARGUMENT);
+            };
+            let cfg = crate::desync::DesyncConfig::from_record(r);
+            let out = crate::desync::desync_packet(pkt, &cfg);
+            if out.dropped_inbound {
+                self.counters.rst_dropped.fetch_add(1, Ordering::Relaxed);
+            } else {
+                match out.inspection.protocol {
+                    crate::desync::PROTO_TLS_CLIENT_HELLO => {
+                        self.counters.connections.fetch_add(1, Ordering::Relaxed);
+                        self.counters.tls_split.fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::desync::PROTO_HTTP_REQUEST => {
+                        self.counters.connections.fetch_add(1, Ordering::Relaxed);
+                        self.counters.http_split.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                if out.packets.len() > 1
+                    && matches!(
+                        cfg.mode,
+                        crate::desync::DesyncMode::FakeBadSum
+                            | crate::desync::DesyncMode::FakeAutoTtl
+                            | crate::desync::DesyncMode::QuicScramble
+                            | crate::desync::DesyncMode::AdaptiveFull
+                    )
+                {
+                    self.counters.fake_sent.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            crate::desync::encode_desync_output(&out, cfg.mode)
+        }
+
+        /// Starts (or restarts) the local unprivileged SOCKS5/HTTP DPI-circumvention proxy.
+        pub fn start_proxy(&self, r: &Record) -> Record {
+            let cfg = crate::desync::DesyncConfig::from_record(r);
+            let mut guard = self.proxy.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(mut old) = guard.take() {
+                old.stop();
+            }
+            match crate::desync::LocalProxy::start_with_counters(
+                cfg,
+                std::sync::Arc::clone(&self.counters),
+            ) {
+                Ok(p) => {
+                    let port = p.port();
+                    let mode = p.config().mode;
+                    let c = p.counters();
+                    let mut out = Record::with_status(code::OK);
+                    out.int(tags::desync::ACTIVE, 1)
+                        .int(tags::desync::PORT, i64::from(port))
+                        .int(tags::desync::MODE, mode as i64)
+                        .int(
+                            tags::desync::CONNECTIONS,
+                            sat(c.connections.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            tags::desync::TLS_SPLIT,
+                            sat(c.tls_split.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            tags::desync::HTTP_SPLIT,
+                            sat(c.http_split.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            tags::desync::FAKE_SENT,
+                            sat(c.fake_sent.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            tags::desync::RST_DROPPED,
+                            sat(c.rst_dropped.load(Ordering::Relaxed)),
+                        );
+                    *guard = Some(p);
+                    out
+                }
+                Err(_) => Record::with_status(code::INTERNAL),
+            }
+        }
+
+        /// Stops the local DPI-circumvention proxy if running.
+        pub fn stop_proxy(&self) -> i32 {
+            let mut guard = self.proxy.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(mut p) = guard.take() {
+                p.stop();
+            }
+            code::OK
+        }
+
+        /// Returns live telemetry counters for the local DPI-circumvention proxy.
+        pub fn proxy_stats(&self) -> Record {
+            use tags::desync as t;
+            let guard = self.proxy.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut r = Record::with_status(code::OK);
+            let c = &self.counters;
+            match guard.as_ref() {
+                Some(p) => {
+                    r.int(t::ACTIVE, 1)
+                        .int(t::PORT, i64::from(p.port()))
+                        .int(t::MODE, p.config().mode as i64)
+                        .int(t::CONNECTIONS, sat(c.connections.load(Ordering::Relaxed)))
+                        .int(t::TLS_SPLIT, sat(c.tls_split.load(Ordering::Relaxed)))
+                        .int(t::HTTP_SPLIT, sat(c.http_split.load(Ordering::Relaxed)))
+                        .int(t::FAKE_SENT, sat(c.fake_sent.load(Ordering::Relaxed)))
+                        .int(t::RST_DROPPED, sat(c.rst_dropped.load(Ordering::Relaxed)));
+                }
+                None => {
+                    r.int(t::ACTIVE, 0)
+                        .int(t::PORT, 0)
+                        .int(t::MODE, crate::desync::DesyncMode::Off as i64)
+                        .int(t::CONNECTIONS, sat(c.connections.load(Ordering::Relaxed)))
+                        .int(t::TLS_SPLIT, sat(c.tls_split.load(Ordering::Relaxed)))
+                        .int(t::HTTP_SPLIT, sat(c.http_split.load(Ordering::Relaxed)))
+                        .int(t::FAKE_SENT, sat(c.fake_sent.load(Ordering::Relaxed)))
+                        .int(t::RST_DROPPED, sat(c.rst_dropped.load(Ordering::Relaxed)));
+                }
+            }
+            r
         }
     }
 
@@ -4550,11 +6029,13 @@ pub mod engine {
     ) -> Record {
         use tags::eval as t;
         let mut r = Record::with_status(code::OK);
+        let desync_mode = crate::decide::recommend_desync_mode(diags);
         r.int(t::SCORE, score.unwrap_or(-1))
             .int(t::EWMA, decider.ewma().unwrap_or(-1))
             .int(t::GENERATION, i64::from(generation))
             .int(t::STABILITY, decider.stability())
-            .int(t::EVALUATIONS, i64::from(evaluations));
+            .int(t::EVALUATIONS, i64::from(evaluations))
+            .int(t::DESYNC_MODE, desync_mode as i64);
         for dg in diags {
             let mut x = Record::new();
             x.int(tags::diagnosis::CATEGORY, dg.category as i64)
@@ -4858,6 +6339,37 @@ pub mod api {
 
     pub fn mark_applied(handle: i64, action: i32) -> i32 {
         registry::get(handle).map_or(code::INVALID_HANDLE, |e| e.mark_applied(i64::from(action)))
+    }
+
+    pub fn desync_packet(handle: i64, request: &[u8]) -> Vec<u8> {
+        let Some(e) = registry::get(handle) else {
+            return status_only(code::INVALID_HANDLE);
+        };
+        match decode(request) {
+            Ok(r) => encode(&e.desync_packet(&r)),
+            Err(c) => status_only(c),
+        }
+    }
+
+    pub fn start_proxy(handle: i64, config: &[u8]) -> Vec<u8> {
+        let Some(e) = registry::get(handle) else {
+            return status_only(code::INVALID_HANDLE);
+        };
+        match decode(config) {
+            Ok(r) => encode(&e.start_proxy(&r)),
+            Err(c) => status_only(c),
+        }
+    }
+
+    pub fn stop_proxy(handle: i64) -> i32 {
+        registry::get(handle).map_or(code::INVALID_HANDLE, |e| e.stop_proxy())
+    }
+
+    pub fn proxy_stats(handle: i64) -> Vec<u8> {
+        match registry::get(handle) {
+            Some(e) => encode(&e.proxy_stats()),
+            None => status_only(code::INVALID_HANDLE),
+        }
     }
 }
 
@@ -5237,6 +6749,69 @@ mod exports {
         action: JInt,
     ) -> JInt {
         jni::guard(code::PANIC, || api::mark_applied(handle, action))
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_thedpi_Native_desyncPacket(
+        env: EnvPtr,
+        _class: JClass,
+        handle: JLong,
+        data: JByteArray,
+    ) -> JByteArray {
+        jni::guard(null_mut(), || {
+            // SAFETY: JVM-provided env and array.
+            let out = match unsafe { input(env, data) } {
+                Ok(b) => api::desync_packet(handle, &b),
+                Err(c) => api::status_only(c),
+            };
+            // SAFETY: JVM-provided env.
+            unsafe { respond(env, &out) }
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_thedpi_Native_startProxy(
+        env: EnvPtr,
+        _class: JClass,
+        handle: JLong,
+        data: JByteArray,
+    ) -> JByteArray {
+        jni::guard(null_mut(), || {
+            // SAFETY: JVM-provided env and array.
+            let out = match unsafe { input(env, data) } {
+                Ok(b) => api::start_proxy(handle, &b),
+                Err(c) => api::status_only(c),
+            };
+            // SAFETY: JVM-provided env.
+            unsafe { respond(env, &out) }
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_thedpi_Native_stopProxy(
+        _env: EnvPtr,
+        _class: JClass,
+        handle: JLong,
+    ) -> JInt {
+        jni::guard(code::PANIC, || api::stop_proxy(handle))
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_thedpi_Native_proxyStats(
+        env: EnvPtr,
+        _class: JClass,
+        handle: JLong,
+    ) -> JByteArray {
+        // SAFETY: JVM-provided env.
+        jni::guard(null_mut(), || unsafe {
+            respond(env, &api::proxy_stats(handle))
+        })
     }
 }
 

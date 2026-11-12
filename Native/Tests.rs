@@ -2758,3 +2758,389 @@ fn stress_init_shutdown_and_concurrency() {
         start.elapsed().as_secs_f64()
     );
 }
+
+// ---------------------------------------------------------------- simd & desync (2026-2027)
+
+fn sample_tls_client_hello(host: &str, with_ech: bool, with_pq: bool) -> Vec<u8> {
+    let host_b = host.as_bytes();
+    let mut exts = Vec::new();
+    // SNI extension (0x0000)
+    let sni_list_len = (host_b.len() + 3) as u16;
+    let sni_ext_len = sni_list_len + 2;
+    exts.extend_from_slice(&0x0000u16.to_be_bytes());
+    exts.extend_from_slice(&sni_ext_len.to_be_bytes());
+    exts.extend_from_slice(&sni_list_len.to_be_bytes());
+    exts.push(0x00);
+    exts.extend_from_slice(&(host_b.len() as u16).to_be_bytes());
+    exts.extend_from_slice(host_b);
+    // ECH extension (0xfe0d, RFC 9849)
+    if with_ech {
+        let ech_payload = [
+            0x00, 0x00, 0x01, 0x00, 0x20, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11,
+        ];
+        exts.extend_from_slice(&0xfe0du16.to_be_bytes());
+        exts.extend_from_slice(&(ech_payload.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&ech_payload);
+    }
+    // Hybrid Post-Quantum Key Share (0x0033 with 0x11ec X25519MLKEM768)
+    if with_pq {
+        let ks_payload = [0x00, 0x06, 0x11, 0xec, 0x00, 0x02, 0xde, 0xad];
+        exts.extend_from_slice(&0x0033u16.to_be_bytes());
+        exts.extend_from_slice(&(ks_payload.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&ks_payload);
+    }
+    let body_len = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + exts.len();
+    let rec_len = 4 + body_len;
+    let mut buf = Vec::with_capacity(5 + rec_len);
+    buf.extend_from_slice(&[0x16, 0x03, 0x01]);
+    buf.extend_from_slice(&(rec_len as u16).to_be_bytes());
+    buf.push(0x01); // ClientHello
+    buf.push(0x00);
+    buf.extend_from_slice(&(body_len as u16).to_be_bytes());
+    buf.extend_from_slice(&[0x03, 0x03]); // Legacy version TLS 1.2
+    buf.extend_from_slice(&[0x42u8; 32]); // Random
+    buf.push(0x00); // Session ID len 0
+    buf.extend_from_slice(&2u16.to_be_bytes());
+    buf.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+    buf.push(0x01);
+    buf.push(0x00); // Null compression
+    buf.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    buf.extend_from_slice(&exts);
+    buf
+}
+
+fn wrap_ipv4_tcp(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total = 20 + 20 + payload.len();
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[4..6].copy_from_slice(&0x1337u16.to_be_bytes());
+    pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = 6;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    let ip_csum = desync::ipv4_header_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+    pkt[20..22].copy_from_slice(&sport.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dport.to_be_bytes());
+    pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+    pkt[28..32].copy_from_slice(&1u32.to_be_bytes());
+    pkt[32] = 0x50; // data offset 20 bytes
+    pkt[33] = flags;
+    pkt[34..36].copy_from_slice(&65535u16.to_be_bytes());
+    pkt[40..].copy_from_slice(payload);
+    let tcp_csum = desync::transport_checksum_v4(src, dst, 6, &pkt[20..]);
+    pkt[36..38].copy_from_slice(&tcp_csum.to_be_bytes());
+    pkt
+}
+
+#[test]
+fn simd_csum_fold_matches_std_all_lengths_and_alignments() {
+    let mut rng = Lcg(0x2026_2027_dead_beef);
+    let raw = rng.bytes(1600);
+    for align in 0..8 {
+        for len in 0..=1024 {
+            let init = rng.next() & 0xffff_ffff;
+            let slice = &raw[align..align + len];
+            assert_eq!(
+                ascii::csum_fold(slice, init),
+                ascii::csum_fold_std(slice, init),
+                "mismatch at align={align}, len={len}"
+            );
+        }
+    }
+}
+
+#[test]
+fn simd_csum_delta_matches_rfc1624_and_full_recompute() {
+    let mut rng = Lcg(0x9988_7766_5544_3322);
+    for _ in 0..2000 {
+        let mut pkt = rng.bytes(64);
+        pkt[10] = 0;
+        pkt[11] = 0;
+        let orig_csum = !ascii::csum_fold(&pkt, 0);
+        let idx = ((rng.next() as usize) % 30) * 2;
+        if idx == 10 {
+            continue;
+        }
+        let old_w = u16::from_be_bytes([pkt[idx], pkt[idx + 1]]);
+        let new_w = (rng.next() & 0xffff) as u16;
+        pkt[idx..idx + 2].copy_from_slice(&new_w.to_be_bytes());
+        let expected = !ascii::csum_fold(&pkt, 0);
+        let delta = ascii::csum_delta(orig_csum, old_w, new_w);
+        assert_eq!(delta, expected);
+        assert_eq!(delta, ascii::csum_delta_std(orig_csum, old_w, new_w));
+    }
+}
+
+#[test]
+fn simd_scan_pattern_matches_std_across_offsets() {
+    let mut rng = Lcg(0x1234_5678_9abc_def0);
+    let base = rng.bytes(300);
+    for hay_len in [0usize, 1, 7, 15, 16, 17, 31, 32, 33, 64, 129, 256] {
+        for n_len in 0..=20 {
+            let needle: Vec<u8> = (0..n_len).map(|i| (i as u8).wrapping_add(0x61)).collect();
+            assert_eq!(
+                ascii::scan_pattern(&base[..hay_len], &needle),
+                ascii::scan_pattern_std(&base[..hay_len], &needle)
+            );
+            if n_len > 0 && hay_len >= n_len {
+                for pos in 0..=(hay_len - n_len) {
+                    let mut hay = base[..hay_len].to_vec();
+                    if pos > 0 {
+                        hay[pos / 2] = needle[0]; // false first-byte match
+                    }
+                    hay[pos..pos + n_len].copy_from_slice(&needle);
+                    assert_eq!(
+                        ascii::scan_pattern(&hay, &needle),
+                        ascii::scan_pattern_std(&hay, &needle),
+                        "planted mismatch hay_len={hay_len} n_len={n_len} pos={pos}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn desync_inspects_tls13_sni_ech_and_post_quantum_keyshare() {
+    let ch = sample_tls_client_hello("Blocked.Example.ORG", true, true);
+    let info = desync::inspect_l7(&ch, 2);
+    assert_eq!(info.protocol, desync::PROTO_TLS_CLIENT_HELLO);
+    assert_eq!(info.host, "blocked.example.org");
+    assert!(info.host_offset.is_some());
+    assert!(info.ech_offset.is_some());
+    assert!(info.post_quantum);
+    assert_eq!(info.split_offsets.len(), 2);
+}
+
+#[test]
+fn desync_inspects_http_request_and_splits_host() {
+    let req = b"GET /index.html HTTP/1.1\r\nUser-Agent: TheDPI/2.0\r\nHost: Censor.Example.COM:8080\r\nAccept: */*\r\n\r\n";
+    let info = desync::inspect_l7(req, 2);
+    assert_eq!(info.protocol, desync::PROTO_HTTP_REQUEST);
+    assert_eq!(info.host, "censor.example.com");
+    assert_eq!(info.split_offsets.len(), 1);
+    let split = info.split_offsets[0];
+    assert!(split > info.host_offset.unwrap() && split < info.host_offset.unwrap() + info.host_len);
+}
+
+#[test]
+fn desync_ipv4_and_ipv6_packet_split_disorder_and_fake_injection() {
+    let ch = sample_tls_client_hello("freedom.example.com", true, true);
+    let src = Ipv4Addr::new(192, 0, 2, 10);
+    let dst = Ipv4Addr::new(198, 51, 100, 20);
+    let raw_pkt = wrap_ipv4_tcp(src, dst, 54321, 443, 1000, 0x18, &ch);
+
+    let cfg = desync::DesyncConfig {
+        mode: desync::DesyncMode::AdaptiveFull,
+        fake_ttl: 4,
+        split_pos: 2,
+        drop_spoofed_rst: true,
+        listen_port: 0,
+    };
+    let out = desync::desync_packet(&raw_pkt, &cfg);
+    assert!(!out.dropped_inbound);
+    // AdaptiveFull emits: [FakeAutoTtl, FakeBadSum, Seg3, Seg2, Seg1] = 5 packets
+    assert_eq!(out.packets.len(), 5);
+    // 1st packet is FakeAutoTtl (TTL == 4, valid TCP checksum)
+    assert_eq!(out.packets[0][8], 4);
+    assert_eq!(
+        desync::transport_checksum_v4(src, dst, 6, &out.packets[0][20..]),
+        0,
+        "FakeAutoTtl must have valid TCP checksum"
+    );
+    // 2nd packet is FakeBadSum (corrupted TCP checksum != 0)
+    assert_ne!(
+        desync::transport_checksum_v4(src, dst, 6, &out.packets[1][20..]),
+        0,
+        "FakeBadSum must have intentionally invalid TCP checksum"
+    );
+    // Real segments (indices 2, 3, 4) are in reverse Sequence Number order and have valid checksums
+    let seq2 = u32::from_be_bytes(out.packets[2][24..28].try_into().unwrap());
+    let seq3 = u32::from_be_bytes(out.packets[3][24..28].try_into().unwrap());
+    let seq4 = u32::from_be_bytes(out.packets[4][24..28].try_into().unwrap());
+    assert!(seq2 > seq3 && seq3 > seq4 && seq4 == 1000);
+    for seg in &out.packets[2..] {
+        assert_eq!(
+            desync::ipv4_header_checksum(&seg[..20]),
+            u16::from_be_bytes([seg[10], seg[11]])
+        );
+        assert_eq!(desync::transport_checksum_v4(src, dst, 6, &seg[20..]), 0);
+    }
+}
+
+#[test]
+fn desync_quic_initial_scrambler_prepends_low_ttl_decoy() {
+    let mut quic_init = quic::build_probe(
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        &[9, 10, 11, 12, 13, 14, 15, 16],
+        quic::MIN_INITIAL_DATAGRAM,
+    );
+    quic_init[1..5].copy_from_slice(&quic::VERSION_1.to_be_bytes());
+    let total = 20 + 8 + quic_init.len();
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = 17; // UDP
+    pkt[12..16].copy_from_slice(&[192, 0, 2, 1]);
+    pkt[16..20].copy_from_slice(&[198, 51, 100, 1]);
+    pkt[20..22].copy_from_slice(&55000u16.to_be_bytes());
+    pkt[22..24].copy_from_slice(&443u16.to_be_bytes());
+    pkt[24..26].copy_from_slice(&((8 + quic_init.len()) as u16).to_be_bytes());
+    pkt[28..].copy_from_slice(&quic_init);
+
+    let cfg = desync::DesyncConfig {
+        mode: desync::DesyncMode::QuicScramble,
+        fake_ttl: 3,
+        ..desync::DesyncConfig::default()
+    };
+    let out = desync::desync_packet(&pkt, &cfg);
+    assert_eq!(out.inspection.protocol, desync::PROTO_QUIC_INITIAL);
+    assert_eq!(out.packets.len(), 2);
+    assert_eq!(out.packets[0][8], 3); // low TTL decoy
+    assert_eq!(&out.packets[1], &pkt);
+}
+
+#[test]
+fn desync_inbound_filter_drops_spoofed_rst_and_redirect() {
+    let src = Ipv4Addr::new(198, 51, 100, 20);
+    let dst = Ipv4Addr::new(192, 0, 2, 10);
+    // Spoofed RST with payload
+    let rst_pkt = wrap_ipv4_tcp(src, dst, 443, 54321, 500, 0x04, b"reset");
+    let cfg = desync::DesyncConfig::default();
+    let out = desync::desync_packet(&rst_pkt, &cfg);
+    assert!(out.dropped_inbound);
+    assert!(out.packets.is_empty());
+
+    // Spoofed HTTP 302 block redirect with FIN+PSH+ACK
+    let redir_pkt = wrap_ipv4_tcp(
+        src,
+        dst,
+        80,
+        54321,
+        500,
+        0x19,
+        b"HTTP/1.1 302 Found\r\nLocation: http://block.isp.invalid\r\n\r\n",
+    );
+    let out2 = desync::desync_packet(&redir_pkt, &cfg);
+    assert!(out2.dropped_inbound);
+}
+
+#[test]
+fn local_proxy_socks5_and_http_connect_desync_roundtrip() {
+    let ch = sample_tls_client_hello("proxy.example.org", true, false);
+    let expected_len = ch.len();
+    // Echo server on loopback that collects all bytes sent by the proxy
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let srv_thread = thread::spawn(move || {
+        let (mut conn, _) = upstream.accept().unwrap();
+        conn.set_read_timeout(Some(Duration::from_millis(2000)))
+            .unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 512];
+        while let Ok(n) = conn.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+            if received.len() >= expected_len {
+                break;
+            }
+        }
+        conn.write_all(b"SERVER_OK").unwrap();
+        received
+    });
+
+    let cfg = desync::DesyncConfig {
+        mode: desync::DesyncMode::Split,
+        fake_ttl: 4,
+        split_pos: 2,
+        drop_spoofed_rst: true,
+        listen_port: 0,
+    };
+    let mut proxy = desync::LocalProxy::start(cfg).unwrap();
+    let pport = proxy.port();
+    assert!(pport > 0);
+
+    // Connect via SOCKS5 to the local proxy
+    let mut client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, pport)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(2000)))
+        .unwrap();
+    client.write_all(&[0x05, 0x01, 0x00]).unwrap();
+    let mut auth_resp = [0u8; 2];
+    client.read_exact(&mut auth_resp).unwrap();
+    assert_eq!(auth_resp, [0x05, 0x00]);
+
+    let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+    req.extend_from_slice(&up_port.to_be_bytes());
+    client.write_all(&req).unwrap();
+    let mut conn_resp = [0u8; 10];
+    client.read_exact(&mut conn_resp).unwrap();
+    assert_eq!(conn_resp[1], 0x00);
+
+    client.write_all(&ch).unwrap();
+    let mut reply = [0u8; 9];
+    client.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"SERVER_OK");
+
+    let received = srv_thread.join().unwrap();
+    assert_eq!(received, ch);
+    assert_eq!(proxy.counters().tls_split.load(Ordering::Relaxed), 1);
+    proxy.stop();
+}
+
+#[test]
+fn api_desync_packet_and_proxy_lifecycle() {
+    let _g = registry_guard();
+    let h = api::create(None);
+    assert!(h > 0);
+
+    let ch = sample_tls_client_hello("api.example.net", true, true);
+    let pkt = wrap_ipv4_tcp(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(93, 184, 216, 34),
+        40000,
+        443,
+        100,
+        0x18,
+        &ch,
+    );
+    let mut req = Record::new();
+    req.int(tags::desync::MODE, desync::DesyncMode::Disorder as i64)
+        .bytes(tags::desync::PACKET, &pkt);
+    let out = wire::decode(&api::desync_packet(h, &wire::encode(&req).unwrap())).unwrap();
+    assert_eq!(out.status(), Some(code::OK as i64));
+    assert_eq!(out.get_text(tags::desync::SNI), Some("api.example.net"));
+    assert_eq!(out.get_int(tags::desync::ECH), Some(1));
+    assert_eq!(out.get_int(tags::desync::POST_QUANTUM), Some(1));
+
+    let mut pcfg = Record::new();
+    pcfg.int(tags::desync::MODE, desync::DesyncMode::AdaptiveFull as i64)
+        .int(tags::desync::PORT, 0);
+    let started = wire::decode(&api::start_proxy(h, &wire::encode(&pcfg).unwrap())).unwrap();
+    assert_eq!(started.status(), Some(code::OK as i64));
+    assert_eq!(started.get_int(tags::desync::ACTIVE), Some(1));
+    assert!(started.get_int(tags::desync::PORT).unwrap_or(0) > 0);
+
+    let stats = wire::decode(&api::proxy_stats(h)).unwrap();
+    assert_eq!(stats.get_int(tags::desync::ACTIVE), Some(1));
+    assert_eq!(api::stop_proxy(h), code::OK);
+    let stats_after = wire::decode(&api::proxy_stats(h)).unwrap();
+    assert_eq!(stats_after.get_int(tags::desync::ACTIVE), Some(0));
+
+    assert_eq!(api::destroy(h), code::OK);
+}

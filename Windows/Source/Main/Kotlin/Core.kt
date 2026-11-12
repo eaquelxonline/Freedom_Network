@@ -25,6 +25,13 @@ import java.awt.event.WindowAdapter
 import java.awt.event.WindowEvent
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetSocketAddress
@@ -51,6 +58,7 @@ import javax.net.ssl.TrustManagerFactory
 import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JCheckBox
+import javax.swing.JComboBox
 import javax.swing.JFrame
 import javax.swing.JLabel
 import javax.swing.JPanel
@@ -100,6 +108,10 @@ object Native {
     @JvmStatic external fun dohQuery(request: ByteArray): ByteArray?
     @JvmStatic external fun systemConnections(): ByteArray?
     @JvmStatic external fun submitEncrypted(handle: Long, results: ByteArray): Int
+    @JvmStatic external fun desyncPacket(handle: Long, request: ByteArray): ByteArray?
+    @JvmStatic external fun startProxy(handle: Long, config: ByteArray): ByteArray?
+    @JvmStatic external fun stopProxy(handle: Long): Int
+    @JvmStatic external fun proxyStats(handle: Long): ByteArray?
 }
 
 object Codes {
@@ -325,10 +337,17 @@ object Tags {
         const val VERSION = 5; const val ALPN = 6; const val CIPHER = 7
     }
 
-    object Eval { const val SCORE = 1; const val EWMA = 2; const val GENERATION = 3; const val DIAGNOSIS = 4; const val DECISION = 5; const val STABILITY = 6; const val EVALUATIONS = 7 }
+    object Eval { const val SCORE = 1; const val EWMA = 2; const val GENERATION = 3; const val DIAGNOSIS = 4; const val DECISION = 5; const val STABILITY = 6; const val EVALUATIONS = 7; const val DESYNC_MODE = 8 }
     object Diagnosis { const val CATEGORY = 1; const val CONFIDENCE = 2; const val OBSERVATION = 3 }
     object Observation { const val CODE = 1; const val SUBJECT = 2; const val ARG = 3 }
     object Decision { const val STATE = 1; const val ACTION = 2; const val CONFIDENCE = 3; const val CATEGORY = 4; const val COOLDOWN_MS = 5; const val PARAM = 6; const val HIGH_IMPACT = 7 }
+    object Desync {
+        const val MODE = 1; const val FAKE_TTL = 2; const val SPLIT_POS = 3; const val DROP_RST = 4
+        const val PORT = 5; const val PACKET = 6; const val OUT_PACKET = 7; const val DROPPED = 8
+        const val PROTOCOL = 9; const val SNI = 10; const val ECH = 11; const val POST_QUANTUM = 12
+        const val CONNECTIONS = 13; const val TLS_SPLIT = 14; const val HTTP_SPLIT = 15
+        const val FAKE_SENT = 16; const val RST_DROPPED = 17; const val ACTIVE = 18
+    }
 }
 
 // ------------------------------------------------------------------ models
@@ -445,9 +464,44 @@ data class Observation(val code: Int, val subject: String, val args: List<Long>)
 data class Diagnosis(val category: Int, val confidence: Int, val observations: List<Observation>)
 data class Decision(val state: Int, val action: Int, val confidence: Int, val category: Int, val cooldownMs: Long, val param: Long, val highImpact: Boolean)
 
+object DesyncMode {
+    const val OFF = 0
+    const val SPLIT = 1
+    const val DISORDER = 2
+    const val FAKE_BAD_SUM = 3
+    const val FAKE_AUTO_TTL = 4
+    const val QUIC_SCRAMBLE = 5
+    const val ADAPTIVE_FULL = 6
+}
+
+data class DesyncConfig(
+    val mode: Int = DesyncMode.ADAPTIVE_FULL,
+    val fakeTtl: Int = 5,
+    val splitPos: Int = 2,
+    val dropRst: Boolean = true,
+    val port: Int = 0,
+) {
+    fun toRecord(): Record = Record()
+        .int(Tags.Desync.MODE, mode).int(Tags.Desync.FAKE_TTL, fakeTtl)
+        .int(Tags.Desync.SPLIT_POS, splitPos).int(Tags.Desync.DROP_RST, if (dropRst) 1 else 0)
+        .int(Tags.Desync.PORT, port)
+}
+
+data class DesyncResult(
+    val status: Int, val mode: Int, val dropped: Boolean, val protocol: Int,
+    val sni: String, val ech: Boolean, val postQuantum: Boolean, val packets: List<ByteArray>,
+)
+
+data class ProxyStatus(
+    val status: Int, val active: Boolean, val port: Int, val mode: Int,
+    val connections: Long = 0, val tlsSplit: Long = 0, val httpSplit: Long = 0,
+    val fakeSent: Long = 0, val rstDropped: Long = 0,
+)
+
 data class Evaluation(
     val status: Int, val score: Long, val ewma: Long, val generation: Long, val stability: Long,
     val evaluations: Long, val diagnoses: List<Diagnosis>, val decision: Decision?,
+    val desyncMode: Int = DesyncMode.OFF,
 )
 
 object TlsStatus { const val NOT_RUN = 0; const val OK = 1; const val CERTIFICATE = 2; const val HANDSHAKE = 3; const val TIMEOUT = 4; const val IO = 5; const val UNSUPPORTED = 6 }
@@ -512,6 +566,37 @@ object Decode {
                     d.l(Tags.Decision.COOLDOWN_MS), d.l(Tags.Decision.PARAM), d.l(Tags.Decision.HIGH_IMPACT) == 1L,
                 )
             },
+            desyncMode = r.i(Tags.Eval.DESYNC_MODE),
+        )
+    }
+
+    fun desync(bytes: ByteArray?): DesyncResult {
+        val r = Wire.decode(bytes ?: throw WireException("null result"))
+        val pkts = r.fields.filter { it.first == Tags.Desync.OUT_PACKET }.mapNotNull { (it.second as? Record.BytesValue)?.v }
+        return DesyncResult(
+            status = (r.status ?: Codes.INTERNAL.toLong()).toInt(),
+            mode = r.i(Tags.Desync.MODE),
+            dropped = r.l(Tags.Desync.DROPPED) == 1L,
+            protocol = r.i(Tags.Desync.PROTOCOL),
+            sni = r.getText(Tags.Desync.SNI) ?: "",
+            ech = r.l(Tags.Desync.ECH) == 1L,
+            postQuantum = r.l(Tags.Desync.POST_QUANTUM) == 1L,
+            packets = pkts,
+        )
+    }
+
+    fun proxy(bytes: ByteArray?): ProxyStatus {
+        val r = Wire.decode(bytes ?: throw WireException("null result"))
+        return ProxyStatus(
+            status = (r.status ?: Codes.INTERNAL.toLong()).toInt(),
+            active = r.l(Tags.Desync.ACTIVE) == 1L,
+            port = r.i(Tags.Desync.PORT),
+            mode = r.i(Tags.Desync.MODE),
+            connections = r.l(Tags.Desync.CONNECTIONS),
+            tlsSplit = r.l(Tags.Desync.TLS_SPLIT),
+            httpSplit = r.l(Tags.Desync.HTTP_SPLIT),
+            fakeSent = r.l(Tags.Desync.FAKE_SENT),
+            rstDropped = r.l(Tags.Desync.RST_DROPPED),
         )
     }
 }
@@ -685,6 +770,18 @@ class DiagnosticSession(val config: EngineConfig = EngineConfig()) : AutoCloseab
     fun evaluate(): Evaluation = Decode.evaluation(Native.evaluate(live()))
     fun networkChanged(): Int = Native.networkChanged(live())
     fun markApplied(action: Int): Int = Native.markApplied(live(), action)
+
+    fun desyncPacket(packet: ByteArray, cfg: DesyncConfig = DesyncConfig()): DesyncResult {
+        val req = cfg.toRecord().bytes(Tags.Desync.PACKET, packet)
+        return Decode.desync(Native.desyncPacket(live(), Wire.encode(req)))
+    }
+
+    fun startProxy(cfg: DesyncConfig = DesyncConfig()): ProxyStatus =
+        Decode.proxy(Native.startProxy(live(), Wire.encode(cfg.toRecord())))
+
+    fun stopProxy(): Int = Native.stopProxy(live())
+
+    fun proxyStats(): ProxyStatus = Decode.proxy(Native.proxyStats(live()))
 
     /** Full pipeline: native probes → platform TLS on reachable targets → evaluation. */
     /** Measures user-authorized encrypted resolvers and submits them for validation. */
@@ -1003,6 +1100,920 @@ object Text {
             }
             if (d.cooldownMs > 0) appendLine("  Yeni değişiklik önerisi için kalan süre: ${d.cooldownMs / 1000} sn")
         }
+        if (e.desyncMode != DesyncMode.OFF) {
+            appendLine()
+            appendLine("AKTİF DPI AŞMA (DESYNC) ÖNERİSİ: ${desyncMode(e.desyncMode)}")
+        }
+    }
+
+    const val KNOWN_DESYNC_MODES = 6
+
+    fun desyncMode(m: Int): String = when (m) {
+        DesyncMode.OFF -> "Kapalı (Doğrudan Geçiş)"
+        DesyncMode.SPLIT -> "TLS SNI/ECH + HTTP Host Bölme (Split)"
+        DesyncMode.DISORDER -> "Ters Sıralı TCP Segmentasyonu (Multi-Disorder)"
+        DesyncMode.FAKE_BAD_SUM -> "Sahte Paket (RFC 1624 BadSum) + Disorder"
+        DesyncMode.FAKE_AUTO_TTL -> "Sahte Paket (Oto-TTL) + Disorder"
+        DesyncMode.QUIC_SCRAMBLE -> "QUIC v1/v2 Initial Şaşırtma + TCP/TLS 1.3 Yedeği"
+        DesyncMode.ADAPTIVE_FULL -> "Tam Adaptif Özgürlük Modu (PQ-TLS 1.3 + ECH + Oto-TTL + BadSum + RST Kalkanı)"
+        else -> "Mod $m"
+    }
+
+    fun proxyStatus(p: ProxyStatus): String = buildString {
+        if (!p.active) {
+            appendLine("ENGELSİZ MOD (YEREL DPI AŞMA): Kapalı")
+            return@buildString
+        }
+        appendLine("ENGELSİZ MOD (YEREL DPI AŞMA): Etkin · 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
+        appendLine("  Strateji   : ${desyncMode(p.mode)}")
+        appendLine("  İstatistik : bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped}")
+    }
+
+    fun vpnStatus(
+        vpnActive: Boolean,
+        p: ProxyStatus,
+        tcpFlows: Int = 0,
+        udpFlows: Int = 0,
+        dnsQueries: Int = 0,
+        dohResolved: Int = 0,
+        desyncedFlows: Int = 0,
+    ): String = buildString {
+        if (!vpnActive && !p.active) {
+            appendLine("ENGELSİZ MOD (SİSTEM GENELİ VPN + DPI AŞMA): Kapalı")
+            return@buildString
+        }
+        val modeDesc = if (vpnActive) {
+            "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · DoH DNS + TCP/TLS Desync + Roblox/Discord UDP NAT)"
+        } else {
+            "Yerel Proxy (127.0.0.1:${p.port})"
+        }
+        appendLine("ENGELSİZ MOD: Etkin · $modeDesc")
+        if (p.active) {
+            appendLine("  Yerel Proxy: 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
+        }
+        appendLine("  Strateji   : ${desyncMode(p.mode)}")
+        appendLine("  TUN Köprüsü: TCP akışı $tcpFlows (Desync $desyncedFlows) · UDP/Oyun-Ses akışı $udpFlows · DNS $dnsQueries (Şifreli DoH $dohResolved)")
+        appendLine("  Motor İstat: bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped}")
+    }
+}
+
+// ------------------------------------------------------------------ user-mode TUN TCP/UDP/DoH bridge
+
+/**
+ * Zero-dependency IPv4 + TCP/UDP packet parser, RFC 1071 / RFC 1624 checksum calculator,
+ * packet synthesizer, and L7 Desync segment reassembler for the user-mode TUN bridge.
+ */
+object IpPackets {
+    const val PROTO_ICMP = 1
+    const val PROTO_TCP = 6
+    const val PROTO_UDP = 17
+
+    const val TCP_FIN = 0x01
+    const val TCP_SYN = 0x02
+    const val TCP_RST = 0x04
+    const val TCP_PSH = 0x08
+    const val TCP_ACK = 0x10
+
+    data class Ipv4Header(
+        val ihl: Int,
+        val totalLen: Int,
+        val ttl: Int,
+        val proto: Int,
+        val srcIp: Int,
+        val dstIp: Int,
+    )
+
+    data class TcpSegment(
+        val ip: Ipv4Header,
+        val srcPort: Int,
+        val dstPort: Int,
+        val seq: Long,
+        val ack: Long,
+        val dataOffset: Int,
+        val flags: Int,
+        val window: Int,
+        val payload: ByteArray,
+    )
+
+    data class UdpDatagram(
+        val ip: Ipv4Header,
+        val srcPort: Int,
+        val dstPort: Int,
+        val payload: ByteArray,
+    )
+
+    fun u8(b: ByteArray, off: Int): Int = b[off].toInt() and 0xFF
+    fun u16(b: ByteArray, off: Int): Int = ((b[off].toInt() and 0xFF) shl 8) or (b[off + 1].toInt() and 0xFF)
+    fun u32(b: ByteArray, off: Int): Long =
+        ((b[off].toLong() and 0xFFL) shl 24) or
+            ((b[off + 1].toLong() and 0xFFL) shl 16) or
+            ((b[off + 2].toLong() and 0xFFL) shl 8) or
+            (b[off + 3].toLong() and 0xFFL)
+
+    fun putU16(b: ByteArray, off: Int, v: Int) {
+        b[off] = ((v ushr 8) and 0xFF).toByte()
+        b[off + 1] = (v and 0xFF).toByte()
+    }
+
+    fun putU32(b: ByteArray, off: Int, v: Long) {
+        b[off] = ((v ushr 24) and 0xFFL).toByte()
+        b[off + 1] = ((v ushr 16) and 0xFFL).toByte()
+        b[off + 2] = ((v ushr 8) and 0xFFL).toByte()
+        b[off + 3] = (v and 0xFFL).toByte()
+    }
+
+    fun ipToBytes(ip: Int): ByteArray = byteArrayOf(
+        ((ip ushr 24) and 0xFF).toByte(),
+        ((ip ushr 16) and 0xFF).toByte(),
+        ((ip ushr 8) and 0xFF).toByte(),
+        (ip and 0xFF).toByte(),
+    )
+
+    fun ipToString(ip: Int): String =
+        "${(ip ushr 24) and 0xFF}.${(ip ushr 16) and 0xFF}.${(ip ushr 8) and 0xFF}.${ip and 0xFF}"
+
+    fun parseIpLiteral(s: String): Int? {
+        val parts = s.trim().substringBefore(':').split('.')
+        if (parts.size != 4) return null
+        var acc = 0
+        for (p in parts) {
+            val n = p.toIntOrNull() ?: return null
+            if (n !in 0..255) return null
+            acc = (acc shl 8) or n
+        }
+        return acc
+    }
+
+    fun parseIpv4(raw: ByteArray): Ipv4Header? {
+        if (raw.size < 20) return null
+        val ver = (raw[0].toInt() ushr 4) and 0x0F
+        if (ver != 4) return null
+        val ihl = (raw[0].toInt() and 0x0F) * 4
+        if (ihl < 20 || raw.size < ihl) return null
+        val totalLen = u16(raw, 2)
+        if (totalLen < ihl || totalLen > raw.size) return null
+        val ttl = u8(raw, 8)
+        val proto = u8(raw, 9)
+        val srcIp = u32(raw, 12).toInt()
+        val dstIp = u32(raw, 16).toInt()
+        return Ipv4Header(ihl, totalLen, ttl, proto, srcIp, dstIp)
+    }
+
+    fun parseTcp(raw: ByteArray, ip: Ipv4Header? = parseIpv4(raw)): TcpSegment? {
+        val ip_ = ip ?: return null
+        if (ip.proto != PROTO_TCP || ip.totalLen < ip.ihl + 20) return null
+        val base = ip.ihl
+        val dataOff = ((raw[base + 12].toInt() ushr 4) and 0x0F) * 4
+        if (dataOff < 20 || ip.totalLen < base + dataOff) return null
+        val srcPort = u16(raw, base)
+        val dstPort = u16(raw, base + 2)
+        val seq = u32(raw, base + 4)
+        val ack = u32(raw, base + 8)
+        val flags = u8(raw, base + 13)
+        val window = u16(raw, base + 14)
+        val payload = raw.copyOfRange(base + dataOff, ip.totalLen)
+        return TcpSegment(ip, srcPort, dstPort, seq, ack, dataOff, flags, window, payload)
+    }
+
+    fun parseUdp(raw: ByteArray, ip: Ipv4Header? = null): UdpDatagram? {
+        val ip = ip ?: parseIpv4(raw) ?: return null
+        if (ip.proto != PROTO_UDP || ip.totalLen < ip.ihl + 8) return null
+        val base = ip.ihl
+        val srcPort = u16(raw, base)
+        val dstPort = u16(raw, base + 2)
+        val udpLen = u16(raw, base + 4)
+        val end = minOf(ip.totalLen, if (udpLen >= 8) base + udpLen else ip.totalLen)
+        if (end < base + 8) return null
+        val payload = raw.copyOfRange(base + 8, end)
+        return UdpDatagram(ip, srcPort, dstPort, payload)
+    }
+
+    /** RFC 1071 16-bit one's-complement checksum over `buf[off until off + len]`. */
+    fun ipv4Checksum(buf: ByteArray, off: Int = 0, len: Int = buf.size - off): Int {
+        var sum = 0L
+        var i = 0
+        while (i + 1 < len) {
+            sum += u16(buf, off + i).toLong()
+            i += 2
+        }
+        if (i < len) {
+            sum += ((buf[off + i].toInt() and 0xFF) shl 8).toLong()
+        }
+        while ((sum ushr 16) != 0L) {
+            sum = (sum and 0xFFFFL) + (sum ushr 16)
+        }
+        return (sum.inv() and 0xFFFFL).toInt()
+    }
+
+    /** Computes or verifies TCP/UDP transport checksum over IPv4 pseudo-header + L4 segment. */
+    fun transportChecksumV4(
+        srcIp: Int,
+        dstIp: Int,
+        proto: Int,
+        buf: ByteArray,
+        off: Int = 0,
+        len: Int = buf.size - off,
+    ): Int {
+        var sum = 0L
+        sum += ((srcIp ushr 16) and 0xFFFF).toLong()
+        sum += (srcIp and 0xFFFF).toLong()
+        sum += ((dstIp ushr 16) and 0xFFFF).toLong()
+        sum += (dstIp and 0xFFFF).toLong()
+        sum += (proto and 0xFF).toLong()
+        sum += (len and 0xFFFF).toLong()
+        var i = 0
+        while (i + 1 < len) {
+            sum += u16(buf, off + i).toLong()
+            i += 2
+        }
+        if (i < len) {
+            sum += ((buf[off + i].toInt() and 0xFF) shl 8).toLong()
+        }
+        while ((sum ushr 16) != 0L) {
+            sum = (sum and 0xFFFFL) + (sum ushr 16)
+        }
+        return (sum.inv() and 0xFFFFL).toInt()
+    }
+
+    /** Synthesizes a valid IPv4 + UDP packet with computed IPv4 and UDP checksums. */
+    fun buildIpv4Udp(
+        srcIp: Int,
+        dstIp: Int,
+        srcPort: Int,
+        dstPort: Int,
+        payload: ByteArray,
+        ttl: Int = 64,
+    ): ByteArray {
+        val udpLen = 8 + payload.size
+        val totalLen = 20 + udpLen
+        val pkt = ByteArray(totalLen)
+        pkt[0] = 0x45
+        putU16(pkt, 2, totalLen)
+        putU16(pkt, 4, 0x2468)
+        putU16(pkt, 6, 0x4000)
+        pkt[8] = ttl.toByte()
+        pkt[9] = PROTO_UDP.toByte()
+        putU32(pkt, 12, srcIp.toLong() and 0xFFFFFFFFL)
+        putU32(pkt, 16, dstIp.toLong() and 0xFFFFFFFFL)
+        putU16(pkt, 10, ipv4Checksum(pkt, 0, 20))
+
+        putU16(pkt, 20, srcPort)
+        putU16(pkt, 22, dstPort)
+        putU16(pkt, 24, udpLen)
+        System.arraycopy(payload, 0, pkt, 28, payload.size)
+        val csum = transportChecksumV4(srcIp, dstIp, PROTO_UDP, pkt, 20, udpLen)
+        putU16(pkt, 26, if (csum == 0) 0xFFFF else csum)
+        return pkt
+    }
+
+    /** Synthesizes a valid IPv4 + TCP segment (with optional MSS option on SYN+ACK). */
+    fun buildIpv4Tcp(
+        srcIp: Int,
+        dstIp: Int,
+        srcPort: Int,
+        dstPort: Int,
+        seq: Long,
+        ack: Long,
+        flags: Int,
+        window: Int = 65535,
+        payload: ByteArray = ByteArray(0),
+        mssOption: Int = 0,
+        ttl: Int = 64,
+    ): ByteArray {
+        val tcpHdrLen = if (mssOption > 0) 24 else 20
+        val totalLen = 20 + tcpHdrLen + payload.size
+        val pkt = ByteArray(totalLen)
+        pkt[0] = 0x45
+        putU16(pkt, 2, totalLen)
+        putU16(pkt, 4, 0x1357)
+        putU16(pkt, 6, 0x4000)
+        pkt[8] = ttl.toByte()
+        pkt[9] = PROTO_TCP.toByte()
+        putU32(pkt, 12, srcIp.toLong() and 0xFFFFFFFFL)
+        putU32(pkt, 16, dstIp.toLong() and 0xFFFFFFFFL)
+        putU16(pkt, 10, ipv4Checksum(pkt, 0, 20))
+
+        putU16(pkt, 20, srcPort)
+        putU16(pkt, 22, dstPort)
+        putU32(pkt, 24, seq and 0xFFFFFFFFL)
+        putU32(pkt, 28, ack and 0xFFFFFFFFL)
+        pkt[32] = (((tcpHdrLen / 4) shl 4) and 0xF0).toByte()
+        pkt[33] = (flags and 0xFF).toByte()
+        putU16(pkt, 34, window)
+        if (mssOption > 0) {
+            pkt[40] = 0x02
+            pkt[41] = 0x04
+            putU16(pkt, 42, mssOption)
+        }
+        if (payload.isNotEmpty()) {
+            System.arraycopy(payload, 0, pkt, 20 + tcpHdrLen, payload.size)
+        }
+        val csum = transportChecksumV4(srcIp, dstIp, PROTO_TCP, pkt, 20, tcpHdrLen + payload.size)
+        putU16(pkt, 36, csum)
+        return pkt
+    }
+
+    /**
+     * Extracts genuine split payload chunks in ascending TCP sequence number order from a
+     * `DesyncResult` (filtering out low-TTL and BadSum decoy packets meant for raw sockets)
+     * so user-mode `VpnService.protect()`ed stream sockets transmit SNI/ECH/Host splits
+     * without stream corruption.
+     */
+    fun extractOrderedStreamChunks(
+        origPacket: ByteArray,
+        origPayload: ByteArray,
+        res: DesyncResult?,
+    ): List<ByteArray> {
+        if (origPayload.isEmpty()) return emptyList()
+        val origIp = parseIpv4(origPacket)
+        if (res != null && res.status == Codes.OK && !res.dropped && origIp != null && res.packets.isNotEmpty()) {
+            val realSegments = ArrayList<Pair<Long, ByteArray>>()
+            for (pkt in res.packets) {
+                val ip = parseIpv4(pkt) ?: continue
+                if (ip.ttl != origIp.ttl) continue // filter out FakeAutoTtl decoy
+                if (transportChecksumV4(ip.srcIp, ip.dstIp, PROTO_TCP, pkt, ip.ihl, ip.totalLen - ip.ihl) != 0) {
+                    continue // filter out FakeBadSum decoy
+                }
+                val tcp = parseTcp(pkt, ip) ?: continue
+                if (tcp.payload.isNotEmpty()) {
+                    realSegments.add(tcp.seq to tcp.payload)
+                }
+            }
+            if (realSegments.isNotEmpty()) {
+                realSegments.sortBy { it.first }
+                val total = realSegments.sumOf { it.second.size }
+                if (total == origPayload.size) {
+                    val combined = ByteArray(total)
+                    var pos = 0
+                    for ((_, seg) in realSegments) {
+                        System.arraycopy(seg, 0, combined, pos, seg.size)
+                        pos += seg.size
+                    }
+                    if (combined.contentEquals(origPayload)) {
+                        return realSegments.map { it.second }
+                    }
+                }
+            }
+        }
+        if (origPayload.size > 2) {
+            val splitAt = minOf(2, origPayload.size - 1)
+            return listOf(origPayload.copyOfRange(0, splitAt), origPayload.copyOfRange(splitAt, origPayload.size))
+        }
+        return listOf(origPayload)
+    }
+}
+
+/**
+ * User-mode TUN -> Protected Socket Bridge (`tun2socks` + DoH DNS + UDP NAT + Active DPI Desync).
+ *
+ * Bridges raw IPv4 packets from the Android `VpnService` TUN descriptor (`0.0.0.0/0`) to real
+ * outbound TCP/UDP sockets protected with `VpnService.protect()`:
+ * 1. **Encrypted DNS (UDP/TCP 53)**: Intercepts DNS queries and resolves them via RFC 8484
+ *    DoH3/DoH (`DohClient`) first so ISP DNS poisoning on `discord.com` / `roblox.com` is
+ *    bypassed; falls back to `protect()`ed UDP DNS sockets (`1.1.1.1` / `8.8.8.8`).
+ * 2. **TCP + TLS/HTTP Desync (Discord TCP 443, HTTPS, Web)**: Terminates the local TUN TCP
+ *    3-way handshake, inspects the initial `ClientHello` / HTTP request via the Rust+SIMD
+ *    `desyncPacket` engine, and writes the split `SNI`/`ECH`/`Host:` segments with `TCP_NODELAY`
+ *    over a `protect()`ed outbound `Socket`.
+ * 3. **Lossless UDP NAT Relay (Roblox RakNet UDP, Discord Voice RTC UDP, QUIC UDP 443)**:
+ *    Maintains per-flow NAT bindings over `protect()`ed `DatagramSocket`s and relays UDP
+ *    datagrams bidirectionally with zero packet drops.
+ */
+class TunBridge(
+    private val session: DiagnosticSession,
+    private val tunInput: InputStream,
+    private val tunOutput: OutputStream,
+    private val protectSocket: (Socket) -> Boolean = { true },
+    private val protectDatagram: (DatagramSocket) -> Boolean = { true },
+    private val dohClient: DohClient? = null,
+    private val dohEndpoints: List<String> = DEFAULT_DOH_ENDPOINTS,
+    private val upstreamDnsServers: List<String> = DEFAULT_DNS_SERVERS,
+    private val desyncConfig: DesyncConfig = DesyncConfig(
+        mode = DesyncMode.ADAPTIVE_FULL,
+        fakeTtl = 5,
+        splitPos = 2,
+        dropRst = true,
+    ),
+) : AutoCloseable {
+    private data class FlowKey(val srcIp: Int, val srcPort: Int, val dstIp: Int, val dstPort: Int)
+
+    private val running = AtomicBoolean(false)
+    private val writeLock = Any()
+    private val ioPool: ExecutorService = Executors.newCachedThreadPool { r ->
+        Thread(r, "thedpi-tun-io").apply { isDaemon = true }
+    }
+    private var readerThread: Thread? = null
+    private val tcpTable = ConcurrentHashMap<FlowKey, TcpFlow>()
+    private val udpTable = ConcurrentHashMap<FlowKey, UdpFlow>()
+    private val virtualDnsIp: Int = IpPackets.parseIpLiteral(VPN_DNS_IP) ?: 0x0AD7AD02
+
+    val tcpFlows = AtomicInteger(0)
+    val udpFlows = AtomicInteger(0)
+    val dnsQueries = AtomicInteger(0)
+    val dohResolved = AtomicInteger(0)
+    val desyncedFlows = AtomicInteger(0)
+
+    fun start() {
+        if (!running.compareAndSet(false, true)) return
+        readerThread = Thread({ readLoop() }, "thedpi-tun-reader").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun writeTun(pkt: ByteArray) {
+        if (!running.get()) return
+        synchronized(writeLock) {
+            try {
+                tunOutput.write(pkt)
+                tunOutput.flush()
+            } catch (_: IOException) {
+            }
+        }
+    }
+
+    private fun readLoop() {
+        val buf = ByteArray(32767)
+        while (running.get()) {
+            val n = try {
+                tunInput.read(buf)
+            } catch (_: IOException) {
+                break
+            }
+            if (n <= 0) {
+                if (n < 0) break
+                continue
+            }
+            var off = 0
+            while (off + 20 <= n && ((buf[off].toInt() ushr 4) and 0x0F) == 4) {
+                val pktLen = IpPackets.u16(buf, off + 2)
+                if (pktLen < 20 || off + pktLen > n) break
+                val pkt = buf.copyOfRange(off, off + pktLen)
+                dispatchPacket(pkt)
+                off += pktLen
+            }
+            if (off == 0) {
+                dispatchPacket(buf.copyOf(n))
+            }
+        }
+    }
+
+    private fun dispatchPacket(raw: ByteArray) {
+        val ip = IpPackets.parseIpv4(raw) ?: return
+        when (ip.proto) {
+            IpPackets.PROTO_UDP -> {
+                val udp = IpPackets.parseUdp(raw, ip) ?: return
+                if (udp.dstPort == 53) {
+                    handleDnsUdp(udp)
+                } else {
+                    handleUdp(raw, udp)
+                }
+            }
+            IpPackets.PROTO_TCP -> {
+                val tcp = IpPackets.parseTcp(raw, ip) ?: return
+                handleTcp(raw, tcp)
+            }
+        }
+    }
+
+    private fun handleDnsUdp(udp: IpPackets.UdpDatagram) {
+        val query = udp.payload
+        if (query.size < 12) return
+        dnsQueries.incrementAndGet()
+        ioPool.execute {
+            val answer = resolveDnsQuery(query, udp.ip.dstIp) ?: return@execute
+            val reply = IpPackets.buildIpv4Udp(
+                srcIp = udp.ip.dstIp,
+                dstIp = udp.ip.srcIp,
+                srcPort = udp.dstPort,
+                dstPort = udp.srcPort,
+                payload = answer,
+            )
+            writeTun(reply)
+        }
+    }
+
+    private fun resolveDnsQuery(query: ByteArray, requestedServerIp: Int): ByteArray? {
+        // 1) Try Encrypted DNS (DoH3 / DoH) first (RFC 8484 wire format with 2-byte ID set to 0)
+        val client = dohClient
+        if (client != null && dohEndpoints.isNotEmpty() && query.size >= 12) {
+            val dohWire = query.copyOf()
+            dohWire[0] = 0
+            dohWire[1] = 0
+            for (ep in dohEndpoints) {
+                if (!Doh.validEndpoint(ep)) continue
+                val resp = runCatching { client.post(ep, dohWire, 2500) }.getOrNull() ?: continue
+                val body = resp.body
+                if (resp.transport == 1 && body != null && body.size >= 12) {
+                    val fixed = body.copyOf()
+                    fixed[0] = query[0]
+                    fixed[1] = query[1]
+                    dohResolved.incrementAndGet()
+                    return fixed
+                }
+            }
+        }
+        // 2) Fallback: protected UDP DNS socket bypassing VPN TUN
+        val candidates = ArrayList<String>()
+        if (requestedServerIp != virtualDnsIp) {
+            candidates.add(IpPackets.ipToString(requestedServerIp))
+        }
+        for (s in upstreamDnsServers) {
+            if (s.isNotBlank() && s !in candidates) candidates.add(s)
+        }
+        for (srv in candidates) {
+            val host = srv.substringBefore(':')
+            val port = srv.substringAfter(':', "53").toIntOrNull() ?: 53
+            val sock = try {
+                DatagramSocket()
+            } catch (_: Exception) {
+                continue
+            }
+            try {
+                protectDatagram(sock)
+                sock.soTimeout = 2000
+                val target = InetSocketAddress(InetAddress.getByName(host), port)
+                sock.send(DatagramPacket(query, query.size, target))
+                val buf = ByteArray(4096)
+                val p = DatagramPacket(buf, buf.size)
+                sock.receive(p)
+                if (p.length >= 12) {
+                    return buf.copyOf(p.length)
+                }
+            } catch (_: Exception) {
+            } finally {
+                runCatching { sock.close() }
+            }
+        }
+        return null
+    }
+
+    private fun handleUdp(raw: ByteArray, udp: IpPackets.UdpDatagram) {
+        if (udp.payload.isEmpty()) return
+        val key = FlowKey(udp.ip.srcIp, udp.srcPort, udp.ip.dstIp, udp.dstPort)
+        val flow = udpTable.computeIfAbsent(key) { k ->
+            udpFlows.incrementAndGet()
+            UdpFlow(k).also { it.start() }
+        }
+        flow.sendOutbound(raw, udp.payload)
+    }
+
+    private inner class UdpFlow(val key: FlowKey) {
+        val socket: DatagramSocket? = runCatching {
+            DatagramSocket(0).also {
+                protectDatagram(it)
+                it.soTimeout = 30_000
+            }
+        }.getOrNull()
+        private val closed = AtomicBoolean(false)
+        private val targetAddress: InetSocketAddress? = runCatching {
+            val ip = if (key.dstIp == virtualDnsIp) {
+                InetAddress.getByName(upstreamDnsServers.firstOrNull()?.substringBefore(':') ?: "1.1.1.1")
+            } else {
+                InetAddress.getByAddress(IpPackets.ipToBytes(key.dstIp))
+            }
+            InetSocketAddress(ip, key.dstPort)
+        }.getOrNull()
+
+        fun start() {
+            val s = socket ?: return
+            ioPool.execute {
+                val buf = ByteArray(16384)
+                while (running.get() && !closed.get()) {
+                    val dp = DatagramPacket(buf, buf.size)
+                    try {
+                        s.receive(dp)
+                        if (dp.length > 0) {
+                            val pkt = IpPackets.buildIpv4Udp(
+                                srcIp = key.dstIp,
+                                dstIp = key.srcIp,
+                                srcPort = key.dstPort,
+                                dstPort = key.srcPort,
+                                payload = buf.copyOf(dp.length),
+                            )
+                            writeTun(pkt)
+                        }
+                    } catch (_: SocketTimeoutException) {
+                        break
+                    } catch (_: IOException) {
+                        break
+                    }
+                }
+                close()
+            }
+        }
+
+        fun sendOutbound(rawIpPacket: ByteArray, payload: ByteArray) {
+            val s = socket ?: return
+            val dst = targetAddress ?: return
+            ioPool.execute {
+                try {
+                    // Apply QUIC Initial scramble via Native.desyncPacket when applicable
+                    val res = if (key.dstPort == 443) {
+                        runCatching { session.desyncPacket(rawIpPacket, desyncConfig) }.getOrNull()
+                    } else {
+                        null
+                    }
+                    if (res != null && res.status == Codes.OK && !res.dropped && res.packets.size > 1) {
+                        desyncedFlows.incrementAndGet()
+                        for (pkt in res.packets) {
+                            val u = IpPackets.parseUdp(pkt) ?: continue
+                            if (u.payload.isNotEmpty()) {
+                                s.send(DatagramPacket(u.payload, u.payload.size, dst))
+                            }
+                        }
+                    } else {
+                        s.send(DatagramPacket(payload, payload.size, dst))
+                    }
+                } catch (_: IOException) {
+                    close()
+                }
+            }
+        }
+
+        fun close() {
+            if (closed.compareAndSet(false, true)) {
+                udpTable.remove(key, this)
+                runCatching { socket?.close() }
+            }
+        }
+    }
+
+    private fun handleTcp(raw: ByteArray, tcp: IpPackets.TcpSegment) {
+        val key = FlowKey(tcp.ip.srcIp, tcp.srcPort, tcp.ip.dstIp, tcp.dstPort)
+        val isSyn = (tcp.flags and IpPackets.TCP_SYN) != 0 && (tcp.flags and IpPackets.TCP_ACK) == 0
+        val isRst = (tcp.flags and IpPackets.TCP_RST) != 0
+        val isFin = (tcp.flags and IpPackets.TCP_FIN) != 0
+
+        if (isRst) {
+            tcpTable.remove(key)?.close()
+            return
+        }
+        if (isSyn) {
+            tcpTable.remove(key)?.close()
+            val flow = TcpFlow(key, (tcp.seq + 1L) and 0xFFFFFFFFL)
+            tcpTable[key] = flow
+            tcpFlows.incrementAndGet()
+            flow.onSyn()
+            return
+        }
+        val flow = tcpTable[key] ?: return
+        if (tcp.payload.isNotEmpty()) {
+            flow.onClientData(raw, tcp)
+        }
+        if (isFin) {
+            flow.onClientFin(tcp)
+        }
+    }
+
+    private inner class TcpFlow(val key: FlowKey, var clientNextSeq: Long) {
+        val lock = Any()
+        var serverSeq: Long = 0x5000_0000L
+        var connected = false
+        var finFromClient = false
+        var firstPayloadDone = false
+        val closed = AtomicBoolean(false)
+        val pending = ArrayList<Pair<ByteArray, ByteArray>>()
+        @Volatile var upstreamSocket: Socket? = null
+
+        fun onSyn() {
+            val synAckSeq: Long
+            val ackNum: Long
+            synchronized(lock) {
+                synAckSeq = serverSeq
+                ackNum = clientNextSeq
+                serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
+            }
+            writeTun(
+                IpPackets.buildIpv4Tcp(
+                    srcIp = key.dstIp,
+                    dstIp = key.srcIp,
+                    srcPort = key.dstPort,
+                    dstPort = key.srcPort,
+                    seq = synAckSeq,
+                    ack = ackNum,
+                    flags = IpPackets.TCP_SYN or IpPackets.TCP_ACK,
+                    mssOption = 1360,
+                ),
+            )
+            ioPool.execute { connectAndPump() }
+        }
+
+        fun onClientData(raw: ByteArray, tcp: IpPackets.TcpSegment) {
+            val ackPkt: ByteArray
+            var immediateSend: Pair<ByteArray, ByteArray>? = null
+            synchronized(lock) {
+                if (tcp.seq != clientNextSeq) {
+                    ackPkt = IpPackets.buildIpv4Tcp(
+                        srcIp = key.dstIp,
+                        dstIp = key.srcIp,
+                        srcPort = key.dstPort,
+                        dstPort = key.srcPort,
+                        seq = serverSeq,
+                        ack = clientNextSeq,
+                        flags = IpPackets.TCP_ACK,
+                    )
+                } else {
+                    clientNextSeq = (clientNextSeq + tcp.payload.size) and 0xFFFFFFFFL
+                    ackPkt = IpPackets.buildIpv4Tcp(
+                        srcIp = key.dstIp,
+                        dstIp = key.srcIp,
+                        srcPort = key.dstPort,
+                        dstPort = key.srcPort,
+                        seq = serverSeq,
+                        ack = clientNextSeq,
+                        flags = IpPackets.TCP_ACK,
+                    )
+                    val item = raw.copyOf() to tcp.payload.copyOf()
+                    if (connected) {
+                        immediateSend = item
+                    } else {
+                        pending.add(item)
+                    }
+                }
+            }
+            writeTun(ackPkt)
+            immediateSend?.let { (r, p) ->
+                synchronized(lock) {
+                    sendToUpstreamLocked(r, p)
+                }
+            }
+        }
+
+        fun onClientFin(tcp: IpPackets.TcpSegment) {
+            val finAckPkt: ByteArray
+            synchronized(lock) {
+                if (tcp.seq + tcp.payload.size == clientNextSeq) {
+                    clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
+                }
+                finFromClient = true
+                finAckPkt = IpPackets.buildIpv4Tcp(
+                    srcIp = key.dstIp,
+                    dstIp = key.srcIp,
+                    srcPort = key.dstPort,
+                    dstPort = key.srcPort,
+                    seq = serverSeq,
+                    ack = clientNextSeq,
+                    flags = IpPackets.TCP_ACK,
+                )
+                if (connected) {
+                    runCatching { upstreamSocket?.shutdownOutput() }
+                }
+            }
+            writeTun(finAckPkt)
+        }
+
+        private fun sendToUpstreamLocked(rawIpPacket: ByteArray, payload: ByteArray) {
+            val sock = upstreamSocket ?: return
+            try {
+                val out = sock.getOutputStream()
+                if (!firstPayloadDone) {
+                    firstPayloadDone = true
+                    val res = runCatching { session.desyncPacket(rawIpPacket, desyncConfig) }.getOrNull()
+                    val chunks = IpPackets.extractOrderedStreamChunks(rawIpPacket, payload, res)
+                    if (chunks.size > 1) {
+                        desyncedFlows.incrementAndGet()
+                    }
+                    for (chunk in chunks) {
+                        out.write(chunk)
+                        out.flush()
+                    }
+                } else {
+                    out.write(payload)
+                    out.flush()
+                }
+            } catch (_: IOException) {
+                close()
+            }
+        }
+
+        private fun connectAndPump() {
+            val sock = Socket()
+            try {
+                protectSocket(sock)
+                sock.tcpNoDelay = true
+                sock.soTimeout = 30_000
+                val dstInet = if (key.dstIp == virtualDnsIp) {
+                    InetAddress.getByName(upstreamDnsServers.firstOrNull()?.substringBefore(':') ?: "1.1.1.1")
+                } else {
+                    InetAddress.getByAddress(IpPackets.ipToBytes(key.dstIp))
+                }
+                sock.connect(InetSocketAddress(dstInet, key.dstPort), 5000)
+                synchronized(lock) {
+                    if (closed.get()) {
+                        runCatching { sock.close() }
+                        return
+                    }
+                    upstreamSocket = sock
+                    connected = true
+                    val queued = ArrayList(pending)
+                    pending.clear()
+                    for ((r, p) in queued) {
+                        sendToUpstreamLocked(r, p)
+                    }
+                    if (finFromClient) {
+                        runCatching { sock.shutdownOutput() }
+                    }
+                }
+
+                val input = sock.getInputStream()
+                val buf = ByteArray(1360)
+                while (running.get() && !closed.get()) {
+                    val n = input.read(buf)
+                    if (n < 0) {
+                        val finSeq: Long
+                        val ackNum: Long
+                        synchronized(lock) {
+                            finSeq = serverSeq
+                            ackNum = clientNextSeq
+                            serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
+                        }
+                        writeTun(
+                            IpPackets.buildIpv4Tcp(
+                                srcIp = key.dstIp,
+                                dstIp = key.srcIp,
+                                srcPort = key.dstPort,
+                                dstPort = key.srcPort,
+                                seq = finSeq,
+                                ack = ackNum,
+                                flags = IpPackets.TCP_FIN or IpPackets.TCP_ACK,
+                            ),
+                        )
+                        break
+                    }
+                    if (n > 0) {
+                        val segSeq: Long
+                        val ackNum: Long
+                        synchronized(lock) {
+                            segSeq = serverSeq
+                            ackNum = clientNextSeq
+                            serverSeq = (serverSeq + n) and 0xFFFFFFFFL
+                        }
+                        writeTun(
+                            IpPackets.buildIpv4Tcp(
+                                srcIp = key.dstIp,
+                                dstIp = key.srcIp,
+                                srcPort = key.dstPort,
+                                dstPort = key.srcPort,
+                                seq = segSeq,
+                                ack = ackNum,
+                                flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK,
+                                payload = buf.copyOf(n),
+                            ),
+                        )
+                    }
+                }
+            } catch (_: Exception) {
+                val rstSeq: Long
+                val ackNum: Long
+                synchronized(lock) {
+                    rstSeq = serverSeq
+                    ackNum = clientNextSeq
+                }
+                writeTun(
+                    IpPackets.buildIpv4Tcp(
+                        srcIp = key.dstIp,
+                        dstIp = key.srcIp,
+                        srcPort = key.dstPort,
+                        dstPort = key.srcPort,
+                        seq = rstSeq,
+                        ack = ackNum,
+                        flags = IpPackets.TCP_RST or IpPackets.TCP_ACK,
+                    ),
+                )
+            } finally {
+                close()
+            }
+        }
+
+        fun close() {
+            if (closed.compareAndSet(false, true)) {
+                tcpTable.remove(key, this)
+                runCatching { upstreamSocket?.close() }
+            }
+        }
+    }
+
+    override fun close() {
+        if (running.compareAndSet(true, false)) {
+            readerThread?.interrupt()
+            for (f in tcpTable.values) f.close()
+            for (u in udpTable.values) u.close()
+            tcpTable.clear()
+            udpTable.clear()
+            ioPool.shutdownNow()
+        }
+    }
+
+    companion object {
+        const val VPN_CLIENT_IP = "10.215.173.1"
+        const val VPN_DNS_IP = "10.215.173.2"
+        val DEFAULT_DOH_ENDPOINTS = listOf(
+            "https://cloudflare-dns.com/dns-query",
+            "https://dns.google/dns-query",
+            "https://dns.quad9.net/dns-query",
+        )
+        val DEFAULT_DNS_SERVERS = listOf("1.1.1.1", "8.8.8.8", "9.9.9.9")
     }
 }
 
@@ -1133,6 +2144,8 @@ fun runCli(args: List<String>): Int {
     val alt = ArrayList<String>()
     val doh = ArrayList<String>()
     var system = false
+    var desyncMode = DesyncMode.OFF
+    var proxyPort = -1
     var i = 0
     while (i < args.size) {
         when (args[i]) {
@@ -1141,6 +2154,18 @@ fun runCli(args: List<String>): Int {
             "--alt" -> alt += args.getOrNull(++i) ?: ""
             "--doh" -> doh += args.getOrNull(++i) ?: ""
             "--system" -> system = true
+            "--desync" -> {
+                val m = (args.getOrNull(++i) ?: "adaptive").lowercase()
+                desyncMode = when (m) {
+                    "split", "1" -> DesyncMode.SPLIT
+                    "disorder", "2" -> DesyncMode.DISORDER
+                    "badsum", "3" -> DesyncMode.FAKE_BAD_SUM
+                    "ttl", "autottl", "4" -> DesyncMode.FAKE_AUTO_TTL
+                    "quic", "5" -> DesyncMode.QUIC_SCRAMBLE
+                    else -> DesyncMode.ADAPTIVE_FULL
+                }
+            }
+            "--proxy" -> proxyPort = (args.getOrNull(++i) ?: "8880").toIntOrNull() ?: 8880
             else -> targets += args[i]
         }
         i++
@@ -1157,6 +2182,13 @@ fun runCli(args: List<String>): Int {
                 WindowsPlatform.dohClient(), doh.filter { it.isNotEmpty() },
             )
             print(Text.report(report))
+            if (desyncMode != DesyncMode.OFF || proxyPort >= 0) {
+                val mode = if (desyncMode != DesyncMode.OFF) desyncMode else DesyncMode.ADAPTIVE_FULL
+                val ps = session.startProxy(DesyncConfig(mode = mode, port = if (proxyPort >= 0) proxyPort else 0))
+                println()
+                print(Text.proxyStatus(ps))
+                session.stopProxy()
+            }
             if (system) {
                 println()
                 print(Text.system(SystemSnapshot.capture()))
@@ -1177,6 +2209,7 @@ class MainWindow {
         toolTipText = "Örnek: https://dns.example/dns-query — yalnızca https:// adresleri; DoH3 (HTTP/3) desteklenirse kullanılır"
     }
     private val runButton = JButton("Tanıla")
+    private val desyncButton = JButton("Engelsiz Modu Başlat (DPI Aşma)")
     private val systemButton = JButton("Sistem geneli bağlantılar")
     private val appliedButton = JButton("Öneriyi uyguladım — doğrula").apply { isEnabled = false }
     private val auto = JCheckBox("Ağ değişince yeniden tanıla", false)
@@ -1210,7 +2243,7 @@ class MainWindow {
         row(1, "Test hedefleri:", JScrollPane(targets))
         row(2, "Karşılaştırılacak DNS (isteğe bağlı):", altDns)
         row(3, "Şifreli DNS — DoH3/DoH adresleri (isteğe bağlı):", dohEndpoints)
-        val buttons = JPanel().apply { add(runButton); add(systemButton); add(appliedButton); add(auto) }
+        val buttons = JPanel().apply { add(runButton); add(desyncButton); add(systemButton); add(appliedButton); add(auto) }
         c.gridx = 0; c.gridy = 4; c.gridwidth = 2; form.add(buttons, c)
 
         frame.layout = BorderLayout()
@@ -1228,6 +2261,7 @@ class MainWindow {
         frame.setLocationRelativeTo(null)
 
         runButton.addActionListener { startRun(verifyRuns = 0) }
+        desyncButton.addActionListener { toggleDesync() }
         appliedButton.addActionListener { applied() }
         systemButton.addActionListener { showSystem() }
 
@@ -1275,6 +2309,28 @@ class MainWindow {
             } finally {
                 busy.set(false)
                 ui { runButton.isEnabled = true }
+            }
+        }
+    }
+
+    private fun toggleDesync() {
+        val s = session ?: return
+        desyncButton.isEnabled = false
+        worker.execute {
+            val cur = s.proxyStats()
+            val next = if (cur.active) {
+                s.stopProxy()
+                s.proxyStats()
+            } else {
+                s.startProxy(DesyncConfig(mode = DesyncMode.ADAPTIVE_FULL, port = 0))
+            }
+            val text = Text.proxyStatus(next)
+            ui {
+                output.text = text + "\n" + output.text
+                output.caretPosition = 0
+                desyncButton.text = if (next.active) "Engelsiz Modu Durdur (127.0.0.1:${next.port})" else "Engelsiz Modu Başlat (DPI Aşma)"
+                status.text = if (next.active) "Engelsiz Mod etkin (127.0.0.1:${next.port})" else "Engelsiz Mod durduruldu"
+                desyncButton.isEnabled = true
             }
         }
     }
