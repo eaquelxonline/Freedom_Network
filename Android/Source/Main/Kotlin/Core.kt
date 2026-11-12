@@ -4625,7 +4625,11 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         CrashLogger.log("MainActivity", "onCreate başladı")
         try {
+            cm = getSystemService(ConnectivityManager::class.java)
+            setContentView(buildModernUi(savedInstanceState))
+
             // Android 11-17 Edge-to-Edge & Dark Cyber Theme System Bar Integration
+            // Must run after setContentView(...) so PhoneWindow.mDecor is initialized (avoids Android 17 PhoneWindow.getInsetsController NPE).
             window.setDecorFitsSystemWindows(false)
             @Suppress("DEPRECATION")
             if (Build.VERSION.SDK_INT < 35) {
@@ -4635,14 +4639,13 @@ class MainActivity : Activity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 window.isNavigationBarContrastEnforced = false
             }
-            window.insetsController?.setSystemBarsAppearance(
-                0,
-                android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
-                    android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
-            )
-
-            cm = getSystemService(ConnectivityManager::class.java)
-            setContentView(buildModernUi(savedInstanceState))
+            runCatching {
+                window.insetsController?.setSystemBarsAppearance(
+                    0,
+                    android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                        android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
+                )
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                     requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
@@ -4708,17 +4711,19 @@ class MainActivity : Activity() {
 
     private fun updatePredictiveBackRegistration(shouldIntercept: Boolean) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
-        val dispatcher = onBackInvokedDispatcher
-        val existing = backCallback as? android.window.OnBackInvokedCallback
-        if (shouldIntercept && existing == null) {
-            val cb = android.window.OnBackInvokedCallback {
-                tabSwitcher.invoke(0)
+        runCatching {
+            val dispatcher = onBackInvokedDispatcher
+            val existing = backCallback as? android.window.OnBackInvokedCallback
+            if (shouldIntercept && existing == null) {
+                val cb = android.window.OnBackInvokedCallback {
+                    tabSwitcher.invoke(0)
+                }
+                dispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
+                backCallback = cb
+            } else if (!shouldIntercept && existing != null) {
+                dispatcher.unregisterOnBackInvokedCallback(existing)
+                backCallback = null
             }
-            dispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
-            backCallback = cb
-        } else if (!shouldIntercept && existing != null) {
-            runCatching { dispatcher.unregisterOnBackInvokedCallback(existing) }
-            backCallback = null
         }
     }
 
