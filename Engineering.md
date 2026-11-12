@@ -70,19 +70,20 @@ Temel ilkeler:
 |---|---|---|---|---|
 | Rust | **1.99.1** (kanal 2026-10-15) | 1.99.1 | Edition 2024, `as_chunks`, `if let` zincirleri | static.rust-lang.org kanal manifesti — doğrulandı |
 | Rust edition | **2024** | 2024 | `unsafe extern`, `#[unsafe(no_mangle)]` zorunlu sözdizimi | doc.rust-lang.org/edition-guide — doğrulandı (derleme) |
-| Kotlin | **2.4.21** (Maven, 2026-10-08) | 2.4.21 | — | Maven Central meta verisi — doğrulandı |
-| Gradle | **9.7.1** (2026-08-19) | 9.9.1 (2026-11-10) | KGP 2.4.21'in **tam desteklenen** Gradle aralığı 7.6.3–**9.7.0**; 9.7.1 aynı küçük sürümün yama sürümü ve Gradle'ın kendisi 9.7.1'i öneriyor (`BaseExecSpec` düzeltmesi Exec görevlerimizi etkiliyor) | kotlinlang.org/docs/gradle-configure-project.html, docs.gradle.org/9.7.1/release-notes — doğrulandı |
-| Android Gradle Plugin | **9.3.1** (2026-07-23) | 9.5.1 | KGP 2.4.21'in tam desteklediği AGP aralığı 8.5.2–**9.3.1**. AGP 9.3 API 37'yi destekler, en düşük Gradle sürümü 9.5.0 | developer.android.com/build/releases/agp-9-3-0-release-notes — doğrulandı |
+| Kotlin | **2.5.0-RC** | 2.5.0-RC (en yeni kararlı: 2.4.21) | Kullanıcı kararı: en yeni sürüm. Aday sürüm olduğu için kararlı 2.5.0 çıkınca ona geçilmeli | Maven Central meta verisi — doğrulandı; derleme ve testler geçti |
+| Gradle | **9.9.1** (2026-11-10) | 9.9.1 | En yeni kararlı | services.gradle.org — doğrulandı; derleme geçti |
+| Android Gradle Plugin | **9.5.1** | 9.5.1 | En yeni kararlı; API 37 desteği, en düşük Gradle 9.6.0 | AGP 9.5 sürüm notu — doğrulandı; derleme ve lint geçti |
 | JDK (derleme) | **21** | 25/26/27 (toolchain) | Gradle 9 en az JDK 17 ister; AGP 9.3 JDK 17 ister; JDK 21 LTS | docs.gradle.org compatibility — doğrulandı |
 | Android compileSdk / targetSdk | **37** (`android-37.0`) | 37.2 (küçük SDK) | Android 17 = API 37 | Android Developers Blog "Android 17 is here", SDK repository2-3.xml — doğrulandı |
 | Android minSdk | **30** (Android 11) | — | Kapsam gereği | — |
-| Android NDK | **28.2.13676358** (r28c) | 30.0.x | AGP 9.3'ün varsayılan NDK'sı; 16 KB sayfa hizalaması destekli | AGP 9.3 sürüm notu — doğrulandı |
+| Android NDK | **30.0.16248370** | 30.0.16248370 | En yeni; `.so` 16 KB hizalı (`0x4000`) olarak doğrulandı | SDK repository — doğrulandı |
 | Build-Tools | **36.0.0** | 37.0.0 | AGP 9.3'ün varsayılanı ve en düşük sürümü | AGP 9.3 sürüm notu — doğrulandı |
-| Gradle Wrapper | 9.7.1, `distributionSha256Sum` sabitlenmiş | — | Tedarik zinciri bütünlüğü | services.gradle.org .sha256 — doğrulandı |
+| Gradle Wrapper | 9.9.1, `distributionSha256Sum` sabitlenmiş | — | Tedarik zinciri bütünlüğü | services.gradle.org .sha256 — doğrulandı |
 
-**Neden en yeni sürümler değil?** AGP 9.5.1 en az Gradle 9.6.0 istiyor ama Kotlin 2.4.21 resmî olarak
-AGP 9.3.1'e kadar tam destek veriyor. Gradle 9.9.1 de KGP'nin tam destek aralığının dışında. Belgelenmiş
-destek kümesi seçildi.
+**Sürüm politikası (kullanıcı kararı, 12.11.2026):** Kullanılan tüm araçların en yeni sürümü kullanılır.
+Bu kombinasyon (Gradle 9.9.1 + AGP 9.5.1 + Kotlin 2.5.0-RC + NDK 30) Kotlin'in resmî "tam desteklenen"
+tablosunun dışında, ama bu projede derleme, testler ve lint gerçekten çalıştırılarak doğrulandı. Kotlin
+2.5.0 kararlı sürümü yayımlandığında RC'den ona geçilmelidir.
 
 ## 3. 2027 yükseltme politikası
 
@@ -130,7 +131,8 @@ destek kümesi seçildi.
 | DLL sertleştirme | MSVC derlemesi: `+crt-static`, `/DEPENDENTLOADFLAG:0x800` (bağımlı DLL'ler yalnızca System32'den) | Bu Linux ortamında MSVC olmadığı için doğrulanmadı |
 | Paketleme | `jpackage --type app-image` (JDK aracı), `-Djava.library.path=$APPDIR`; ardından `signtool` ile Authenticode imzası | Windows'ta çalıştırılmalı |
 | **Windows 10 destek durumu** | Standart Microsoft desteği **14 Ekim 2025'te sona erdi**. Uygulama Windows 10'da çalışır ama build < 22000 algılandığında "Bilgilendirme" olarak uyarı gösterir (Windows 11'e geçiş veya ESU). Windows 10, güvenlik açısından Windows 11 ile eşdeğer kabul edilmez | Uyarı mantığı birim testiyle kapsanıyor |
-| WFP | **Kullanılmıyor.** Bölüm 17'ye bakın | — |
+| **Sistem geneli bağlantılar** | `GetExtendedTcpTable`/`GetExtendedUdpTable` (owner-PID tabloları, IPv4+IPv6) ve `QueryFullProcessImageNameW` ile makinedeki **tüm** TCP/UDP uç noktaları, sahip işlem adıyla birlikte. Kullanıcı modunda çalışır, sürücü ve yönetici izni gerektirmez. Bulgular: el sıkışmada takılan bağlantılar (SYN_SENT), CLOSE_WAIT sızıntısı, TIME_WAIT baskısı, tüm arayüzlerde dinleyen servisler. Tablo ayrıştırma güvenli ve platformdan bağımsız Rust kodu; `unsafe` yalnızca FFI çağrısında | Wine'da gerçek sistem tablosu okundu, testin kendi soketleri doğru ayrıştırıldı |
+| Paket seviyesi (WFP) | Sürücü yolu bölüm 19'da | Sürücü imzası gerekiyor |
 
 ## 6. Rust yerel çekirdek tasarımı
 
@@ -148,8 +150,13 @@ destek kümesi seçildi.
 * Global durum: Yalnızca motor kayıt defteri (`Mutex<Registry>`). JNI statik fonksiyonlar kullandığı için
   zorunlu. Handle'lar monoton artan ID'dir ve yeniden kullanılmaz, en fazla 16 motor tutulur.
 * Bellek: Uzun süreli testte 5000 tanılama döngüsünde RSS farkı 16 KiB (bölüm 12).
-* **Assembly (`Core.s`) oluşturulmadı.** Profil hiçbir sıcak noktada Assembly'yi haklı çıkarmıyor
-  (bölüm 12). Kural gereği dosya ve `build.rs` eklenmedi.
+* **Assembly:** `Core.s` (x86_64, SSE2) ve `Core.aarch64.s` (ARM64, NEON), `core::arch::global_asm!`
+  ile derleniyor; harici assembler veya `build.rs` gerekmiyor. x86_64 tarafında `extern "sysv64"`
+  çağrı kuralı zorlandığı için tek dosya Linux, Android x86_64 ve Windows x64'te aynı şekilde çalışıyor.
+  Diğer hedeflerde `std` yedeği kullanılıyor. Rutin, DNS ve hedef adı normalleştirme yolundaki ASCII
+  küçük harf dönüşümü. Tüm uzunluklar ve tüm bayt değerleri için `std` ile bayt bayt aynı sonucu verdiği
+  x86_64, ARM64 (QEMU) ve Windows (Wine) üzerinde test edildi. Komutların yayımlanan `.so`/ikililerde
+  bulunduğu disassembly ile doğrulandı.
 
 ## 7. JNI mimarisi
 
@@ -262,6 +269,38 @@ E: çalışma süresi (radyonun açık kalma süresi için vekil ölçü).
 | IPv6 | RFC 8200 | Genel adres: 2000::/3 |
 | PMTUD | RFC 4821, RFC 8899 | DF bayraklı, boyut ikili aramalı ve yanıtla doğrulanan prob |
 
+### Şifreli DNS (DoH3 / DoH) — 2026 modern yöntem
+
+Araştırma (Kasım 2026): DoH3, DNS'i HTTP/3 üzerinden QUIC ile 443 numaralı portta taşır. DoQ ise
+(RFC 9250) DNS'i doğrudan QUIC üzerinden, genellikle UDP 853'te taşır. Tarayıcılar ve uygulamalar
+DoH3'ü tercih ediyor; büyük açık çözümleyiciler 2026'da DoH3 ve DoQ'yu yaygın şekilde sunuyor.
+Windows 11 ve Android sistem düzeyinde şifreli DNS'i (DoH / Özel DNS-DoT) yerel olarak destekliyor.
+
+THE DPI tasarımı:
+
+1. Sorgu, **Rust DNS kodlayıcısıyla** RFC 8484 biçiminde üretilir (ID 0, önbellek dostu).
+2. Taşıma **platformun** HTTPS/HTTP3 yığınıyla yapılır; kendi kriptografimiz yok.
+   * Android 14+: `android.net.http.HttpEngine` (QUIC açık, etkin ağa bağlı).
+   * Android 11–13: `HttpsURLConnection`.
+   * Windows: JDK `HttpClient` ve Windows sertifika deposu. Çalışan JDK HTTP/3 sunuyorsa (JEP 517)
+     otomatik olarak kullanılır.
+   Gerçekte anlaşılan protokol raporlanır; HTTP/2 kullanıldıysa DoH3 iddia edilmez.
+   Yönlendirmeler izlenmez ve yalnızca `https://` adresleri kabul edilir.
+3. Yanıt, Rust'ın sağlamlaştırılmış ayrıştırıcısıyla doğrulanır. `200 text/html` dönen bir giriş
+   sayfası asla DNS yanıtı sayılmaz (test edildi).
+4. Sınıflandırma:
+   * Şifreli çözümleyici çalışıyor ve sistem DNS'i sorunluysa: teşhis güveni artar, öneri "şifreli DNS kullan".
+   * Sistem NXDOMAIN diyor ama bağımsız şifreli çözümleyici adı çözüyorsa: "çözümleyici düzeyinde tutarsızlık".
+   * İkisi de NXDOMAIN diyorsa: "hedef adını kontrol et".
+   * Sistem DNS'i sağlıklı ama şifreli değilse: gizlilik önerisi.
+   * Şifreli çözümleyiciye ulaşılamıyorsa: yalnızca bilgilendirme, arıza iddiası yok.
+5. Sistemin şifreli DNS ayarı THE DPI tarafından **sessizce değiştirilmez**; kullanıcıya önerilir.
+
+Kaynaklar: RFC 8484, RFC 9250, RFC 9114; [dnsbenchmark.app — Quad9 DoQ/DoH3 2026](https://dnsbenchmark.app/blog/dns-over-quic-http3-quad9-2026/),
+[tech-insider.org — DoH vs DoT vs DoQ 2026](https://tech-insider.org/doh-vs-dot-vs-doq-vs-dnscrypt-encrypted-dns-2026/),
+[pbxscience.com — DoQ adoption](https://pbxscience.com/encrypted-dns-reaches-a-turning-point-as-doq-adoption-accelerates/)
+(bunlar ikincil kaynaklardır; normatif tanım RFC'lerdedir).
+
 Yöntem hakkında not: QUIC VN probu, RFC 9000 §6'da tanımlı standart davranıştan yararlanır. Trafik
 gizlemez, başka bir protokolü taklit etmez ve hiçbir engeli aşmaya çalışmaz; yalnızca erişilebilirliği
 ölçer.
@@ -306,6 +345,8 @@ Release APK ve Windows imzalaması bu ortamda yapılamadı.
 | `wire::encode` (8 hedefli rapor, 3,7 KB) | 1 087 | 30 097 | 28× |
 | `wire::decode` (aynı rapor) | 6 199 | 34 126 | 6× |
 | `create + destroy` | 116 | 307 | 3× |
+| ASCII küçük harf, 253 B — **Assembly** (SSE2) | 43 | — | — |
+| ASCII küçük harf, 253 B — `std` (autovektörize) | 39 | — | — |
 | Tam tanılama + değerlendirme, 4 hedef, loopback (QUIC kapalı / açık) | 0,45 ms / 0,51 ms | — | — |
 
 Stres testleri:
@@ -327,17 +368,19 @@ Reddedilen ve ertelenen optimizasyonlar:
 
 * `wire::decode` 6 µs. Tanılama başına bir kez çalışıyor ve ağ süresinin yanında ihmal edilebilir;
   karmaşıklık eklenmedi.
-* **Assembly gerekmiyor.** En sıcak yol (`classify`) 1,1 µs ve maliyetin tamamına yakını ağ beklemesi.
-  Bu yüzden `Core.s` oluşturulmadı.
+* **Assembly ölçümü (dürüst sonuç):** 253 baytlık en kötü durumda el yazımı SSE2 rutini 43 ns,
+  LLVM'in otomatik vektörize ettiği `std` rutini 39 ns. Gerçek DNS adları ~20 bayt olduğundan fark
+  ihmal edilebilir. Assembly, kullanıcı kararıyla projenin mimariye özgü SIMD bileşeni olarak
+  doğrulanmış biçimde tutuluyor.
 
 İkili boyutları (release, LTO=fat, `codegen-units=1`, strip):
 
 | İkili | Boyut |
 |---|---:|
-| `libthe_dpi.so` arm64-v8a | 470 KiB |
+| `libthe_dpi.so` arm64-v8a (NDK 30) | 468 KiB |
 | `libthe_dpi.so` x86_64 | 510 KiB |
 | `the_dpi.dll` (MinGW) | 998 KiB |
-| Release APK (R8) | 566 KiB (classes.dex 64 KiB) |
+| Release APK (R8) | 564 KiB |
 
 Ölçülemeyenler (ölçüm planı): Android pil tüketimi ve cihazda başlangıç süresi (Battery Historian /
 `adb shell am start -W`), Windows'ta UI yanıt süresi ve gerçek MSVC ikilisinin boyutu. Bunlar gerçek
@@ -348,9 +391,10 @@ cihaz ve Windows makinesi gerektirir.
 | Tür | Bağımlılık | Gerekçe |
 |---|---|---|
 | Rust çalışma zamanı | **Yok** (yalnızca `std`) | `Cargo.lock` tek paket içeriyor |
-| Kotlin çalışma zamanı | `org.jetbrains.kotlin:kotlin-stdlib:2.4.21` → `org.jetbrains:annotations:13.0` | Kotlin dilinin çalışma zamanı (spesifikasyonda izin verilen istisna). Android'de R8 ile küçültülüyor |
+| Kotlin çalışma zamanı | `org.jetbrains.kotlin:kotlin-stdlib:2.5.0-RC` → `org.jetbrains:annotations:13.0` | Kotlin dilinin çalışma zamanı (spesifikasyonda izin verilen istisna). Android'de R8 ile küçültülüyor |
 | Üçüncü taraf Java/Kotlin kütüphanesi | **Yok** (JUnit dahil; testler kendi koşucusunu kullanıyor) | Politika |
-| Derleme zamanı | Gradle 9.7.1, AGP 9.3.1, KGP 2.4.21, Android SDK 37.0 / Build-Tools 36 / NDK r28c, JDK 21 (keytool, jpackage), Cargo | Resmî araçlar |
+| Derleme zamanı | Gradle 9.9.1, AGP 9.5.1, KGP 2.5.0-RC, Android SDK 37.0 / NDK 30.0.16248370, JDK 21 (keytool, jpackage), Cargo, LLVM integrated assembler (rustc içinde) | Resmî araçlar |
+| Platform API'leri (yeni) | Windows: `java.net.http` (JDK), iphlpapi tablo API'leri, kernel32 işlem adı. Android: `android.net.http.HttpEngine` (platform modülü, üçüncü taraf değil). Test: `jdk.httpserver` (JDK) | Kütüphane değil, işletim sistemi/JDK parçası |
 | İşletim sistemi | Android: libc, libdl, platform TLS. Windows: iphlpapi, ws2_32, advapi32, kernel32 (std aracılığıyla bcryptprimitives, ntdll, userenv) | Sistem API'leri |
 | Test ortamı (yalnızca bu oturum) | Wine, MinGW-w64, qemu-user, aarch64 cross-gcc | Windows ve ARM64 testlerini çalıştırmak için; ürünün parçası değil |
 
@@ -368,8 +412,7 @@ The DPI/
 ├── Windows/
 │   ├── build.gradle.kts
 │   └── Source/{Main/Kotlin/Core.kt, Test/Kotlin/CoreTest.kt}
-├── Shared/Source/Main/Kotlin/Bridge.kt
-├── Native/{Cargo.toml, Cargo.lock, rust-toolchain.toml, Core.rs, Tests.rs}
+├── Native/{Cargo.toml, Cargo.lock, rust-toolchain.toml, Core.rs, Core.s, Core.aarch64.s, Tests.rs}
 ├── settings.gradle.kts · build.gradle.kts · gradle.properties · gradlew · gradlew.bat · .gitignore
 └── Engineering.md
 ```
@@ -377,13 +420,13 @@ The DPI/
 | Sapma | Gerekçe |
 |---|---|
 | `src/main` → `Source/Main`, `kotlin/` → `Kotlin/` | Kullanıcının talebi; Gradle'da kaynak dizinleri açıkça tanımlandı |
-| `Shared/Source/Main/Kotlin/Bridge.kt` | JNI sembol adları (`Java_thedpi_Native_*`) iki platformda aynı olmalı. İki kopya tutmak sessiz uyumsuzluğa (`UnsatisfiedLinkError`) yol açar. Ayrı modül değil, her iki modüle eklenen bir kaynak dizini |
+| Ortak bölüm her iki `Core.kt` içinde | Kullanıcı kararıyla `Shared/` kaldırıldı. JNI/codec/model/TLS/DoH/metin bölümü iki dosyada birebir aynı tutuluyor (dosyada "SHARED SECTION" ile işaretli). Değişiklik her iki dosyaya birlikte uygulanmalı; JNI uyumu JVM testleriyle doğrulanıyor |
 | `Windows/Source/Test/Kotlin/CoreTest.kt` | Kullanıcının talebi (testler); JUnit yerine bağımlılıksız koşucu |
 | `Native/Tests.rs` | Testleri güvenlikle ilgili üretim kodundan ayırır; `#[cfg(test)] #[path]` ile tek crate korunur |
 | `Native/rust-toolchain.toml`, `Native/Cargo.lock` | Tekrarlanabilir derleme (derleyici ve kilit sabitleme) |
 | `Android/Source/Main/Resources/…` | Başlatıcı ikonu (üretim gereksinimi) ve veri çıkarma hariç tutma kuralları (lint) |
 | `Engineering.md` | Spesifikasyonun istediği araştırma ve rapor belgesi |
-| `Core.s` ve `build.rs` **yok** | Profil Assembly ihtiyacı göstermedi (bölüm 12); kural gereği eklenmedi |
+| `Core.aarch64.s` | Entegre assembler nesne başına tek mimari derler; ARM64 NEON sürümü ayrı dosyada. `build.rs` gerekmiyor (`global_asm!`) |
 | Kökte Cargo.toml yok | Tek crate; workspace gerekmiyor |
 
 ## 15. Aşama raporları 0.0 → 1.0
@@ -395,12 +438,12 @@ The DPI/
 | 0.2 Ağ tanılama | DNS/TCP/UDP/PMTU probları, çözümleyici istatistikleri | Loopback sahte sunucularla uçtan uca testler | ✅ |
 | 0.3 Protokol zekâsı | HTTPS RR (ALPN/ECH), QUIC VN, platform TLS | Ayrıştırıcı, fuzz ve TLS 1.3/ALPN testleri | ✅ |
 | 0.4 Adaptif motor | Sınıflandırma, puan, debounce, histerezis, cooldown, doğrulama ve geri alma | 15 karar ve 14 sınıflandırma testi | ✅ |
-| 0.5 Android | API 30–37 arm64 uygulaması | debug/release APK, R8, lint 0 bulgu | ✅ derleme · ⚠ cihazda doğrulanmadı |
-| 0.6 Windows | Swing arayüzü, CLI, IP Helper, Windows-ROOT, jpackage görevi | JVM testleri, Wine'da Rust testleri, gerçek ağda CLI | ✅ · ⚠ gerçek Windows'ta doğrulanmadı |
+| 0.5 Android | API 30–37 arm64 uygulaması, DoH3 (HttpEngine) | debug/release APK, R8, lint 0 bulgu | ✅ derleme · cihaz testleri: kullanıcı |
+| 0.6 Windows | Swing arayüzü, CLI, IP Helper, sistem geneli bağlantılar, DoH, Windows-ROOT, jpackage görevi | JVM testleri, Wine'da Rust testleri, gerçek ağda CLI | ✅ · Windows testleri: kullanıcı |
 | 0.7 Gizlilik/Güvenlik | Tehdit modeli, unsafe izolasyonu, DLL sertleştirme, Android 17 yerel ağ uyumu | Testler ve inceleme | ✅ · ⚠ dış güvenlik denetimi yok |
 | 0.8 Optimizasyon | Benchmark'lar, iki ölçüme dayalı iyileştirme | Bölüm 12 | ✅ |
 | 0.9 Stres/Uyumluluk | Uzun süreli, eşzamanlı ve tekrarlı başlat/kapat testleri | Bölüm 12 ve 16 | ✅ (emülatör ve cihaz matrisi hariç) |
-| 1.0 Yayın | Sürüm adayı 1.0.0 | Aşağıdaki kapı | ⚠ **İmzalama ve cihaz/Windows doğrulaması yapılmadan üretime çıkılmamalı** |
+| 1.0 Yayın | Sürüm adayı 1.0.0 | Aşağıdaki kapı | Otomatik kapı ✅ · cihaz/Windows testleri ve imzalama: kullanıcı |
 
 ## 16. Test ve yayın kabul kriterleri + test raporu
 
@@ -408,12 +451,12 @@ The DPI/
 
 | Paket | Sonuç (12.11.2026) |
 |---|---|
-| Rust birim ve entegrasyon testleri, x86_64 Linux | **66/66** ✅ (+4 benchmark/stres testi, `--ignored`) |
-| Aynı testler, Windows x64 ikilisi (MinGW + Wine) | **66/66** ✅ |
-| Aynı testler, ARM64 (aarch64 + QEMU) | **66/66** ✅ |
+| Rust birim ve entegrasyon testleri, x86_64 Linux | **78/78** ✅ (+4 benchmark/stres testi, `--ignored`) |
+| Aynı testler, Windows x64 ikilisi (MinGW + Wine) | **78/78** ✅ |
+| Aynı testler, ARM64 (aarch64 + QEMU) | **78/78** ✅ |
 | clippy `-D warnings`: Linux, Android aarch64, Windows MSVC, Windows GNU | 0 uyarı ✅ |
 | rustfmt | ✅ |
-| JVM/JNI (`-Xcheck:jni`): codec, hatalar, TLS sertifika/hostname/zaman aşımı, uçtan uca, eşzamanlılık, stres, metin katalogu | **16/16** ✅ |
+| JVM/JNI (`-Xcheck:jni`): codec, hatalar, TLS sertifika/hostname/zaman aşımı, yerel HTTPS üzerinden gerçek DoH turu, sistem geneli görünüm, uçtan uca, eşzamanlılık, stres, metin katalogu | **20/20** ✅ |
 | Android lint (uyarılar hata sayılıyor) | 0 bulgu ✅ |
 | Gerçek ağda CLI duman testi (example.com + NXDOMAIN hedefi) | Doğru teşhis ve karar ✅ |
 
@@ -421,10 +464,8 @@ The DPI/
 
 1. Otomatik kapı tamamen yeşil olmalı. ✅
 2. Kritik veya yüksek önem derecesinde açık güvenlik bulgusu olmamalı (iç inceleme: yok). ⚠ Bağımsız inceleme önerilir.
-3. Android 11, 13, 15 ve 17 çalıştıran gerçek ARM64 cihazlarda: başlatma, Wi-Fi↔mobil geçişi, uçak modu,
-   captive portal ağı, Özel DNS açık/kapalı, Veri Tasarrufu, düşük bellek ve işlem sonlandırma. ⚠ Bekliyor.
-4. Windows 10 22H2 ve Windows 11 24H2 x64'te: MSVC derlemesi, `packageWindows`, imzalama, Ethernet/Wi-Fi/VPN,
-   uyku/uyanma, IPv6'sız ağ, `Windows-ROOT` güveni. ⚠ Bekliyor.
+3. Android cihaz testleri (11–17, ARM64; DoH3 için Android 14+) — **kullanıcı yürütüyor.**
+4. Windows 10/11 x64 testleri (MSVC derlemesi, `packageWindows`, sistem geneli görünüm, DoH, `Windows-ROOT`) — **kullanıcı yürütüyor.**
 5. Release APK imzası (`THEDPI_KEYSTORE*` ortam değişkenleri) ve Windows Authenticode imzası. ⚠ Bekliyor.
 6. Tekrarlanabilirlik: aynı commit'ten iki temiz derleme aynı `.so` özetini vermeli. ⚠ Bekliyor.
 
@@ -432,9 +473,9 @@ The DPI/
 
 | Özellik | Durum | Neden / alternatif |
 |---|---|---|
-| Sistem genelinde paket inceleme veya yönlendirme (Windows) | **Yapılmadı** | WFP callout'ları kernel-mode sürücü gerektirir: C/C++ ve WDK, EV kod imzalama ile Microsoft attestation, ayrı güvenlik ve bakım yükü. Kotlin/Rust user-mode ile mümkün değil. Alternatif: tanılama ve öneri (şu anki mimari) |
-| Android VPN modu | **Yapılmadı** | `VpnService` kullanıcı onayı ister ve anlamlı bir tünel için **ayrı işletilen bir uç nokta (sunucu)** gerekir. Yerel uygulama tek başına bunu sağlayamaz. Gerçek bir ihtiyaç ve altyapı tanımlanırsa ayrı bir aşama olarak ele alınmalı |
-| DoT/DoH/DoQ istemcisi | **Yapılmadı** | TLS/QUIC kriptografisi gerekir; özel kriptografi ve harici kütüphane yasak. Platformun Özel DNS'i algılanır ve önerilir |
+| Sistem geneli görünüm (Windows) | **Yapıldı (kullanıcı modu)** | Tüm bağlantılar sahip işlemiyle birlikte görülüyor, sürücü gerekmiyor. Paket seviyesi WFP katmanı için bölüm 19 |
+| Android VPN modu | **Kapsam dışı (kullanıcı kararı)** | Ürün VPN değil |
+| Şifreli DNS | **DoH3/DoH yapıldı** | Platform HTTPS/HTTP3 üzerinden, yanıt Rust'ta doğrulanıyor (bölüm 10). DoT ve DoQ'nun ham soket üzerinden yapılması TLS/QUIC kriptografisini kendimizin yazmasını gerektirirdi; bu yüzden yalnızca platformun sunduğu yerlerde kullanılıyor (Android Özel DNS = DoT) |
 | QUIC/HTTP3 el sıkışması | Yalnızca Version Negotiation | Tam el sıkışma kriptografi gerektirir. h3 yeteneği DNS ilanı ve VN yanıtıyla dolaylı olarak, güven seviyesiyle birlikte raporlanır |
 | ECH kullanımı | Yalnızca ilan algılama | Platform TLS'in işi (Android 17 destekliyor). JDK'nın ECH desteği doğrulanmadı |
 | Windows captive portal ve ölçülü bağlantı | "Bilinmiyor" | `INetworkListManager` COM gerektirir; harici crate olmadan Rust'ta COM yazmak büyük bir unsafe yüzey getirir. Gerekirse 1.x'te ayrı bir modül olarak değerlendirilmeli |
@@ -453,7 +494,7 @@ The DPI/
 ## 18. Derleme ve test talimatları
 
 Önkoşullar: JDK 21, Rust (`rust-toolchain.toml` 1.99.1'i otomatik kurar), Android SDK (platform
-`android-37.0`, Build-Tools 36.0.0, NDK 28.2.13676358) ve `local.properties` içinde `sdk.dir=...`
+`android-37.0`, NDK 30.0.16248370) ve `local.properties` içinde `sdk.dir=...`
 veya `ANDROID_HOME`. Windows paketleme için Visual Studio Build Tools (MSVC) ve WiX gerekmez (app-image).
 
 ```bash
@@ -461,8 +502,34 @@ veya `ANDROID_HOME`. Windows paketleme için Visual Studio Build Tools (MSVC) ve
 ./gradlew :Android:assembleRelease      # R8, arm64-v8a, 16 KB hizalı .so (imza: THEDPI_KEYSTORE* env)
 ./gradlew :Windows:run                  # Geliştirme: Swing arayüzü
 ./gradlew :Windows:packageWindows       # Windows'ta: MSVC DLL + jpackage app-image (sonra signtool)
-TheDPI --cli example.com --dns 1.1.1.1  # Komut satırı modu
+TheDPI --cli example.com --dns 1.1.1.1 --doh https://dns.example/dns-query --system  # Komut satırı modu
 
 cd Native
 cargo test --release -- --ignored --nocapture --test-threads=1   # benchmark ve stres testleri
 ```
+
+## 19. Windows paket seviyesi katman (WFP) — sürücü yolu
+
+**Dil engel değil.** Bir Windows çekirdek sürücüsü Rust ile yazılabilir; Microsoft'un kendi
+`windows-drivers-rs` çalışması bunu gösteriyor. Teorik olarak Assembly ile de yazılabilir. Yani C++
+zorunlu değil. Gerçek engeller şunlar:
+
+1. **İmza.** 64-bit Windows yalnızca Microsoft imzalı çekirdek sürücülerini yükler: EV kod imzalama
+   sertifikası ve Microsoft Partner Center üzerinden attestation imzası gerekir. Test için "test
+   signing" modu yalnızca geliştirici makinesinde kullanılabilir.
+2. **Araç zinciri.** WDK (Windows Driver Kit) ve bir Windows derleme makinesi gerekir. Bu Linux ortamında
+   çekirdek sürücüsü derlenemez ve test edilemez.
+3. **Bağımlılık politikası.** `windows-drivers-rs` üçüncü taraf crate'tir. Sıfır-crate politikasıyla
+   WDK başlıklarını Rust'a elle bağlamak (`#![no_std]`, ham FFI) gerekir. Bu mümkün ama büyük bir iştir.
+4. **Risk.** Çekirdek kodundaki bir hata sistemi çökertir (BSOD). Ayrı test matrisi ve Driver Verifier
+   gerekir.
+
+**Önerilen yol:**
+
+* Kullanıcı modu WFP (`fwpuclnt.dll`, sürücü gerektirmez) ile önce uygulama/port bazlı **izleme ve
+  filtreleme kuralları** (güvenlik duvarı benzeri, kullanıcı onaylı).
+* Ardından, imza altyapısı hazırsa, Rust `no_std` WFP callout sürücüsü ile paket seviyesi **görünürlük**.
+
+Sınır: THE DPI kendi cihazının trafiğini görür ve kullanıcının onayıyla filtreler. Şifreli trafiği
+çözmez (TLS kırma / MITM yok), başka cihazların trafiğine dokunmaz ve güvenlik politikalarını aldatarak
+aşmaz.
