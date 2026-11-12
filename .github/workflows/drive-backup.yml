@@ -2,7 +2,7 @@ name: Drive Yedekle
 
 on:
   push:
-    branches: [ The_DPI_Beta ]
+    branches: [ The_DPI_Beta, Freedom_Network_Beta ]
   workflow_dispatch:
 
 concurrency:

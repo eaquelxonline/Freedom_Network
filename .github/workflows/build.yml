@@ -5,7 +5,7 @@ name: Build
 
 on:
   push:
-    branches: [The_DPI_Beta]
+    branches: [The_DPI_Beta, Freedom_Network_Beta]
   pull_request:
   workflow_dispatch:
 

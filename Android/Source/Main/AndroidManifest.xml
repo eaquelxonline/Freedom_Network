@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Freedom Network — Android 11–17 (API 30–37), ARM64. Universal censorship bypass, privacy & speed engine. -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -19,6 +20,7 @@
         android:usesCleartextTraffic="false"
         android:supportsRtl="true"
         android:enableOnBackInvokedCallback="true"
+        tools:targetApi="33"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <activity
