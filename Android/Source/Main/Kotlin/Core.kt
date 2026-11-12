@@ -7785,11 +7785,10 @@ class MainActivity : Activity() {
                     leaksBlocked = b?.leaksBlocked?.get() ?: 0,
                     killSwitch = killSwitchEnabled,
                     exitRelayLabel = exitRelayLabel,
-                    isWarpActive = b?.isWarpActive ?: false,
-                    warpEndpoint = b?.activeExitRelayLabel ?: "",
-                    personaName = selectedPersona.shortLabel,
-                    aaaaSuppressed = b?.aaaaSuppressed?.get() ?: 0,
-                    httpHeadersSpoofed = b?.httpHeadersSpoofed?.get() ?: 0,
+                    ipMasked = (b?.isIpMasked == true) || exitRelayLabel.isNotEmpty(),
+                    maskMethodLabel = b?.activeExitRelayLabel ?: "",
+                    devicePersonaLabel = selectedPersona.shortLabel,
+                    locationShieldLabel = if (mockLocationEnabled) NullIslandLocationShield.lastStatusText else "Kapalı",
                 )
                 ui {
                     diagOutput.text = text + "\n" + diagOutput.text.toString()
