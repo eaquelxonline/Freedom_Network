@@ -80,6 +80,7 @@ android {
             "ChromeOsAbiSupport", // arm64-v8a is the only in-scope ABI
             "AndroidGradlePluginVersion", "GradleDependency", "NewerVersionAvailable", // versions are pinned by the verified matrix
             "InlinedApi", // API 34+ foreground service types are conditionally guarded by Build.VERSION.SDK_INT
+            "ObsoleteSdkInt", // defensive version checks for backward compatibility patterns
         )
     }
 }

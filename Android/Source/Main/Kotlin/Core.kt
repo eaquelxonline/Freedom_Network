@@ -3351,18 +3351,16 @@ class TheDpiVpnService : VpnService() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "THE DPI Engelsiz Mod Tüneli",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = "THE DPI sistem geneli TUN köprüsü ve sansür kalkanı durum bildirimi"
-                setShowBadge(false)
-            }
-            val nm = getSystemService(NotificationManager::class.java)
-            nm?.createNotificationChannel(channel)
+        val channel = NotificationChannel(
+            NOTIFICATION_CHANNEL_ID,
+            "THE DPI Engelsiz Mod Tüneli",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = "THE DPI sistem geneli TUN köprüsü ve sansür kalkanı durum bildirimi"
+            setShowBadge(false)
         }
+        val nm = getSystemService(NotificationManager::class.java)
+        nm?.createNotificationChannel(channel)
     }
 
     private fun buildNotification(statusText: String): Notification {
@@ -3382,13 +3380,7 @@ class TheDpiVpnService : VpnService() {
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-        }
-        return builder
+        return Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle("THE DPI — Engelsiz Mod Aktif")
             .setContentText(statusText)
@@ -3520,12 +3512,7 @@ class TheDpiVpnService : VpnService() {
         runCatching { session?.stopProxy(); session?.close() }
         session = null
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
+            stopForeground(STOP_FOREGROUND_REMOVE)
         } catch (t: Throwable) {
             CrashLogger.log("TheDpiVpnService", "stopForeground hatası: ${t.message}", t)
         }
@@ -4204,11 +4191,7 @@ class MainActivity : Activity() {
                 val vpnIntent = Intent(this, TheDpiVpnService::class.java)
                     .putStringArrayListExtra(TheDpiVpnService.EXTRA_DOH, dohList)
                     .putStringArrayListExtra(TheDpiVpnService.EXTRA_DNS, dnsList)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(vpnIntent)
-                } else {
-                    startService(vpnIntent)
-                }
+                startForegroundService(vpnIntent)
                 CrashLogger.log("MainActivity", "TheDpiVpnService startForegroundService çağrıldı")
             }.onFailure {
                 CrashLogger.log("MainActivity", "TheDpiVpnService başlatılamadı!", it)
