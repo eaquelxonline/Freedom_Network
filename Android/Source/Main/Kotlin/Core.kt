@@ -3768,6 +3768,9 @@ class ModernPowerShieldView(context: Context) : View(context) {
     private val subTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
     }
+    private val density by lazy { resources.displayMetrics.density }
+    private val orbitalDash by lazy { DashPathEffect(floatArrayOf(12f * density, 8f * density), 0f) }
+    private val orbitalRect = RectF()
 
     private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
         duration = 2000L
@@ -3849,11 +3852,11 @@ class ModernPowerShieldView(context: Context) : View(context) {
             val reticleR = maxR * 0.52f
             ringPaint.color = Color.argb(160, r, g, b)
             ringPaint.strokeWidth = 2f * density
-            ringPaint.pathEffect = DashPathEffect(floatArrayOf(12f * density, 8f * density), 0f)
-            val rect = RectF(cx - reticleR, cy - reticleR, cx + reticleR, cy + reticleR)
+            ringPaint.pathEffect = orbitalDash
+            orbitalRect.set(cx - reticleR, cy - reticleR, cx + reticleR, cy + reticleR)
             canvas.save()
             canvas.rotate(orbitAngle, cx, cy)
-            canvas.drawArc(rect, 0f, 360f, false, ringPaint)
+            canvas.drawArc(orbitalRect, 0f, 360f, false, ringPaint)
             canvas.restore()
             ringPaint.pathEffect = null
         }
@@ -3973,6 +3976,9 @@ class ThroughputSparklineView(context: Context) : View(context) {
         textSize = 9.5f * resources.displayMetrics.density
         color = Color.parseColor("#64748B")
     }
+    private val rxPath = Path()
+    private val txPath = Path()
+    private val rxFill = Path()
 
     fun updateMetrics(rxKbps: Float, txKbps: Float, totalRx: Long, totalTx: Long) {
         currentRxKbps = rxKbps
@@ -4024,9 +4030,9 @@ class ThroughputSparklineView(context: Context) : View(context) {
             if (txHistory[i] > maxVal) maxVal = txHistory[i]
         }
 
-        val rxPath = Path()
-        val txPath = Path()
-        val rxFill = Path()
+        rxPath.reset()
+        txPath.reset()
+        rxFill.reset()
         val stepX = graphW / (maxSamples - 1).toFloat()
 
         for (i in 0 until maxSamples) {
