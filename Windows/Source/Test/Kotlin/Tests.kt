@@ -489,7 +489,7 @@ fun main() {
             eq(started.status, Codes.OK, "startProxy status")
             eq(started.mode, DesyncMode.REALITY_VISION, "startProxy mode")
             expect(started.active && started.port > 0) { "proxy active on port ${started.port}" }
-            expect("ENGELSİZ MOD" in Text.proxyStatus(started) && "REALITY + ML-KEM-768" in Text.proxyStatus(started)) { "proxy Turkish status" }
+            expect("FREEDOM NETWORK (YEREL DPI AŞMA)" in Text.proxyStatus(started) && "REALITY + ML-KEM-768" in Text.proxyStatus(started)) { "proxy Turkish status" }
             eq(s.stopProxy(), Codes.OK, "stopProxy")
             expect(!s.proxyStats().active) { "proxy stopped" }
         }
