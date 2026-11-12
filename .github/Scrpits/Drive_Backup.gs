@@ -1,4 +1,4 @@
-// Google Drive yedeği (Google Apps Script, kullanıcının kendi Drive hesabında çalışır).
+// Freedom Network — Google Drive Yedeği (Google Apps Script, kullanıcının kendi Drive hesabında çalışır).
 const OWNER = 'eaquelxonline';
 const REPO = 'The_DPI';
 const BRANCH = 'The_DPI_Beta';

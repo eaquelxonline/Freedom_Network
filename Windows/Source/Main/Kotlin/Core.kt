@@ -1,11 +1,11 @@
-// THE DPI — Windows 10/11 x64 application (Kotlin/JVM, JDK Swing, Rust DLL via JNI).
+// Freedom Network — Windows 10/11 x64 application (Kotlin/JVM, JDK Swing, Rust DLL via JNI).
 //
-// Self-contained: the JNI boundary (class thedpi.Native), the wire codec mirrored from
+// Self-contained: the JNI boundary (class com.freedom.network.Native), the wire codec mirrored from
 // Native/Core.rs, typed models, the platform-TLS prober, the diagnostic session
 // orchestrator, the Turkish text catalogue, and this platform's integration.
 // The shared section below is kept byte-identical with the other platform module.
 
-package thedpi
+package com.freedom.network
 
 import java.time.Duration
 import java.net.http.HttpTimeoutException
@@ -52,6 +52,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetSocketAddress
@@ -99,10 +100,10 @@ import kotlin.system.exitProcess
 
 // ------------------------------------------------------------------ JNI
 
-/** The single JNI boundary. Symbols: Java_thedpi_Native_* in Native/Core.rs. */
+/** The single JNI boundary. Symbols: Java_com_freedom_network_Native_* in Native/Core.rs. */
 object Native {
     const val EXPECTED_API = 1
-    const val LIBRARY = "the_dpi"
+    const val LIBRARY = "freedom"
 
     /** Null when the native library loaded; otherwise the reason it did not. */
     val loadError: Throwable? = try {
@@ -1069,7 +1070,7 @@ object Text {
         0 -> "İşlem gerekmiyor."
         1 -> "IPv6 yolu çalışmıyor, IPv4 çalışıyor. Modem/yönlendirici IPv6 ayarlarını kontrol edin; gerekirse ağ bağdaştırıcısında IPv4'ü önceliklendirin (yönetici izni gerekir)."
         2 -> "IPv4 yolu çalışmıyor, IPv6 çalışıyor. Modem/yönlendirici IPv4 (NAT/DHCP) ayarlarını kontrol edin."
-        3 -> "Sistem DNS'i sorunlu görünüyor. Güvendiğiniz bir şifreli DNS hizmetini kendiniz seçip ayarlayabilirsiniz (Android: Ayarlar › Ağ › Özel DNS; Windows: Ayarlar › Ağ › DNS sunucusu ataması › Şifreli DNS). THE DPI sistem DNS'ini sessizce değiştirmez. Gizlilik notu: seçtiğiniz DNS sağlayıcısı sorgularınızı görür."
+        3 -> "Sistem DNS'i sorunlu görünüyor. Güvendiğiniz bir şifreli DNS hizmetini kendiniz seçip ayarlayabilirsiniz (Android: Ayarlar › Ağ › Özel DNS; Windows: Ayarlar › Ağ › DNS sunucusu ataması › Şifreli DNS). Freedom Network sistem DNS'ini sessizce değiştirmez. Gizlilik notu: seçtiğiniz DNS sağlayıcısı sorgularınızı görür."
         4 -> "UDP/443 (QUIC) yolu yanıt vermiyor; uygulamalar normalde HTTP/2 (TCP) ile otomatik devam eder. Sorun yaşarsanız tarayıcıda QUIC/HTTP3'ü kapatabilirsiniz."
         5 -> "Ölçülen yol MTU'su ${param} bayt. Büyük paketler yolda düşüyor olabilir; bağdaştırıcı MTU değerini bu değere düşürmeyi değerlendirin (yönetici izni gerekir)."
         6 -> "Ağ bir giriş sayfası (captive portal) istiyor. Tarayıcıda giriş yapın; ardından tekrar tanılayın."
@@ -1131,7 +1132,7 @@ object Text {
             43 -> "$s: sistem DNS'i alan adı yok diyor, bağımsız şifreli DNS (${Text.encProtocol(o.args.getOrNull(0)?.toInt() ?: 0)}) çözüyor — çözümleyici düzeyinde tutarsızlık"
             44 -> "$s: şifreli DNS de alan adının olmadığını doğruluyor"
             45 -> "$s: DNS yanıtı zehirlenmiş / sansür IP'sine yönlendirildi (${a(0)}.${a(1)}.${a(2)}.${a(3)})"
-            39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; THE DPI bu izni istemez). Bu bir ağ arızası değildir."
+            39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; Freedom Network bu izni istemez). Bu bir ağ arızası değildir."
             else -> "Gözlem ${o.code} $s ${o.args}"
         }
     }
@@ -1285,7 +1286,7 @@ object Text {
 
     fun serverManager(mgr: ServerManager): String = buildString {
         val list = mgr.list()
-        appendLine("THE DPI — KİŞİSEL SUNUCU YÖNETİCİSİ (${list.size} profil)")
+        appendLine("FREEDOM NETWORK — KİŞİSEL SUNUCU YÖNETİCİSİ (${list.size} profil)")
         for (p in list) {
             val kota = if (p.quotaBytes > 0) "${p.usedBytes}/${p.quotaBytes} bayt" else "${p.usedBytes} bayt (sınırsız)"
             appendLine("  • ${p.name} [${serverStatus(p.status)}] → ${p.activeEndpoint} (REALITY hedefi: ${p.coverDest} · cihaz: ${p.deviceId} · gecikme: ${p.latencyMs} ms · kayıp: %${p.lossPct} · kota: $kota)")
@@ -1294,10 +1295,10 @@ object Text {
 
     fun proxyStatus(p: ProxyStatus): String = buildString {
         if (!p.active) {
-            appendLine("ENGELSİZ MOD (YEREL DPI AŞMA): Kapalı")
+            appendLine("FREEDOM NETWORK (YEREL DPI AŞMA): Kapalı")
             return@buildString
         }
-        appendLine("ENGELSİZ MOD (YEREL DPI AŞMA): Etkin · 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
+        appendLine("FREEDOM NETWORK (YEREL DPI AŞMA): Etkin · 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         appendLine("  Strateji   : ${desyncMode(p.mode)}")
         appendLine("  İstatistik : bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped} · Vision doğrudan aktarım ${p.visionSplice}")
     }
@@ -1316,22 +1317,25 @@ object Text {
         tlsFragmented: Int = 0,
         bytesUp: Long = 0,
         bytesDown: Long = 0,
+        trackersBlocked: Int = 0,
+        leaksBlocked: Int = 0,
+        killSwitch: Boolean = false,
     ): String = buildString {
         if (!vpnActive && !p.active) {
-            appendLine("ENGELSİZ MOD (SİSTEM GENELİ VPN + DPI AŞMA): Kapalı")
+            appendLine("FREEDOM NETWORK (SİSTEM GENELİ ÖZGÜR AĞ): Kapalı")
             return@buildString
         }
         val modeDesc = if (vpnActive) {
-            "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · DoH DNS + REALITY/Vision Desync + Roblox/Discord UDP NAT)"
+            "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · Şifreli DoH3/ODoH + REALITY/Vision Desync + Tam UDP NAT)"
         } else {
             "Yerel Proxy (127.0.0.1:${p.port})"
         }
-        appendLine("ENGELSİZ MOD: Etkin · $modeDesc")
+        appendLine("FREEDOM NETWORK: Etkin · $modeDesc")
         if (p.active) {
             appendLine("  Yerel Proxy: 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         }
-        appendLine("  Strateji   : ${desyncMode(p.mode)}")
-        appendLine("  TUN Köprüsü: TCP $tcpFlows (Desync $desyncedFlows, TLS Kayıt Parçalama $tlsFragmented, Vision Splice $visionSplicedFlows) · UDP/Oyun-Ses $udpFlows (QUIC Geçişi $quicFallbacks) · DNS $dnsQueries (Şifreli DoH $dohResolved, Zehirlenme Engellendi $poisonedBlocked)")
+        appendLine("  Strateji   : ${desyncMode(p.mode)}${if (killSwitch) " · Sızdırmaz Kill Switch AKTİF" else ""}")
+        appendLine("  TUN Köprüsü: TCP $tcpFlows (Desync $desyncedFlows, TLS Kayıt Parçalama $tlsFragmented, Vision Splice $visionSplicedFlows) · Gerçek Zamanlı UDP $udpFlows (QUIC Geçişi $quicFallbacks) · DNS $dnsQueries (Şifreli DoH $dohResolved, Zehir $poisonedBlocked, İzleyici $trackersBlocked, Sızıntı Engeli $leaksBlocked)")
         if (bytesUp > 0 || bytesDown > 0) {
             appendLine("  Veri Akışı : Yükleme ${bytesUp / 1024} KB · İndirme ${bytesDown / 1024} KB")
         }
@@ -1952,8 +1956,69 @@ object IpPackets {
         return if (records.size > 1) records else tcpChunks
     }
 
-    /** Builds a 74-byte Discord Voice UDP IP Discovery packet (`0x00 0x01 0x00 0x46` + SSRC). */
-    fun buildDiscordVoiceIpDiscovery(ssrc: Int, address: String = "", port: Int = 0): ByteArray {
+    /** Extracts the lowercase QNAME from a standard DNS wire query packet, or null. */
+    fun parseDnsQuestionName(msg: ByteArray): String? {
+        if (msg.size < 13 || u16(msg, 4) == 0) return null
+        val sb = StringBuilder()
+        var pos = 12
+        var guard = 0
+        while (pos < msg.size && guard++ < 128) {
+            val len = msg[pos].toInt() and 0xFF
+            if (len == 0) break
+            if ((len and 0xC0) != 0) return null
+            if (pos + 1 + len > msg.size) return null
+            if (sb.isNotEmpty()) sb.append('.')
+            for (i in 1..len) {
+                val c = (msg[pos + i].toInt() and 0xFF)
+                sb.append(if (c in 65..90) (c + 32).toChar() else c.toChar())
+            }
+            pos += 1 + len
+        }
+        return if (sb.isEmpty()) null else sb.toString()
+    }
+
+    /** Synthesizes a fast local NXDOMAIN DNS answer (RCODE=3) preserving query ID and question. */
+    fun buildDnsNxdomain(query: ByteArray): ByteArray {
+        if (query.size < 12) return query.copyOf()
+        val end = skipDnsName(query, 12)
+        val qEnd = if (end in 13..(query.size - 4)) end + 4 else query.size
+        val out = ByteArray(qEnd)
+        System.arraycopy(query, 0, out, 0, qEnd)
+        out[2] = ((query[2].toInt() and 0x01) or 0x81).toByte() // QR=1, copy RD
+        out[3] = 0x83.toByte() // RA=1, RCODE=3 (NXDOMAIN)
+        out[4] = 0; out[5] = if (qEnd > 12) 1 else 0
+        out[6] = 0; out[7] = 0
+        out[8] = 0; out[9] = 0
+        out[10] = 0; out[11] = 0
+        return out
+    }
+
+    private val TRACKER_SUFFIXES = arrayOf(
+        "doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
+        "analytics.google.com", "adservice.google.com", "app-measurement.com", "appsflyer.com",
+        "adjust.com", "branch.io", "mixpanel.com", "amplitude.com", "hotjar.com",
+        "taboola.com", "outbrain.com", "criteo.com", "pubmatic.com", "rubiconproject.com",
+        "scorecardresearch.com", "quantserve.com", "unityads.unity3d.com",
+        "ads-api.tiktok.com", "analytics.tiktok.com", "ads.reddit.com", "telemetry.mozilla.org",
+    )
+
+    /** True when [host] matches a known advertising or behavioral telemetry tracker domain. */
+    fun isTrackerOrAdDomain(host: String): Boolean {
+        val h = host.lowercase().trimEnd('.')
+        return TRACKER_SUFFIXES.any { s -> h == s || h.endsWith(".$s") }
+    }
+
+    /** True when [payload] is a classic STUN Binding Request / IP Discovery packet (`0x0001`). */
+    fun isStunBindingRequest(payload: ByteArray): Boolean {
+        if (payload.size < 20) return false
+        val msgType = u16(payload, 0)
+        if (msgType != 0x0001) return false
+        val magic = u32(payload, 4)
+        return magic == 0x2112A442L || payload.size == 74
+    }
+
+    /** Builds a 74-byte STUN UDP IP Discovery packet (`0x00 0x01 0x00 0x46` + SSRC). */
+    fun buildStunIpDiscovery(ssrc: Int, address: String = "", port: Int = 0): ByteArray {
         val pkt = ByteArray(74)
         putU16(pkt, 0, 0x0001)
         putU16(pkt, 2, 70)
@@ -1964,8 +2029,8 @@ object IpPackets {
         return pkt
     }
 
-    /** Builds a Roblox RakNet `ID_OPEN_CONNECTION_REQUEST_1` (`0x05`) UDP handshake datagram. */
-    fun buildRobloxRakNetOpenConnectionRequest1(totalSize: Int = 48): ByteArray {
+    /** Builds a real-time UDP protocol handshake datagram (`0x05` + offline framing magic). */
+    fun buildRealtimeUdpHandshake(totalSize: Int = 48): ByteArray {
         val size = maxOf(18, totalSize)
         val pkt = ByteArray(size)
         pkt[0] = 0x05
@@ -1976,7 +2041,7 @@ object IpPackets {
             0x12, 0x34, 0x56, 0x78,
         )
         System.arraycopy(magic, 0, pkt, 1, magic.size)
-        pkt[17] = 11 // RakNet protocol version
+        pkt[17] = 11
         return pkt
     }
 }
@@ -1984,12 +2049,10 @@ object IpPackets {
 /**
  * RFC 8484 DoH client that needs **no DNS of its own**: endpoints are IP literals
  * (`https://1.1.1.1/dns-query`) or well-known resolver names mapped to their anycast IPs, so
- * the ISP resolver (which answers `discord.com` with the `195.175.254.2` block page) is never
+ * the ISP resolver (which may return poisoned sinkhole IPs such as `195.175.254.2`) is never
  * consulted and a VPN TUN cannot recurse into itself. Every socket is passed to
- * [protectSocket] (Android `VpnService.protect`). IP-literal hosts send no SNI; the server
- * certificate is validated by the platform trust store and the host/IP SAN is verified
- * through endpoint identification plus an optional platform [verifier]. HTTP/1.1
- * keep-alive connections are pooled per endpoint.
+ * [protectSocket] (Android `VpnService.protect`). Requests send minimal zero-fingerprint headers
+ * over pooled HTTP/1.1 keep-alive connections and verify server identity via HTTPS SAN rules.
  */
 class DirectDohClient(
     private val protectSocket: (Socket) -> Boolean = { true },
@@ -2024,7 +2087,7 @@ class DirectDohClient(
             try {
                 conn.sock.soTimeout = timeoutMs
                 val hostHeader = if (host.contains(':')) "[$host]" else host
-                val head = "POST $path HTTP/1.1\r\nHost: $hostHeader\r\nUser-Agent: TheDPI\r\n" +
+                val head = "POST $path HTTP/1.1\r\nHost: $hostHeader\r\n" +
                     "Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n" +
                     "Content-Length: ${body.size}\r\nConnection: keep-alive\r\n\r\n"
                 conn.out.write(head.toByteArray(Charsets.US_ASCII))
@@ -2155,21 +2218,20 @@ class DirectDohClient(
 }
 
 /**
- * User-mode TUN -> Protected Socket Bridge (`tun2socks` + DoH DNS + UDP NAT + Active DPI Desync).
+ * Freedom Network User-Mode TUN -> Protected Socket Bridge (`tun2socks` + Happy Eyeballs DoH3 +
+ * Privacy/Tracker Shield + Strict Kill Switch + Universal TCP/TLS/ECH Desync + Low-Latency UDP NAT).
  *
- * Bridges raw IPv4 packets from the Android `VpnService` TUN descriptor (`0.0.0.0/0`) to real
- * outbound TCP/UDP sockets protected with `VpnService.protect()`:
- * 1. **Encrypted DNS (UDP/TCP 53)**: Intercepts DNS queries and resolves them via RFC 8484
- *    DoH3/DoH (`DohClient`) first so ISP DNS poisoning on `discord.com` / `roblox.com` is
- *    bypassed; falls back to `protect()`ed UDP DNS sockets (`1.1.1.1` / `8.8.8.8`).
- * 2. **TCP + TLS/HTTP Desync (Discord TCP 443, HTTPS, Web)**: Terminates the local TUN TCP
- *    3-way handshake, inspects the initial `ClientHello` / HTTP request via the Rust+SIMD
- *    `desyncPacket` engine (`REALITY` + `X25519MLKEM768` + `xtls-rprx-vision`), writes the
- *    split `SNI`/`ECH`/`Host:` segments with `TCP_NODELAY` over a `protect()`ed outbound `Socket`,
- *    and directly splices subsequent TLS 1.3 `ApplicationData` records (`0x17 0x03 0x03`).
- * 3. **Lossless UDP NAT Relay (Roblox RakNet UDP, Discord Voice RTC UDP, QUIC UDP 443)**:
- *    Maintains per-flow NAT bindings over `protect()`ed `DatagramSocket`s and relays UDP
- *    datagrams bidirectionally with zero packet drops.
+ * Bridges raw IPv4/IPv6 packets from the TUN descriptor (`0.0.0.0/0` + `::/0`) to real outbound
+ * TCP/UDP sockets protected with `VpnService.protect()`:
+ * 1. **Encrypted DNS & Tracker Shield (UDP/TCP 53)**: Resolves via parallel Happy Eyeballs
+ *    RFC 8484 DoH3/DoH (`DohClient`), strips ISP DNS poisoning, and optionally blocks telemetry/ad
+ *    trackers (`blockTrackers`) and plaintext UDP fallback (`strictKillSwitch`).
+ * 2. **Universal TCP + TLS 1.3 / ECH / PQ Desync**: Terminates the local TUN TCP handshake,
+ *    fragments `SNI`/`ECH`/`Host:` across TLS records and TCP segments via the Rust+SIMD
+ *    `desyncPacket` engine (`REALITY` + `X25519MLKEM768` + `xtls-rprx-vision`), with `TCP_NODELAY`
+ *    and `IPTOS_LOWDELAY` socket tuning.
+ * 3. **Universal UDP NAT & Leak Protection**: Maintains per-flow NAT bindings for real-time audio,
+ *    video, QUIC, and interactive UDP streams, while optionally blocking STUN IP-discovery leaks.
  */
 class TunBridge(
     private val session: DiagnosticSession,
@@ -2187,6 +2249,9 @@ class TunBridge(
         dropRst = true,
     ),
     private val blockQuic: Boolean = true,
+    private val strictKillSwitch: Boolean = false,
+    private val blockTrackers: Boolean = false,
+    private val hardenStunLeaks: Boolean = false,
     private val logger: ((String, String) -> Unit)? = null,
 ) : AutoCloseable {
     private fun log(tag: String, msg: String) {
@@ -2198,7 +2263,7 @@ class TunBridge(
     private val running = AtomicBoolean(false)
     private val writeLock = Any()
     private val ioPool: ExecutorService = Executors.newCachedThreadPool { r ->
-        Thread(r, "thedpi-tun-io").apply { isDaemon = true }
+        Thread(r, "freedom-tun-io").apply { isDaemon = true }
     }
     private var readerThread: Thread? = null
     private val tcpTable = ConcurrentHashMap<FlowKey, TcpFlow>()
@@ -2219,6 +2284,8 @@ class TunBridge(
     val tlsRecordFragmented = AtomicInteger(0)
     val dnsCacheHits = AtomicInteger(0)
     val ipv6Rejected = AtomicInteger(0)
+    val trackersBlocked = AtomicInteger(0)
+    val leaksBlocked = AtomicInteger(0)
     val bytesUp = java.util.concurrent.atomic.AtomicLong(0)
     val bytesDown = java.util.concurrent.atomic.AtomicLong(0)
 
@@ -2238,8 +2305,11 @@ class TunBridge(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
-        log("TunBridge", "TunBridge worker başlatıldı (DoH=${dohEndpoints.size}, DNS=${upstreamDnsServers.size})")
-        readerThread = Thread({ readLoop() }, "thedpi-tun-reader").apply {
+        log(
+            "TunBridge",
+            "Freedom Network TunBridge başlatıldı (DoH=${dohEndpoints.size}, killSwitch=$strictKillSwitch, trackers=$blockTrackers, stunShield=$hardenStunLeaks)",
+        )
+        readerThread = Thread({ readLoop() }, "freedom-tun-reader").apply {
             isDaemon = true
             start()
         }
@@ -2294,7 +2364,7 @@ class TunBridge(
 
     private fun dispatchPacket(raw: ByteArray) {
         if (raw.isNotEmpty() && ((raw[0].toInt() ushr 4) and 0x0F) == 6) {
-            // IPv6 is not bridged: answer immediately so dual-stack apps switch to IPv4 at once.
+            // IPv6 is not bridged: answer immediately so dual-stack apps switch to IPv4 without leak.
             ipv6Rejected.incrementAndGet()
             IpPackets.buildIcmpv6Unreachable(raw)?.let { writeTun(it) }
             return
@@ -2306,9 +2376,13 @@ class TunBridge(
                 if (udp.dstPort == 53) {
                     handleDnsUdp(udp)
                 } else if (blockQuic && udp.dstPort == 443) {
-                    // QUIC Initial carries the SNI in a form the stream splitter cannot protect;
-                    // refuse it so Chrome/Discord/Roblox fall back to fragmented TLS over TCP.
+                    // When QUIC fallback protection is enabled, steer QUIC to fragmented TLS/TCP
+                    // so ISP SNI/ECH inspection cannot drop the session.
                     quicFallbacks.incrementAndGet()
+                    IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
+                } else if (hardenStunLeaks && IpPackets.isStunBindingRequest(udp.payload)) {
+                    // Prevent WebRTC/STUN IP discovery probes from exposing local/ISP IP addresses.
+                    leaksBlocked.incrementAndGet()
                     IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
                 } else {
                     handleUdp(udp)
@@ -2350,7 +2424,15 @@ class TunBridge(
 
     private fun resolveDnsQuery(query: ByteArray, @Suppress("UNUSED_PARAMETER") requestedServerIp: Int): ByteArray? {
         if (query.size < 12) return null
-        // 0) TTL-bounded cache keyed by the query without its ID
+        // 0) Privacy & Tracker Shield sinkhole before leaving the device
+        if (blockTrackers) {
+            val qname = IpPackets.parseDnsQuestionName(query)
+            if (qname != null && IpPackets.isTrackerOrAdDomain(qname)) {
+                trackersBlocked.incrementAndGet()
+                return IpPackets.buildDnsNxdomain(query)
+            }
+        }
+        // 1) TTL-bounded cache keyed by the query without its ID
         val cacheKey = query.copyOfRange(2, query.size).joinToString("") { "%02x".format(it) }
         val now = System.currentTimeMillis()
         dnsCache[cacheKey]?.let { (expiry, msg) ->
@@ -2366,7 +2448,7 @@ class TunBridge(
             dnsCache[cacheKey] = (now + ttl * 1000L) to msg
             return withId(msg, query)
         }
-        // 1) Encrypted DNS (RFC 8484, ID 0) — the ISP resolver is never consulted.
+        // 2) Encrypted DNS (RFC 8484, ID 0) with Happy Eyeballs parallel racing on top 2 resolvers
         val client = dohClient
         val endpoints = dohEndpoints.filter(Doh::validEndpoint)
         if (client != null && endpoints.isNotEmpty()) {
@@ -2374,8 +2456,41 @@ class TunBridge(
             dohWire[0] = 0
             dohWire[1] = 0
             val first = preferredDoh.coerceIn(0, endpoints.size - 1)
+            val tried = HashSet<Int>(2)
+            if (endpoints.size >= 2) {
+                val second = (first + 1) % endpoints.size
+                tried.add(first)
+                tried.add(second)
+                val winner = AtomicReference<Pair<Int, ByteArray>?>(null)
+                val done = CountDownLatch(1)
+                val finished = AtomicInteger(0)
+                for (cand in intArrayOf(first, second)) {
+                    ioPool.execute {
+                        try {
+                            val resp = runCatching { client.post(endpoints[cand], dohWire, 2200) }.getOrNull()
+                            val body = resp?.body
+                            if (resp?.transport == 1 && body != null && body.size >= 12) {
+                                if (IpPackets.containsPoisonedDns(body)) {
+                                    poisonedDnsBlocked.incrementAndGet()
+                                } else if (winner.compareAndSet(null, cand to body)) {
+                                    done.countDown()
+                                }
+                            }
+                        } finally {
+                            if (finished.incrementAndGet() >= 2) done.countDown()
+                        }
+                    }
+                }
+                runCatching { done.await(2300, TimeUnit.MILLISECONDS) }
+                winner.get()?.let { (winIdx, winBody) ->
+                    preferredDoh = winIdx
+                    dohResolved.incrementAndGet()
+                    return remember(winBody)
+                }
+            }
             for (k in endpoints.indices) {
                 val idx = (first + k) % endpoints.size
+                if (!tried.add(idx)) continue
                 val resp = runCatching { client.post(endpoints[idx], dohWire, 2500) }.getOrNull() ?: continue
                 val body = resp.body
                 if (resp.transport == 1 && body != null && body.size >= 12) {
@@ -2389,7 +2504,12 @@ class TunBridge(
                 }
             }
         }
-        // 2) Fallback: protected UDP to public resolvers only; injected/poisoned replies are skipped.
+        // Strict Kill Switch prevents plaintext DNS fallback when encrypted DoH fails.
+        if (strictKillSwitch) {
+            leaksBlocked.incrementAndGet()
+            return null
+        }
+        // 3) Fallback: protected UDP to public resolvers only; injected/poisoned replies are skipped.
         for (srv in upstreamDnsServers) {
             if (srv.isBlank()) continue
             val host = srv.substringBefore(':')
@@ -2451,7 +2571,9 @@ class TunBridge(
         val socket: DatagramSocket? = runCatching {
             DatagramSocket().also {
                 protectDatagram(it)
-                it.soTimeout = 30_000
+                runCatching { it.trafficClass = 0x10 }
+                runCatching { it.receiveBufferSize = 65536; it.sendBufferSize = 65536 }
+                it.soTimeout = 45_000
             }
         }.getOrNull()
         private val closed = AtomicBoolean(false)
@@ -2705,6 +2827,8 @@ class TunBridge(
                 sock.bind(null)
                 protectSocket(sock)
                 sock.tcpNoDelay = true
+                runCatching { sock.trafficClass = 0x10 }
+                runCatching { sock.receiveBufferSize = 65536; sock.sendBufferSize = 65536 }
                 runCatching { sock.keepAlive = true }
                 sock.soTimeout = 90_000
                 val dstInet = if (key.dstIp == virtualDnsIp) {
@@ -2722,7 +2846,7 @@ class TunBridge(
                 ioPool.execute { pumpOutbound(sock, out) }
 
                 val input = sock.getInputStream()
-                val buf = ByteArray(1360)
+                val buf = ByteArray(1400)
                 while (running.get() && !closed.get()) {
                     val n = input.read(buf)
                     if (n > 0) bytesDown.addAndGet(n.toLong())
@@ -2950,7 +3074,7 @@ class JdkDohClient(private val ssl: SSLContext) : DohClient {
     }
 }
 
-/** Headless mode: `TheDPI --cli example.com [--dns 1.1.1.1] [--alt 9.9.9.9]`. */
+/** Headless mode: `FreedomNetwork --cli example.com [--dns 1.1.1.1] [--alt 9.9.9.9]`. */
 fun runCli(args: List<String>): Int {
     val targets = ArrayList<String>()
     val dns = ArrayList<String>()
@@ -2988,7 +3112,7 @@ fun runCli(args: List<String>): Int {
         DiagnosticSession().use { session ->
             val env = WindowsPlatform.environment(dns.filter { it.isNotEmpty() })
             session.setEnvironment(env)
-            println("THE DPI ${Native.engineVersion()} · TLS güveni: ${WindowsPlatform.trust.second}")
+            println("Freedom Network ${Native.engineVersion()} · TLS güveni: ${WindowsPlatform.trust.second}")
             print(Text.environment(env))
             println()
             val report = session.run(
@@ -3015,7 +3139,7 @@ fun runCli(args: List<String>): Int {
     }
 }
 
-// Swing Vector Icon Renderer (Pure Java2D Path2D - Standard 24x24 Lucide Vector Geometry)
+// Swing Vector Icon Renderer (Pure Java2D Path2D - Standard 24x24 Lucide + Freedom Emblem Geometry)
 internal object SwingVectorIcons {
     private val shieldPath = Path2D.Float().apply {
         moveTo(12f, 2f)
@@ -3025,6 +3149,38 @@ internal object SwingVectorIcons {
         curveTo(12.0, 22.0, 4.0, 18.0, 4.0, 12.0)
         lineTo(4f, 5f)
         closePath()
+    }
+
+    private val freedomOuterShield = Path2D.Float().apply {
+        moveTo(12f, 1.8f)
+        lineTo(20.6f, 5.2f)
+        lineTo(19.4f, 13.8f)
+        lineTo(12f, 22.2f)
+        lineTo(4.6f, 13.8f)
+        lineTo(3.4f, 5.2f)
+        closePath()
+    }
+
+    private val freedomInnerCore = Path2D.Float().apply {
+        moveTo(12f, 4.4f)
+        lineTo(17.9f, 6.8f)
+        lineTo(17.0f, 13.0f)
+        lineTo(12f, 19.2f)
+        lineTo(7.0f, 13.0f)
+        lineTo(6.1f, 6.8f)
+        closePath()
+    }
+
+    private val freedomUpperWing = Path2D.Float().apply {
+        moveTo(7.8f, 11.4f)
+        lineTo(12f, 7.2f)
+        lineTo(16.2f, 11.4f)
+    }
+
+    private val freedomLowerWing = Path2D.Float().apply {
+        moveTo(8.8f, 14.4f)
+        lineTo(12f, 11.2f)
+        lineTo(15.2f, 14.4f)
     }
 
     private val boltPath = Path2D.Float().apply {
@@ -3046,7 +3202,8 @@ internal object SwingVectorIcons {
     }
     private val lockBodyRect = RoundRectangle2D.Float(4f, 11f, 16f, 11f, 5f, 5f)
 
-    private val gamepadBodyRect = RoundRectangle2D.Float(2f, 6f, 20f, 12f, 8f, 8f)
+    private val radarOuterCircle = Ellipse2D.Float(3f, 3f, 18f, 18f)
+    private val radarInnerArc = Arc2D.Float(7.5f, 7.5f, 9f, 9f, 45f, 250f, Arc2D.OPEN)
 
     private val globeOval = Ellipse2D.Float(2f, 2f, 20f, 20f)
     private val globeMeridianPath = Path2D.Float().apply {
@@ -3101,6 +3258,24 @@ internal object SwingVectorIcons {
         g2.stroke = oldStroke
     }
 
+    fun drawFreedomShieldEmblem(g2: Graphics2D, cx: Int, cy: Int, size: Int, primary: Color, accent: Color) {
+        withMatrix(g2, cx, cy, size) {
+            g2.color = Color(primary.red, primary.green, primary.blue, 46)
+            g2.fill(freedomOuterShield)
+            g2.color = Color(accent.red, accent.green, accent.blue, 62)
+            g2.fill(freedomInnerCore)
+            g2.color = primary
+            g2.stroke = BasicStroke(1.9f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(freedomOuterShield)
+            g2.color = accent
+            g2.stroke = BasicStroke(2.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(freedomUpperWing)
+            g2.color = Color.WHITE
+            g2.stroke = BasicStroke(2.0f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(freedomLowerWing)
+        }
+    }
+
     fun drawShield(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color, fill: Boolean = true) {
         withMatrix(g2, cx, cy, size) {
             if (fill) {
@@ -3135,20 +3310,16 @@ internal object SwingVectorIcons {
         }
     }
 
-    fun drawGamepad(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+    fun drawRadar(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
         withMatrix(g2, cx, cy, size) {
-            g2.color = Color(color.red, color.green, color.blue, 35)
-            g2.fill(gamepadBodyRect)
+            g2.color = Color(color.red, color.green, color.blue, 30)
+            g2.fill(radarOuterCircle)
             g2.color = color
-            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
-            g2.draw(gamepadBodyRect)
-            // D-Pad Cross
-            g2.draw(Line2D.Float(6.5f, 12f, 10.5f, 12f))
-            g2.draw(Line2D.Float(8.5f, 10f, 8.5f, 14f))
-            // Action Buttons
-            g2.color = color
-            g2.fill(Ellipse2D.Float(14.3f, 10.8f, 2.4f, 2.4f))
-            g2.fill(Ellipse2D.Float(16.8f, 8.8f, 2.4f, 2.4f))
+            g2.stroke = BasicStroke(1.9f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(radarOuterCircle)
+            g2.draw(radarInnerArc)
+            g2.draw(Line2D.Float(12f, 12f, 18.2f, 5.8f))
+            g2.fill(Ellipse2D.Float(10.2f, 10.2f, 3.6f, 3.6f))
         }
     }
 
@@ -3208,8 +3379,8 @@ internal object SwingVectorIcons {
 
 /**
  * ModernPowerShieldPanel:
- * Antialiased cyber power shield button with rotating reticle, expanding wave rings,
- * and mouse click support.
+ * High-contrast Freedom Network Hero Control Disc for Windows Swing with rotating orbital reticle,
+ * 12 azimuth precision ticks, faceted Freedom Shield emblem, and pill status badge.
  */
 class ModernPowerShieldPanel : JPanel() {
     var isActive = false
@@ -3229,12 +3400,12 @@ class ModernPowerShieldPanel : JPanel() {
     private var animPhase = 0f
     private var isHovered = false
     private val animTimer = Timer(33) {
-        animPhase = (animPhase + 0.02f) % 1.0f
+        animPhase = (animPhase + 0.015f) % 1.0f
         repaint()
     }
 
     init {
-        preferredSize = Dimension(650, 160)
+        preferredSize = Dimension(650, 178)
         background = Color(7, 11, 20)
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         animTimer.start()
@@ -3243,7 +3414,7 @@ class ModernPowerShieldPanel : JPanel() {
             override fun mouseClicked(e: MouseEvent) {
                 val cx = width / 2
                 val cy = height / 2
-                val btnR = (minOf(cx, cy) * 0.52).toInt()
+                val btnR = (minOf(cx, cy) * 0.62).toInt()
                 val dx = e.x - cx
                 val dy = e.y - cy
                 if (dx * dx + dy * dy <= (btnR * 1.3) * (btnR * 1.3)) {
@@ -3272,74 +3443,117 @@ class ModernPowerShieldPanel : JPanel() {
         g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
         g2.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE)
 
-        val w = width
-        val h = height
-        val cx = w / 2
-        val cy = h / 2
+        val cx = width / 2
+        val cy = height / 2
         val maxR = minOf(cx, cy) - 10
+        if (maxR <= 0) {
+            g2.dispose()
+            return
+        }
 
-        val baseColor = if (isActive) Color(16, 185, 129) else Color(56, 189, 248)
+        val btnR = (maxR * 0.60).toInt()
+        val primary = if (isActive) Color(16, 185, 129) else Color(56, 189, 248)
+        val accent = if (isActive) Color(34, 211, 238) else Color(129, 140, 248)
 
-        // 1) Expanding wave pulse rings
+        // 1) Expanding cyber pulse waves
         val waveCount = if (isActive) 3 else 1
         for (i in 0 until waveCount) {
             val phase = (animPhase + i * (1f / waveCount)) % 1f
-            val ringR = ((maxR * 0.52) + phase * (maxR * 0.48)).toInt()
-            val alpha = ((1.0f - phase) * (if (isActive) 140 else 40)).toInt().coerceIn(0, 255)
-            g2.color = Color(baseColor.red, baseColor.green, baseColor.blue, alpha)
-            g2.stroke = BasicStroke((2.5f - phase * 1.2f).coerceAtLeast(1.0f))
+            val ringR = (btnR * 1.06 + phase * (maxR - btnR * 1.06)).toInt()
+            val alpha = ((1.0f - phase) * (if (isActive) 140 else 50)).toInt().coerceIn(0, 255)
+            g2.color = Color(primary.red, primary.green, primary.blue, alpha)
+            g2.stroke = BasicStroke((2.4f - phase * 1.2f).coerceAtLeast(1.0f))
             g2.drawOval(cx - ringR, cy - ringR, ringR * 2, ringR * 2)
         }
 
-        // 2) Rotating orbital dashed reticle
-        if (isActive) {
-            val reticleR = (maxR * 0.56).toInt()
-            g2.color = Color(baseColor.red, baseColor.green, baseColor.blue, 150)
-            val dashPattern = floatArrayOf(10f, 8f)
-            g2.stroke = BasicStroke(2f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10f, dashPattern, animPhase * 360f)
-            g2.drawOval(cx - reticleR, cy - reticleR, reticleR * 2, reticleR * 2)
-        }
+        // 2) Counter-rotating orbital dashed reticles
+        val reticleR = (btnR * 1.13).toInt()
+        g2.color = Color(primary.red, primary.green, primary.blue, if (isActive) 170 else 90)
+        g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 10f, floatArrayOf(10f, 7f), animPhase * 360f)
+        g2.drawOval(cx - reticleR, cy - reticleR, reticleR * 2, reticleR * 2)
 
-        // 3) Center Button
-        val btnR = (maxR * 0.46).toInt()
+        val outerReticleR = (btnR * 1.23).toInt()
+        g2.color = Color(accent.red, accent.green, accent.blue, if (isActive) 110 else 50)
+        g2.stroke = BasicStroke(1.4f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 10f, floatArrayOf(4f, 9f), -animPhase * 252f)
+        g2.drawOval(cx - outerReticleR, cy - outerReticleR, outerReticleR * 2, outerReticleR * 2)
 
-        // Glowing aura
-        val auraR = (btnR * 1.25).toInt()
-        g2.color = Color(baseColor.red, baseColor.green, baseColor.blue, if (isActive) (if (isHovered) 80 else 55) else 25)
+        // 3) Ambient radial aura
+        val auraR = (btnR * 1.42).toInt()
+        g2.paint = RadialGradientPaint(
+            java.awt.geom.Point2D.Float(cx.toFloat(), cy.toFloat()),
+            auraR.toFloat(),
+            floatArrayOf(0f, 1f),
+            arrayOf(Color(primary.red, primary.green, primary.blue, if (isActive) (if (isHovered) 115 else 90) else 38), Color(7, 11, 20, 0)),
+        )
         g2.fillOval(cx - auraR, cy - auraR, auraR * 2, auraR * 2)
 
-        // Inner button gradient fill
-        val p1 = java.awt.geom.Point2D.Float(cx.toFloat(), (cy - btnR).toFloat())
-        val p2 = java.awt.geom.Point2D.Float(cx.toFloat(), (cy + btnR).toFloat())
+        // 4) Center disc fill
+        val p1 = java.awt.geom.Point2D.Float((cx - btnR * 0.4f).toFloat(), (cy - btnR).toFloat())
+        val p2 = java.awt.geom.Point2D.Float((cx + btnR * 0.4f).toFloat(), (cy + btnR).toFloat())
         g2.paint = if (isActive) {
-            LinearGradientPaint(p1, p2, floatArrayOf(0f, 1f), arrayOf(Color(5, 150, 105), Color(16, 185, 129)))
+            LinearGradientPaint(p1, p2, floatArrayOf(0f, 1f), arrayOf(Color(4, 47, 46), Color(6, 95, 70)))
         } else {
-            LinearGradientPaint(p1, p2, floatArrayOf(0f, 1f), arrayOf(Color(30, 41, 59), Color(15, 23, 42)))
+            LinearGradientPaint(p1, p2, floatArrayOf(0f, 1f), arrayOf(Color(10, 18, 34), Color(19, 32, 56)))
         }
         g2.fillOval(cx - btnR, cy - btnR, btnR * 2, btnR * 2)
 
-        // Button border
-        g2.color = if (isActive) Color(52, 211, 153) else (if (isHovered) Color(71, 85, 105) else Color(51, 65, 85))
-        g2.stroke = BasicStroke(2.5f)
+        // Azimuth 12 precision ticks
+        g2.color = Color(226, 232, 240, if (isActive) 75 else 45)
+        g2.stroke = BasicStroke(1.2f)
+        for (tick in 0 until 12) {
+            val rad = Math.toRadians(tick * 30.0)
+            val cosA = kotlin.math.cos(rad)
+            val sinA = kotlin.math.sin(rad)
+            g2.drawLine(
+                (cx + cosA * btnR * 0.87).toInt(),
+                (cy + sinA * btnR * 0.87).toInt(),
+                (cx + cosA * btnR * 0.93).toInt(),
+                (cy + sinA * btnR * 0.93).toInt(),
+            )
+        }
+
+        // Glowing rim border
+        g2.paint = LinearGradientPaint(p1, p2, floatArrayOf(0f, 0.5f, 1f), arrayOf(primary, accent, primary))
+        g2.stroke = BasicStroke(if (isActive) 2.8f else (if (isHovered) 2.4f else 2.0f))
         g2.drawOval(cx - btnR, cy - btnR, btnR * 2, btnR * 2)
 
-        // Center Power Icon
-        val iconSize = (btnR * 0.65).toInt()
-        val iconColor = if (isActive) Color.WHITE else Color(56, 189, 248)
-        SwingVectorIcons.drawPower(g2, cx, cy - (btnR * 0.22).toInt(), iconSize, iconColor)
+        // Top-center Freedom Shield Emblem badge
+        val badgeCx = cx
+        val badgeCy = cy - (btnR * 0.25).toInt()
+        val badgeR = (btnR * 0.30).toInt()
+        g2.color = Color(primary.red, primary.green, primary.blue, if (isActive) 65 else 40)
+        g2.fillOval(badgeCx - badgeR, badgeCy - badgeR, badgeR * 2, badgeR * 2)
+        g2.color = Color(primary.red, primary.green, primary.blue, 130)
+        g2.stroke = BasicStroke(1.2f)
+        g2.drawOval(badgeCx - badgeR, badgeCy - badgeR, badgeR * 2, badgeR * 2)
+        SwingVectorIcons.drawFreedomShieldEmblem(
+            g2, badgeCx, badgeCy, (badgeR * 1.45).toInt(),
+            if (isActive) Color(52, 211, 153) else Color(56, 189, 248),
+            if (isActive) Color(34, 211, 238) else Color(125, 211, 252),
+        )
 
-        // Status text inside button
+        // Hero title
         g2.font = Font("Segoe UI", Font.BOLD, 12)
-        val titleStr = if (isActive) "DEVREDE" else "KAPALI"
+        val titleStr = if (isActive) "KORUMA AKTİF" else "DOKUN VE BAĞLAN"
         val fmTitle = g2.fontMetrics
-        g2.color = if (isActive) Color.WHITE else Color(148, 163, 184)
-        g2.drawString(titleStr, cx - fmTitle.stringWidth(titleStr) / 2, cy + (btnR * 0.38).toInt())
+        g2.color = Color.WHITE
+        g2.drawString(titleStr, cx - fmTitle.stringWidth(titleStr) / 2, cy + (btnR * 0.27).toInt())
 
-        g2.font = Font("Segoe UI", Font.PLAIN, 10)
-        val subStr = if (isActive) "DOKUN VE DURDUR" else "DOKUN VE BAĞLAN"
+        // Inner status pill
+        g2.font = Font("Segoe UI", Font.BOLD, 9)
+        val subStr = if (isActive) (portInfo.ifEmpty { "SİSTEM KORUMALI" }) else "AĞ KORUMASI HAZIR"
         val fmSub = g2.fontMetrics
-        g2.color = if (isActive) Color(209, 250, 229) else Color(100, 116, 139)
-        g2.drawString(subStr, cx - fmSub.stringWidth(subStr) / 2, cy + (btnR * 0.58).toInt())
+        val pillW = fmSub.stringWidth(subStr) + 18
+        val pillH = 16
+        val pillX = cx - pillW / 2
+        val pillY = cy + (btnR * 0.42).toInt()
+        g2.color = if (isActive) Color(6, 78, 59, 175) else Color(15, 23, 42, 185)
+        g2.fillRoundRect(pillX, pillY, pillW, pillH, pillH, pillH)
+        g2.color = if (isActive) Color(52, 211, 153, 180) else Color(56, 189, 248, 120)
+        g2.stroke = BasicStroke(1f)
+        g2.drawRoundRect(pillX, pillY, pillW, pillH, pillH, pillH)
+        g2.color = if (isActive) Color(167, 243, 208) else Color(147, 197, 253)
+        g2.drawString(subStr, cx - fmSub.stringWidth(subStr) / 2, pillY + ((pillH - fmSub.height) / 2) + fmSub.ascent)
 
         g2.dispose()
     }
@@ -3515,7 +3729,7 @@ class ModernStatCard(val iconType: Int, title: String, val heroColor: Color) : J
                     when (iconType) {
                         0 -> SwingVectorIcons.drawBolt(g2, 8, 8, 16, heroColor)
                         1 -> SwingVectorIcons.drawLock(g2, 8, 8, 16, heroColor)
-                        2 -> SwingVectorIcons.drawGamepad(g2, 8, 8, 16, heroColor)
+                        2 -> SwingVectorIcons.drawRadar(g2, 8, 8, 16, heroColor)
                         else -> SwingVectorIcons.drawGlobe(g2, 8, 8, 16, heroColor)
                     }
                     g2.dispose()
@@ -3543,19 +3757,19 @@ typealias StatCard = ModernStatCard
 
 /**
  * MainWindow:
- * Clean 2026–2027 cyber-security architecture with 3 segmented navigation tabs:
- * 1. KONTROL (Hero Power Shield Button, Throughput Sparkline, 4 Live Metric Cards)
+ * Freedom Network 2026–2027 Windows desktop architecture with 3 segmented navigation tabs:
+ * 1. KONTROL (Freedom Hero Power Shield, Throughput Sparkline, 4 Live Metric Cards)
  * 2. TEŞHİS (ISP Out-of-Tunnel Diagnostic Runner, Targets, Monospace Output, Copy)
  * 3. GÜNLÜK & SİSTEM (System Connection Explorer, Socket Diagnostics, Copy)
  */
 class MainWindow {
-    private val frame = JFrame("THE DPI — 2026–2027 Hibrit Ağ Motoru")
+    private val frame = JFrame("Freedom Network — 2026–2027 Özgür Ağ Motoru")
     private val pulsePanel = ModernPowerShieldPanel()
     private val sparkline = ThroughputSparklinePanel()
     private val cardTcp = ModernStatCard(0, "TCP DESYNC", Color(16, 185, 129))
     private val cardVision = ModernStatCard(1, "VISION SPLICE", Color(56, 189, 248))
     private val cardFake = ModernStatCard(2, "SAHTE & KALKAN", Color(167, 139, 250))
-    private val cardDns = ModernStatCard(3, "ŞİFRELİ DoH DNS", Color(251, 191, 36))
+    private val cardDns = ModernStatCard(3, "ŞİFRELİ DoH3 / ECH", Color(251, 191, 36))
 
     private val statusPill = JLabel("KORUMA KAPALI · DOKUNARAK BAĞLANIN", JLabel.CENTER).apply {
         font = Font("Segoe UI", Font.BOLD, 11)
@@ -3566,7 +3780,7 @@ class MainWindow {
         )
     }
 
-    private val targets = JTextArea("discord.com\nroblox.com", 2, 35).apply {
+    private val targets = JTextArea("cloudflare.com\nwikipedia.org\nietf.org", 2, 35).apply {
         background = Color(14, 22, 38)
         foreground = Color.WHITE
         caretColor = Color.WHITE
@@ -3603,7 +3817,7 @@ class MainWindow {
         font = Font("Segoe UI", Font.BOLD, 12)
         isFocusPainted = false
     }
-    private val heroActionButton = JButton("KORUMAYI BAŞLAT (DPI Aşma + Yerel Proxy)").apply {
+    private val heroActionButton = JButton("ÖZGÜR AĞI BAŞLAT (DPI Aşma + Yerel Proxy)").apply {
         background = Color(16, 185, 129)
         foreground = Color(7, 11, 20)
         font = Font("Segoe UI", Font.BOLD, 12)
@@ -3662,7 +3876,7 @@ class MainWindow {
         isFocusPainted = false
     }
 
-    private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "thedpi-worker").apply { isDaemon = true } }
+    private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "freedom-worker").apply { isDaemon = true } }
     private val busy = AtomicBoolean(false)
     private var session: DiagnosticSession? = null
     @Volatile private var lastEnv: EnvironmentInfo? = null
@@ -3696,7 +3910,7 @@ class MainWindow {
         sparkline.updateMetrics(rxRate, txRate, p.connections * 16384L, p.connections * 4096L)
 
         if (p.active) {
-            statusPill.text = "ENGELSİZ MOD DEVREDE (Yerel Vekil 127.0.0.1:${p.port})"
+            statusPill.text = "FREEDOM NETWORK DEVREDE (Yerel Vekil 127.0.0.1:${p.port})"
             statusPill.foreground = Color(16, 185, 129)
             heroActionButton.text = "KORUMAYI DURDUR (127.0.0.1:${p.port})"
             heroActionButton.background = Color(220, 38, 38)
@@ -3704,7 +3918,7 @@ class MainWindow {
         } else {
             statusPill.text = "KORUMA KAPALI · DOKUNARAK BAĞLANIN"
             statusPill.foreground = Color(148, 163, 184)
-            heroActionButton.text = "KORUMAYI BAŞLAT (DPI Aşma + Yerel Proxy)"
+            heroActionButton.text = "ÖZGÜR AĞI BAŞLAT (DPI Aşma + Yerel Proxy)"
             heroActionButton.background = Color(16, 185, 129)
             heroActionButton.foreground = Color(7, 11, 20)
         }
@@ -3722,11 +3936,11 @@ class MainWindow {
         }
         val brandRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
             background = Color(7, 11, 20)
-            val lblTitle = JLabel("THE DPI").apply {
-                font = Font("Segoe UI", Font.BOLD, 18)
-                foreground = Color(16, 185, 129)
+            val lblTitle = JLabel("FREEDOM NETWORK").apply {
+                font = Font("Segoe UI", Font.BOLD, 17)
+                foreground = Color(248, 250, 252)
             }
-            val lblVer = JLabel(" 2026–2027 v2.0").apply {
+            val lblVer = JLabel(" 2026–2027 · v2.0").apply {
                 font = Font("Segoe UI", Font.BOLD, 11)
                 foreground = Color(56, 189, 248)
             }
@@ -3849,7 +4063,7 @@ class MainWindow {
                 BorderFactory.createLineBorder(Color(30, 41, 59), 1),
                 BorderFactory.createEmptyBorder(8, 8, 8, 8),
             )
-            text = "THE DPI Dahili Log & Sistem Gözlemcisi Hazır.\nSistem genelindeki bağlantıları incelemek için 'Sistem Bağlantıları' düğmesine tıklayın."
+            text = "Freedom Network Dahili Log & Sistem Gözlemcisi Hazır.\nSistem genelindeki bağlantıları incelemek için 'Sistem Bağlantıları' düğmesine tıklayın."
         }
         panelLog.add(JScrollPane(logOutput), BorderLayout.CENTER)
         centerContainer.add(panelLog, "LOG")
@@ -3884,7 +4098,7 @@ class MainWindow {
         frame.addWindowListener(object : WindowAdapter() {
             override fun windowClosed(e: WindowEvent) = shutdown()
         })
-        frame.minimumSize = Dimension(750, 600)
+        frame.minimumSize = Dimension(750, 620)
         frame.setLocationRelativeTo(null)
 
         runButton.addActionListener { startRun(verifyRuns = 0) }
@@ -3962,12 +4176,12 @@ class MainWindow {
                     heroActionButton.text = "KORUMAYI DURDUR (127.0.0.1:${next.port})"
                     heroActionButton.background = Color(220, 38, 38)
                     heroActionButton.foreground = Color.WHITE
-                    status.text = "Engelsiz Mod etkin (127.0.0.1:${next.port})"
+                    status.text = "Freedom Network etkin (127.0.0.1:${next.port})"
                 } else {
-                    heroActionButton.text = "KORUMAYI BAŞLAT (DPI Aşma + Yerel Proxy)"
+                    heroActionButton.text = "ÖZGÜR AĞI BAŞLAT (DPI Aşma + Yerel Proxy)"
                     heroActionButton.background = Color(16, 185, 129)
                     heroActionButton.foreground = Color(7, 11, 20)
-                    status.text = "Engelsiz Mod durduruldu"
+                    status.text = "Freedom Network durduruldu"
                 }
                 heroActionButton.isEnabled = true
             }

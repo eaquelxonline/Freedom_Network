@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------
-# THE DPI — .gitignore
+# Freedom Network — .gitignore
 # Platforms in scope: Android (ARM64), Windows (x86_64)
 # Build systems: Gradle (Kotlin DSL), Cargo
 # ---------------------------------------------------------------
@@ -10,8 +10,8 @@ build/
 **/build/
 local.properties
 # Gradle Wrapper must stay tracked (reproducible builds)
-!gradle/wrapper/gradle-wrapper.jar
-!gradle/wrapper/gradle-wrapper.properties
+!Gradle/gradle-wrapper.jar
+!Gradle/gradle-wrapper.properties
 
 # --- Kotlin ---
 .kotlin/

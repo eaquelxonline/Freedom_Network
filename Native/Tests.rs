@@ -1,4 +1,4 @@
-//! THE DPI native core tests (Rust built-in test harness only).
+//! Freedom Network native core tests (Rust built-in test harness only).
 //!
 //! Network tests use loopback-only fake servers created by the test itself;
 //! no external host is contacted.
@@ -2927,7 +2927,7 @@ fn desync_inspects_tls13_sni_ech_and_post_quantum_keyshare() {
 
 #[test]
 fn desync_inspects_http_request_and_splits_host() {
-    let req = b"GET /index.html HTTP/1.1\r\nUser-Agent: TheDPI/2.0\r\nHost: Censor.Example.COM:8080\r\nAccept: */*\r\n\r\n";
+    let req = b"GET /index.html HTTP/1.1\r\nUser-Agent: Freedom/2.0\r\nHost: Censor.Example.COM:8080\r\nAccept: */*\r\n\r\n";
     let info = desync::inspect_l7(req, 2);
     assert_eq!(info.protocol, desync::PROTO_HTTP_REQUEST);
     assert_eq!(info.host, "censor.example.com");
@@ -3266,13 +3266,13 @@ fn personal_relay_server_reality_active_probing_auth_revocation_quota_and_failov
     assert_eq!(session.vision.phase, desync::VisionPhase::DirectSplice);
 
     // Send spliced TLS 1.3 ApplicationData frame (MASQUE UDP capsule inside)
-    let udp_target = SocketAddr::from((Ipv4Addr::new(162, 159, 135, 232), 443));
-    let capsule = encode_udp_capsule(7, udp_target, b"ROBLOX_VOICE_FRAME");
+    let udp_target = SocketAddr::from((Ipv4Addr::new(104, 16, 132, 229), 443));
+    let capsule = encode_udp_capsule(7, udp_target, b"REALTIME_UDP_FRAME");
     let echoed = session.send_spliced(&capsule).unwrap();
     let (ctx_id, dec_addr, dec_payload) = decode_udp_capsule(&echoed).unwrap();
     assert_eq!(ctx_id, 7);
     assert_eq!(dec_addr, udp_target);
-    assert_eq!(dec_payload, b"ROBLOX_VOICE_FRAME");
+    assert_eq!(dec_payload, b"REALTIME_UDP_FRAME");
     drop(session);
 
     // 5. Revoke device -> immediate rejection (`ServerStatus::Revoked`)
@@ -3312,14 +3312,14 @@ fn personal_relay_server_reality_active_probing_auth_revocation_quota_and_failov
 }
 
 #[test]
-fn restricted_isp_middlebox_sni_rst_tls_record_fragmentation_and_udp_voice_game_bypass() {
+fn restricted_isp_middlebox_sni_rst_tls_record_fragmentation_and_udp_media_realtime_bypass() {
     // 1. TLS Record-Layer Multi-Fragmentation (RFC 8446 §5.1) against stateful TCP-reassembling DPI:
-    //    No single 0x16 TLSPlaintext record contains "discord.com", yet reassembling the records
+    //    No single 0x16 TLSPlaintext record contains "blocked.example.com", yet reassembling the records
     //    reproduces the exact byte-identical ClientHello.
-    let discord_ch = sample_tls_client_hello("gateway.discord.com", true, true);
+    let sample_ch = sample_tls_client_hello("blocked.example.com", true, true);
     let fragmented =
-        desync::fragment_tls_client_hello_records(&discord_ch, 2).expect("must fragment records");
-    assert!(fragmented.len() > discord_ch.len());
+        desync::fragment_tls_client_hello_records(&sample_ch, 2).expect("must fragment records");
+    assert!(fragmented.len() > sample_ch.len());
 
     // Simulate an ISP middlebox that inspects each individual TLS 0x16 record after TCP reassembly
     let mut pos = 0usize;
@@ -3332,7 +3332,7 @@ fn restricted_isp_middlebox_sni_rst_tls_record_fragmentation_and_udp_voice_game_
         ]));
         let rec_body = &fragmented[pos + 5..pos + 5 + rlen];
         assert!(
-            ascii::scan_pattern(rec_body, b"gateway.discord.com").is_none(),
+            ascii::scan_pattern(rec_body, b"blocked.example.com").is_none(),
             "no single TLS record may contain the full blocked SNI"
         );
         pos += 5 + rlen;
@@ -3340,71 +3340,74 @@ fn restricted_isp_middlebox_sni_rst_tls_record_fragmentation_and_udp_voice_game_
     }
     assert!(record_count >= 3, "must split into >= 3 TLS 0x16 records");
     let reassembled = desync::reassemble_tls_records(&fragmented).expect("must reassemble");
-    assert_eq!(reassembled, discord_ch);
+    assert_eq!(reassembled, sample_ch);
 
-    // 2. Discord Voice 74-byte IP Discovery UDP packet (`0x00 0x01 0x00 0x46 ...`)
-    let mut discord_voice = vec![0u8; 74];
-    discord_voice[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x46]);
-    discord_voice[4..8].copy_from_slice(&0x11223344u32.to_be_bytes()); // SSRC
-    let dv_info = desync::inspect_l7(&discord_voice, 2);
-    assert_eq!(dv_info.protocol, desync::PROTO_DISCORD_VOICE);
-    assert_eq!(dv_info.host, "discord.voice");
+    // 2. Universal VoIP/STUN IP Discovery UDP packet (`0x00 0x01 0x00 0x46 ...`)
+    let mut stun_media = vec![0u8; 74];
+    stun_media[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x46]);
+    stun_media[4..8].copy_from_slice(&0x11223344u32.to_be_bytes()); // SSRC
+    let stun_info = desync::inspect_l7(&stun_media, 2);
+    assert_eq!(stun_info.protocol, desync::PROTO_UDP_STUN_MEDIA);
+    assert_eq!(stun_info.host, "stun.media");
 
-    let mut dv_pkt = vec![0u8; 20 + 8 + discord_voice.len()];
-    dv_pkt[0] = 0x45;
-    let dv_total = dv_pkt.len() as u16;
-    dv_pkt[2..4].copy_from_slice(&dv_total.to_be_bytes());
-    dv_pkt[8] = 64;
-    dv_pkt[9] = 17;
-    dv_pkt[12..16].copy_from_slice(&[10, 215, 173, 1]);
-    dv_pkt[16..20].copy_from_slice(&[66, 22, 196, 10]);
-    dv_pkt[20..22].copy_from_slice(&50001u16.to_be_bytes());
-    dv_pkt[22..24].copy_from_slice(&50000u16.to_be_bytes());
-    dv_pkt[24..26].copy_from_slice(&((8 + discord_voice.len()) as u16).to_be_bytes());
-    dv_pkt[28..].copy_from_slice(&discord_voice);
+    let mut stun_pkt = vec![0u8; 20 + 8 + stun_media.len()];
+    stun_pkt[0] = 0x45;
+    let stun_total = stun_pkt.len() as u16;
+    stun_pkt[2..4].copy_from_slice(&stun_total.to_be_bytes());
+    stun_pkt[8] = 64;
+    stun_pkt[9] = 17;
+    stun_pkt[12..16].copy_from_slice(&[10, 215, 173, 1]);
+    stun_pkt[16..20].copy_from_slice(&[198, 51, 100, 10]);
+    stun_pkt[20..22].copy_from_slice(&50001u16.to_be_bytes());
+    stun_pkt[22..24].copy_from_slice(&50000u16.to_be_bytes());
+    stun_pkt[24..26].copy_from_slice(&((8 + stun_media.len()) as u16).to_be_bytes());
+    stun_pkt[28..].copy_from_slice(&stun_media);
 
     let cfg = desync::DesyncConfig {
         mode: desync::DesyncMode::RealityVision,
         fake_ttl: 3,
         ..desync::DesyncConfig::default()
     };
-    let dv_out = desync::desync_packet(&dv_pkt, &cfg);
-    assert_eq!(dv_out.packets.len(), 2);
-    assert_eq!(dv_out.packets[0][8], 3, "first UDP packet is low-TTL decoy");
+    let stun_out = desync::desync_packet(&stun_pkt, &cfg);
+    assert_eq!(stun_out.packets.len(), 2);
     assert_eq!(
-        &dv_out.packets[1], &dv_pkt,
-        "second UDP packet is intact Discord Voice"
+        stun_out.packets[0][8], 3,
+        "first UDP packet is low-TTL decoy"
+    );
+    assert_eq!(
+        &stun_out.packets[1], &stun_pkt,
+        "second UDP packet is intact STUN/media packet"
     );
 
-    // 3. Roblox RakNet OpenConnectionRequest1 (`0x05` + 16-byte OFFLINE_MESSAGE_DATA_ID + protocol 11)
-    let mut roblox_raknet = Vec::with_capacity(48);
-    roblox_raknet.push(0x05);
-    roblox_raknet.extend_from_slice(&desync::RAKNET_OFFLINE_MAGIC);
-    roblox_raknet.push(11);
-    roblox_raknet.resize(48, 0);
-    let rk_info = desync::inspect_l7(&roblox_raknet, 2);
-    assert_eq!(rk_info.protocol, desync::PROTO_ROBLOX_RAKNET);
-    assert_eq!(rk_info.host, "roblox.raknet");
+    // 3. Universal real-time UDP OpenConnectionRequest1 (`0x05` + 16-byte OFFLINE_MESSAGE_DATA_ID)
+    let mut rt_udp = Vec::with_capacity(48);
+    rt_udp.push(0x05);
+    rt_udp.extend_from_slice(&desync::RAKNET_OFFLINE_MAGIC);
+    rt_udp.push(11);
+    rt_udp.resize(48, 0);
+    let rt_info = desync::inspect_l7(&rt_udp, 2);
+    assert_eq!(rt_info.protocol, desync::PROTO_UDP_REALTIME);
+    assert_eq!(rt_info.host, "udp.realtime");
 
-    let mut rk_pkt = vec![0u8; 20 + 8 + roblox_raknet.len()];
-    rk_pkt[0] = 0x45;
-    let rk_total = rk_pkt.len() as u16;
-    rk_pkt[2..4].copy_from_slice(&rk_total.to_be_bytes());
-    rk_pkt[8] = 64;
-    rk_pkt[9] = 17;
-    rk_pkt[12..16].copy_from_slice(&[10, 215, 173, 1]);
-    rk_pkt[16..20].copy_from_slice(&[128, 116, 63, 20]);
-    rk_pkt[20..22].copy_from_slice(&55123u16.to_be_bytes());
-    rk_pkt[22..24].copy_from_slice(&59100u16.to_be_bytes());
-    rk_pkt[24..26].copy_from_slice(&((8 + roblox_raknet.len()) as u16).to_be_bytes());
-    rk_pkt[28..].copy_from_slice(&roblox_raknet);
+    let mut rt_pkt = vec![0u8; 20 + 8 + rt_udp.len()];
+    rt_pkt[0] = 0x45;
+    let rt_total = rt_pkt.len() as u16;
+    rt_pkt[2..4].copy_from_slice(&rt_total.to_be_bytes());
+    rt_pkt[8] = 64;
+    rt_pkt[9] = 17;
+    rt_pkt[12..16].copy_from_slice(&[10, 215, 173, 1]);
+    rt_pkt[16..20].copy_from_slice(&[203, 0, 113, 20]);
+    rt_pkt[20..22].copy_from_slice(&55123u16.to_be_bytes());
+    rt_pkt[22..24].copy_from_slice(&59100u16.to_be_bytes());
+    rt_pkt[24..26].copy_from_slice(&((8 + rt_udp.len()) as u16).to_be_bytes());
+    rt_pkt[28..].copy_from_slice(&rt_udp);
 
-    let rk_out = desync::desync_packet(&rk_pkt, &cfg);
-    assert_eq!(rk_out.packets.len(), 2);
-    assert_eq!(rk_out.packets[0][8], 3, "first UDP packet is low-TTL decoy");
+    let rt_out = desync::desync_packet(&rt_pkt, &cfg);
+    assert_eq!(rt_out.packets.len(), 2);
+    assert_eq!(rt_out.packets[0][8], 3, "first UDP packet is low-TTL decoy");
     assert_eq!(
-        &rk_out.packets[1], &rk_pkt,
-        "second UDP packet is intact Roblox RakNet"
+        &rt_out.packets[1], &rt_pkt,
+        "second UDP packet is intact real-time UDP frame"
     );
 }
 
@@ -3412,17 +3415,28 @@ fn restricted_isp_middlebox_sni_rst_tls_record_fragmentation_and_udp_voice_game_
 fn dns_poisoning_detection_and_classification() {
     let tt_v4: Ipv4Addr = "195.175.254.2".parse().unwrap();
     let tt_v6: Ipv6Addr = "2a01:358:4014:a00::3".parse().unwrap();
+    let loopback_v4: Ipv4Addr = "127.0.0.1".parse().unwrap();
     assert!(probe::is_poisoned_ipv4(&tt_v4));
     assert!(probe::is_poisoned_ipv6(&tt_v6));
     assert!(probe::is_poisoned_response(
-        "discord.com",
+        "blocked.example.com",
         &[tt_v4],
         &[tt_v6]
     ));
-    assert!(probe::is_poisoned_response("roblox.com", &[tt_v4], &[]));
+    assert!(probe::is_poisoned_response(
+        "service.example.org",
+        &[loopback_v4],
+        &[]
+    ));
+    // Local testing suffixes remain exempted
+    assert!(!probe::is_poisoned_response(
+        "svc.test",
+        &[loopback_v4],
+        &[]
+    ));
 
     let tr = probe::TargetReport {
-        target: probe::parse_target("discord.com").unwrap(),
+        target: probe::parse_target("service.example.org").unwrap(),
         dns: probe::DnsResult {
             status: Status::Blocked,
             rcode: 0,
@@ -3452,4 +3466,66 @@ fn dns_poisoning_detection_and_classification() {
         decide::recommend_desync_mode(&diags),
         desync::DesyncMode::RealityVision
     );
+}
+
+#[test]
+fn oblivious_ohttp_odoh_framing_header_stripping_and_udp_mimicry() {
+    // 1) OHTTP RFC 9458 encapsulation roundtrip
+    let hdr = oblivious::OhttpHeader::default();
+    let enc = [0xAAu8; oblivious::X25519_ENC_LEN];
+    let ct = b"encrypted-bhttp-payload-2026";
+    let frame = oblivious::encode_ohttp_request(hdr, &enc, ct).expect("encode OHTTP");
+    let (dec_hdr, dec_enc, dec_ct) =
+        oblivious::decode_ohttp_request(&frame, oblivious::X25519_ENC_LEN).expect("decode OHTTP");
+    assert_eq!(dec_hdr, hdr);
+    assert_eq!(dec_enc, &enc);
+    assert_eq!(dec_ct, ct);
+
+    // 2) BHTTP RFC 9292 serialization includes normalized headers
+    let bhttp = oblivious::encode_bhttp_request(
+        "POST",
+        "https",
+        "cloudflare-dns.com",
+        "/dns-query",
+        &[("Content-Type", "application/dns-message")],
+        b"dnswire",
+    );
+    assert_eq!(bhttp[0], 0x00);
+    assert!(ascii::scan_pattern(&bhttp, b"content-type").is_some());
+
+    // 3) ODoH RFC 9230 Query/Response envelope roundtrip
+    let odoh = oblivious::encode_odoh_message(
+        oblivious::OdohType::Query,
+        &[1, 2, 3, 4],
+        b"hpke-dns-query",
+    )
+    .expect("encode ODoH");
+    let (mtype, kid, body) = oblivious::decode_odoh_message(&odoh).expect("decode ODoH");
+    assert_eq!(mtype, oblivious::OdohType::Query);
+    assert_eq!(kid, &[1, 2, 3, 4]);
+    assert_eq!(body, b"hpke-dns-query");
+
+    // 4) IP-identifying headers stripped at relay
+    let raw_headers = vec![
+        ("X-Forwarded-For".to_owned(), "203.0.113.9".to_owned()),
+        ("CF-Connecting-IP".to_owned(), "203.0.113.9".to_owned()),
+        ("Accept".to_owned(), "application/dns-message".to_owned()),
+    ];
+    let clean = oblivious::strip_identifying_http_headers(&raw_headers);
+    assert_eq!(clean.len(), 1);
+    assert_eq!(clean[0].0, "Accept");
+
+    // 5) Privacy tracker guard
+    assert!(oblivious::is_tracker_or_ad_domain(
+        "metrics.doubleclick.net."
+    ));
+    assert!(!oblivious::is_tracker_or_ad_domain("wikipedia.org"));
+
+    // 6) AmneziaWG-inspired UDP mimicry junk prefaces
+    let junks = desync::build_udp_mimicry_prefaces(4, 32, 96, 2026);
+    assert_eq!(junks.len(), 4);
+    for j in junks {
+        assert!((32..=96).contains(&j.len()));
+        assert_eq!(j[0] & 0xc0, 0x40);
+    }
 }

@@ -1,17 +1,17 @@
-// THE DPI — x86_64 Assembly (SSE2), AT&T syntax, System V AMD64 calling convention.
+// Freedom Network — x86_64 Assembly (SSE2), AT&T syntax, System V AMD64 calling convention.
 //
 // Low-level SIMD hot-path primitives for line-rate packet inspection and desynchronization:
-// 1. the_dpi_ascii_lowercase(dst=%rdi, src=%rsi, len=%rdx)
+// 1. freedom_ascii_lowercase(dst=%rdi, src=%rsi, len=%rdx)
 //      Lowercases ASCII 'A'..'Z' in `src[0..len]`, writing to `dst[0..len]`. Bytes >= 0x80
 //      and non-letters are copied unchanged, so a UTF-8 buffer stays valid.
-// 2. the_dpi_csum_fold(buf=%rdi, len=%rsi, initial=%rdx) -> %eax (u16)
+// 2. freedom_csum_fold(buf=%rdi, len=%rsi, initial=%rdx) -> %eax (u16)
 //      RFC 1071 16-bit one's-complement big-endian accumulator and folder (SSE2 vectorized).
 //      Used to compute and verify IPv4, IPv6 pseudo-header, TCP and UDP checksums across
 //      split/disordered segments and synthetic fake packets.
-// 3. the_dpi_csum_delta(old_check=%edi, old_word=%esi, new_word=%edx) -> %eax (u16)
+// 3. freedom_csum_delta(old_check=%edi, old_word=%esi, new_word=%edx) -> %eax (u16)
 //      RFC 1624 incremental checksum update: HC' = ~(~HC + ~m + m'). Updates TCP/IP checksums
 //      in O(1) registers when mutating TTL, Sequence Number or BadSum fields.
-// 4. the_dpi_scan_pattern(hay=%rdi, hay_len=%rsi, needle=%rdx, needle_len=%rcx) -> %rax (usize)
+// 4. freedom_scan_pattern(hay=%rdi, hay_len=%rsi, needle=%rdx, needle_len=%rcx) -> %rax (usize)
 //      SSE2 16-byte broadcast + bitmask pattern scanner (`pcmpeqb` + `pmovmskb` + `bsf`).
 //      Locates TLS ClientHello SNI/ECH extensions and HTTP `Host:` headers in packet payloads.
 //
@@ -20,9 +20,9 @@
 // OS-specific data-section name is needed. Assembled by LLVM via core::arch::global_asm!.
 
 .text
-.globl the_dpi_ascii_lowercase
+.globl freedom_ascii_lowercase
 .p2align 4
-the_dpi_ascii_lowercase:
+freedom_ascii_lowercase:
     test    %rdx, %rdx
     je      .Ldpi_done
     movdqa  .Ldpi_c80(%rip), %xmm5      // 0x80 bias (unsigned->signed order)
@@ -66,9 +66,9 @@ the_dpi_ascii_lowercase:
 .Ldpi_done:
     ret
 
-.globl the_dpi_csum_fold
+.globl freedom_csum_fold
 .p2align 4
-the_dpi_csum_fold:
+freedom_csum_fold:
     mov     %rdx, %rax                  // 64-bit accumulator = initial
     test    %rsi, %rsi
     je      .Lcsum_fold64
@@ -132,9 +132,9 @@ the_dpi_csum_fold:
     movzwl  %ax, %eax
     ret
 
-.globl the_dpi_csum_delta
+.globl freedom_csum_delta
 .p2align 4
-the_dpi_csum_delta:
+freedom_csum_delta:
     movzwl  %di, %eax
     not     %eax
     and     $0xffff, %eax
@@ -155,9 +155,9 @@ the_dpi_csum_delta:
     movzwl  %ax, %eax
     ret
 
-.globl the_dpi_scan_pattern
+.globl freedom_scan_pattern
 .p2align 4
-the_dpi_scan_pattern:
+freedom_scan_pattern:
     test    %rcx, %rcx
     je      .Lscan_zero
     cmp     %rsi, %rcx

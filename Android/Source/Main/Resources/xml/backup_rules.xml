@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- THE DPI stores no data; exclude every domain from cloud backup and device transfer anyway. -->
+<!-- Freedom Network stores zero browsing/network data; exclude every domain from cloud backup and device transfer. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" path="." />

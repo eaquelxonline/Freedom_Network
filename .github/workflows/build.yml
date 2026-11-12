@@ -1,4 +1,4 @@
-# THE DPI — CI: tests, Android APK and Windows EXE (app-image) on every push to The_DPI_Beta.
+# Freedom Network — CI: tests, Android APK and Windows EXE (app-image) on every push to The_DPI_Beta.
 # Only first-party GitHub actions are used. Signing material comes from repository secrets
 # (optional); without them the debug APK is still installable for testing.
 name: Build
@@ -42,22 +42,22 @@ jobs:
 
       - name: Release signing key (optional)
         env:
-          KEYSTORE_BASE64: ${{ secrets.THEDPI_KEYSTORE_BASE64 }}
+          KEYSTORE_BASE64: ${{ secrets.FREEDOM_KEYSTORE_BASE64 || secrets.THEDPI_KEYSTORE_BASE64 }}
         if: env.KEYSTORE_BASE64 != ''
         run: |
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          echo "THEDPI_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "FREEDOM_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
 
       - name: Test, lint and build
         env:
-          THEDPI_KEYSTORE_PASSWORD: ${{ secrets.THEDPI_KEYSTORE_PASSWORD }}
-          THEDPI_KEY_ALIAS: ${{ secrets.THEDPI_KEY_ALIAS }}
-          THEDPI_KEY_PASSWORD: ${{ secrets.THEDPI_KEY_PASSWORD }}
+          FREEDOM_KEYSTORE_PASSWORD: ${{ secrets.FREEDOM_KEYSTORE_PASSWORD || secrets.THEDPI_KEYSTORE_PASSWORD }}
+          FREEDOM_KEY_ALIAS: ${{ secrets.FREEDOM_KEY_ALIAS || secrets.THEDPI_KEY_ALIAS }}
+          FREEDOM_KEY_PASSWORD: ${{ secrets.FREEDOM_KEY_PASSWORD || secrets.THEDPI_KEY_PASSWORD }}
         run: ./gradlew --no-daemon check :Android:assembleDebug :Android:assembleRelease
 
       - uses: actions/upload-artifact@v7
         with:
-          name: TheDPI-Android
+          name: FreedomNetwork-Android
           path: Android/build/outputs/apk/**/*.apk
           retention-days: 30
 
@@ -79,14 +79,14 @@ jobs:
           rustc +1.99.1 --version
 
       - name: Test on real Windows and package
-        run: ./gradlew --no-daemon "-Pthedpi.windowsOnly=true" :check :Windows:check :Windows:packageWindows
+        run: ./gradlew --no-daemon "-Pfreedom.windowsOnly=true" :check :Windows:check :Windows:packageWindows
 
       - name: Zip app image
         shell: pwsh
-        run: Compress-Archive -Path Windows/build/package/image/TheDPI -DestinationPath TheDPI-Windows-x64.zip
+        run: Compress-Archive -Path Windows/build/package/image/FreedomNetwork -DestinationPath FreedomNetwork-Windows-x64.zip
 
       - uses: actions/upload-artifact@v7
         with:
-          name: TheDPI-Windows-x64
-          path: TheDPI-Windows-x64.zip
+          name: FreedomNetwork-Windows-x64
+          path: FreedomNetwork-Windows-x64.zip
           retention-days: 30

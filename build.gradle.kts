@@ -1,5 +1,5 @@
-// THE DPI — root build. Verified toolchain (see Engineering.md §2):
-// Gradle 9.7.1 · AGP 9.3.1 · Kotlin 2.4.21 · Rust 1.99.1 · JDK 21 (build) · NDK 28.2.13676358
+// Freedom Network — root build. Verified toolchain (see Engineering.md §2):
+// Gradle 9.9.1 · AGP 9.5.1 · Kotlin 2.4.21 · Rust 1.99.1 · JDK 21 (build) · NDK 30.0.16248370
 plugins {
     base
     id("com.android.application") version "9.5.1" apply false

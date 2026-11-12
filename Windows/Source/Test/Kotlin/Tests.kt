@@ -1,10 +1,10 @@
-// THE DPI — JVM-side tests (no third-party test framework; run by the Gradle `coreTest` task).
+// Freedom Network — JVM-side tests (no third-party test framework; run by the Gradle `coreTest` task).
 //
 // Exercises the real JNI boundary against the host build of Native/Core.rs, the Kotlin
 // wire codec, the platform TLS prober against a local TLS server, and the Turkish text
 // catalogue. All network activity is loopback-only.
 
-package thedpi
+package com.freedom.network
 
 import com.sun.net.httpserver.HttpsConfigurator
 import com.sun.net.httpserver.HttpsServer
@@ -142,8 +142,8 @@ private fun loopbackConnect(): (String, Int, Int) -> Socket = { _, port, timeout
 }
 
 private fun testKeystore(): Pair<KeyStore, CharArray> {
-    val path = System.getProperty("thedpi.test.keystore") ?: error("thedpi.test.keystore not set")
-    val pw = (System.getProperty("thedpi.test.keystore.password") ?: error("password not set")).toCharArray()
+    val path = System.getProperty("freedom.test.keystore") ?: error("freedom.test.keystore not set")
+    val pw = (System.getProperty("freedom.test.keystore.password") ?: error("password not set")).toCharArray()
     val ks = KeyStore.getInstance("PKCS12")
     FileInputStream(File(path)).use { ks.load(it, pw) }
     return ks to pw
@@ -174,7 +174,7 @@ private val fastConfig = EngineConfig(timeoutMs = 600, dnsSamples = 2, tcpSample
 // ---------------------------------------------------------------- tests
 
 fun main() {
-    println("THE DPI JVM tests · java ${System.getProperty("java.version")} · ${System.getProperty("os.name")}")
+    println("Freedom Network JVM tests · java ${System.getProperty("java.version")} · ${System.getProperty("os.name")}")
 
     test("native library loads and API version matches") {
         expect(Native.available) { "load error: ${Native.loadError}" }
@@ -550,7 +550,7 @@ fun main() {
         expect("Sunucu 01" in rendered && "Sunucu 02" in rendered && "dl.google.com" in rendered) { rendered }
     }
 
-    test("TunBridge end-to-end: DoH DNS, Roblox/Discord UDP NAT, and Discord TCP Desync over protected sockets") {
+    test("TunBridge end-to-end: Happy Eyeballs DoH3, tracker sinkhole, STUN leak guard, UDP NAT, and universal TCP Desync") {
         DiagnosticSession(fastConfig).use { s ->
             val appToBridgeIn = java.io.PipedInputStream(65536)
             val appToBridgeOut = java.io.PipedOutputStream(appToBridgeIn)
@@ -563,7 +563,7 @@ fun main() {
             val mockDoh = DohClient { _, body, _ ->
                 // RFC 8484 requires ID=0 in DoH wire query
                 expect(body.size >= 12 && body[0].toInt() == 0 && body[1].toInt() == 0) { "DoH query ID must be 0" }
-                DohResponse(1, 500, EncProtocol.DOH3, dnsAnswer(body, byteArrayOf(162.toByte(), 159.toByte(), 135.toByte(), 232.toByte())))
+                DohResponse(1, 500, EncProtocol.DOH3, dnsAnswer(body, byteArrayOf(104.toByte(), 16.toByte(), 132.toByte(), 229.toByte())))
             }
 
             fun readNextIpPacket(input: java.io.InputStream): ByteArray {
@@ -596,12 +596,18 @@ fun main() {
                 protectSocket = { protectedTcpCount.incrementAndGet(); true },
                 protectDatagram = { protectedUdpCount.incrementAndGet(); true },
                 dohClient = mockDoh,
-                dohEndpoints = listOf("https://cloudflare-dns.com/dns-query"),
+                dohEndpoints = listOf(
+                    "https://1.1.1.1/dns-query",
+                    "https://8.8.8.8/dns-query",
+                ),
+                strictKillSwitch = true,
+                blockTrackers = true,
+                hardenStunLeaks = true,
             ).use { bridge ->
                 bridge.start()
 
-                // 1) DNS-over-UDP (port 53) intercepted and resolved via Encrypted DNS (DoH3)
-                val rawDnsQuery = Doh.query("discord.com")!!.also {
+                // 1) DNS-over-UDP (port 53) intercepted and resolved via Happy Eyeballs Encrypted DNS (DoH3)
+                val rawDnsQuery = Doh.query("cloudflare.com")!!.also {
                     it[0] = 0xCA.toByte()
                     it[1] = 0xFE.toByte()
                 }
@@ -618,7 +624,34 @@ fun main() {
                 eq(bridge.dnsQueries.get(), 1, "dnsQueries counter")
                 eq(bridge.dohResolved.get(), 1, "dohResolved counter")
 
-                // 2) Roblox RakNet / Discord Voice UDP NAT relay over VpnService.protect()ed DatagramSocket
+                // 1b) Tracker/telemetry DNS sinkhole returns local NXDOMAIN without touching upstream DoH
+                val trackerQuery = Doh.query("doubleclick.net")!!.also {
+                    it[0] = 0xDE.toByte()
+                    it[1] = 0xAD.toByte()
+                }
+                val trackerPkt = IpPackets.buildIpv4Udp(clientIp, vpnDnsIp, 53001, 53, trackerQuery)
+                appToBridgeOut.write(trackerPkt)
+                appToBridgeOut.flush()
+
+                val trackerReplyPkt = readNextIpPacket(bridgeToAppIn)
+                val trackerReplyUdp = IpPackets.parseUdp(trackerReplyPkt)!!
+                eq(trackerReplyUdp.payload[0], 0xDE.toByte(), "tracker DNS ID hi")
+                eq(trackerReplyUdp.payload[3].toInt() and 0x0F, 3, "tracker DNS RCODE=3 (NXDOMAIN)")
+                eq(bridge.trackersBlocked.get(), 1, "trackersBlocked counter")
+                eq(bridge.dohResolved.get(), 1, "tracker must not hit DoH")
+
+                // 1c) WebRTC STUN Binding Request IP-leak hardening returns ICMPv4 unreachable
+                val stunPayload = IpPackets.buildStunIpDiscovery(0x2112A442, "", 0)
+                val stunPkt = IpPackets.buildIpv4Udp(clientIp, loopbackIp, 53500, 3478, stunPayload)
+                appToBridgeOut.write(stunPkt)
+                appToBridgeOut.flush()
+
+                val stunIcmp = readNextIpPacket(bridgeToAppIn)
+                eq(stunIcmp[9].toInt() and 0xFF, IpPackets.PROTO_ICMP, "STUN leak blocked via ICMPv4")
+                eq(stunIcmp[20].toInt() and 0xFF, 3, "ICMPv4 Type 3")
+                eq(bridge.leaksBlocked.get(), 1, "leaksBlocked counter")
+
+                // 2) Universal real-time UDP NAT relay over VpnService.protect()ed DatagramSocket
                 DatagramSocket(0, InetAddress.getLoopbackAddress()).use { udpSrv ->
                     udpSrv.soTimeout = 3000
                     val srvThread = Thread {
@@ -626,11 +659,11 @@ fun main() {
                         val dp = DatagramPacket(buf, buf.size)
                         udpSrv.receive(dp)
                         val msg = String(dp.data, 0, dp.length)
-                        val reply = "VOICE_PONG:$msg".toByteArray()
+                        val reply = "UDP_PONG:$msg".toByteArray()
                         udpSrv.send(DatagramPacket(reply, reply.size, dp.socketAddress))
                     }.apply { isDaemon = true; start() }
 
-                    val udpPayload = "ROBLOX_DISCORD_UDP_FRAME".toByteArray()
+                    val udpPayload = "FREEDOM_REALTIME_UDP_FRAME".toByteArray()
                     val udpOutPkt = IpPackets.buildIpv4Udp(clientIp, loopbackIp, 54000, udpSrv.localPort, udpPayload)
                     appToBridgeOut.write(udpOutPkt)
                     appToBridgeOut.flush()
@@ -639,15 +672,15 @@ fun main() {
                     val udpIn = IpPackets.parseUdp(udpInPkt)!!
                     eq(udpIn.srcPort, udpSrv.localPort, "UDP NAT reply srcPort")
                     eq(udpIn.dstPort, 54000, "UDP NAT reply dstPort")
-                    eq(String(udpIn.payload), "VOICE_PONG:ROBLOX_DISCORD_UDP_FRAME", "UDP NAT payload")
+                    eq(String(udpIn.payload), "UDP_PONG:FREEDOM_REALTIME_UDP_FRAME", "UDP NAT payload")
                     expect(protectedUdpCount.get() >= 1) { "protectDatagram must be called" }
                     srvThread.join(2000)
                 }
 
-                // 3) Discord TCP + Active Desync split over VpnService.protect()ed Socket
+                // 3) Universal TCP + Active Desync split over VpnService.protect()ed Socket
                 ServerSocket(0, 8, InetAddress.getLoopbackAddress()).use { tcpSrv ->
                     tcpSrv.soTimeout = 3000
-                    val httpReq = "GET /api/v10/gateway HTTP/1.1\r\nHost: discord.com\r\n\r\n".toByteArray()
+                    val httpReq = "GET / HTTP/1.1\r\nHost: cloudflare.com\r\n\r\n".toByteArray()
                     val srvThread = Thread {
                         tcpSrv.accept().use { conn ->
                             conn.soTimeout = 3000
@@ -658,7 +691,7 @@ fun main() {
                                 if (n <= 0) break
                                 received.write(buf, 0, n)
                             }
-                            conn.outputStream.write("HTTP/1.1 200 DISCORD_OK\r\n\r\n".toByteArray())
+                            conn.outputStream.write("HTTP/1.1 200 FREEDOM_OK\r\n\r\n".toByteArray())
                             conn.outputStream.flush()
                         }
                     }.apply { isDaemon = true; start() }
@@ -681,7 +714,7 @@ fun main() {
                     eq(synAck.flags and (IpPackets.TCP_SYN or IpPackets.TCP_ACK), IpPackets.TCP_SYN or IpPackets.TCP_ACK, "SYN+ACK flags")
                     eq(synAck.ack, 1001L, "SYN+ACK ack")
 
-                    // Send PSH+ACK carrying HTTP request to discord.com
+                    // Send PSH+ACK carrying HTTP request
                     val dataPkt = IpPackets.buildIpv4Tcp(
                         srcIp = clientIp,
                         dstIp = loopbackIp,
@@ -704,7 +737,7 @@ fun main() {
                             break
                         }
                     }
-                    eq(gotResponse, "HTTP/1.1 200 DISCORD_OK\r\n\r\n", "TCP response payload")
+                    eq(gotResponse, "HTTP/1.1 200 FREEDOM_OK\r\n\r\n", "TCP response payload")
                     expect(protectedTcpCount.get() >= 1) { "protectSocket must be called" }
                     expect(bridge.desyncedFlows.get() >= 1) { "desyncedFlows must be >= 1" }
                     srvThread.join(2000)
@@ -717,31 +750,31 @@ fun main() {
         }
     }
 
-    // ------------------------------------------------------------------ 24. Restricted ISP network simulation: TLS record fragmentation, Discord Voice 74B, Roblox RakNet 0x05
-    test("restricted network simulation: TLS record fragmentation, Discord Voice 74B, and Roblox RakNet 0x05") {
+    // ------------------------------------------------------------------ 24. Restricted ISP network simulation: TLS record fragmentation, STUN 74B, realtime UDP 0x05
+    test("restricted network simulation: TLS record fragmentation, STUN 74B, and realtime UDP 0x05") {
         DiagnosticSession().use { s ->
             val srcIp = IpPackets.parseIpLiteral("10.215.173.1")!!
-            val dstIp = IpPackets.parseIpLiteral("162.159.135.232")!!
+            val dstIp = IpPackets.parseIpLiteral("104.16.132.229")!!
 
-            // 1) Discord Voice 74-byte IP Discovery UDP datagram (`0x00 0x01 0x00 0x46`)
-            val voicePayload = IpPackets.buildDiscordVoiceIpDiscovery(0x11223344, "10.215.173.1", 50001)
-            eq(voicePayload.size, 74, "Discord Voice IP discovery size")
-            val voicePkt = IpPackets.buildIpv4Udp(srcIp, dstIp, 50001, 50000, voicePayload)
-            val voiceRes = s.desyncPacket(voicePkt, DesyncConfig(mode = DesyncMode.REALITY_VISION, fakeTtl = 3))
-            eq(voiceRes.status, Codes.OK, "Discord Voice desync status")
-            eq(voiceRes.protocol, 4, "PROTO_DISCORD_VOICE (4)")
-            eq(voiceRes.packets.size, 2, "low-TTL decoy + real Discord Voice packet")
+            // 1) STUN 74-byte IP Discovery UDP datagram (`0x00 0x01 0x00 0x46`)
+            val stunPayload = IpPackets.buildStunIpDiscovery(0x11223344, "10.215.173.1", 50001)
+            eq(stunPayload.size, 74, "STUN IP discovery size")
+            val stunPkt = IpPackets.buildIpv4Udp(srcIp, dstIp, 50001, 50000, stunPayload)
+            val stunRes = s.desyncPacket(stunPkt, DesyncConfig(mode = DesyncMode.REALITY_VISION, fakeTtl = 3))
+            eq(stunRes.status, Codes.OK, "STUN UDP desync status")
+            eq(stunRes.protocol, 4, "PROTO_UDP_STUN_MEDIA (4)")
+            eq(stunRes.packets.size, 2, "low-TTL decoy + real STUN UDP packet")
 
-            // 2) Roblox RakNet OpenConnectionRequest1 (`0x05` + 16-byte offline magic)
-            val raknetPayload = IpPackets.buildRobloxRakNetOpenConnectionRequest1(48)
-            val raknetPkt = IpPackets.buildIpv4Udp(srcIp, dstIp, 55123, 59100, raknetPayload)
-            val raknetRes = s.desyncPacket(raknetPkt, DesyncConfig(mode = DesyncMode.REALITY_VISION, fakeTtl = 3))
-            eq(raknetRes.status, Codes.OK, "Roblox RakNet desync status")
-            eq(raknetRes.protocol, 5, "PROTO_ROBLOX_RAKNET (5)")
-            eq(raknetRes.packets.size, 2, "low-TTL decoy + real Roblox RakNet packet")
+            // 2) Real-time UDP handshake (`0x05` + 16-byte offline magic)
+            val realtimePayload = IpPackets.buildRealtimeUdpHandshake(48)
+            val realtimePkt = IpPackets.buildIpv4Udp(srcIp, dstIp, 55123, 59100, realtimePayload)
+            val realtimeRes = s.desyncPacket(realtimePkt, DesyncConfig(mode = DesyncMode.REALITY_VISION, fakeTtl = 3))
+            eq(realtimeRes.status, Codes.OK, "Realtime UDP desync status")
+            eq(realtimeRes.protocol, 5, "PROTO_UDP_REALTIME (5)")
+            eq(realtimeRes.packets.size, 2, "low-TTL decoy + real Realtime UDP packet")
 
             // 3) TLS 1.3 ClientHello Record-Layer Multi-Fragmentation (RFC 8446 §5.1)
-            val hostBytes = "gateway.discord.com".toByteArray(Charsets.US_ASCII)
+            val hostBytes = "example.org".toByteArray(Charsets.US_ASCII)
             val sniExtLen = 5 + hostBytes.size
             val extsLen = 4 + sniExtLen
             val bodyLen = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extsLen
@@ -769,7 +802,7 @@ fun main() {
             expect(tlsRecords.size >= 2) { "must fragment into multiple TLS 0x16 records" }
             for (rec in tlsRecords) {
                 eq(rec[0].toInt() and 0xFF, 0x16, "each fragment is a valid TLS 0x16 record")
-                expect(!String(rec, Charsets.ISO_8859_1).contains("gateway.discord.com")) {
+                expect(!String(rec, Charsets.ISO_8859_1).contains("example.org")) {
                     "no single TLS record may contain full SNI"
                 }
             }
@@ -778,17 +811,17 @@ fun main() {
 
     // ------------------------------------------------------------------ 25. DNS Poisoning Detection, ICMP synthesis & Stream First-Flight Evasion
     test("DNS poison detection, ICMP unreachable synthesis, and stream planFirstPayload") {
-        val q = Doh.query("discord.com")!!
+        val q = Doh.query("example.org")!!
 
-        // 1) ISP Poison detection: Türk Telekom 195.175.254.2 / loopback / clean IP
-        val poisonedTt = dnsAnswer(q, byteArrayOf(195.toByte(), 175.toByte(), 254.toByte(), 2))
-        expect(IpPackets.containsPoisonedDns(poisonedTt)) { "must detect Türk Telekom 195.175.254.2 as poisoned" }
+        // 1) ISP Poison detection: 195.175.254.2 / loopback / clean IP
+        val poisonedIsp = dnsAnswer(q, byteArrayOf(195.toByte(), 175.toByte(), 254.toByte(), 2))
+        expect(IpPackets.containsPoisonedDns(poisonedIsp)) { "must detect 195.175.254.2 as poisoned" }
 
         val poisonedLoopback = dnsAnswer(q, byteArrayOf(127, 0, 0, 1))
         expect(IpPackets.containsPoisonedDns(poisonedLoopback)) { "must detect 127.0.0.1 as poisoned" }
 
-        val cleanAnswer = dnsAnswer(q, byteArrayOf(162.toByte(), 159.toByte(), 135.toByte(), 232.toByte()))
-        expect(!IpPackets.containsPoisonedDns(cleanAnswer)) { "clean Discord IP must not be flagged" }
+        val cleanAnswer = dnsAnswer(q, byteArrayOf(104.toByte(), 16.toByte(), 132.toByte(), 229.toByte()))
+        expect(!IpPackets.containsPoisonedDns(cleanAnswer)) { "clean IP must not be flagged" }
 
         val minTtl = IpPackets.dnsMinTtl(cleanAnswer)
         eq(minTtl, 300L, "parsed DNS answer min TTL")
@@ -811,7 +844,7 @@ fun main() {
 
         // 3) ICMPv4 unreachable synthesis for QUIC -> TCP fallback
         val clientIp = IpPackets.parseIpLiteral("10.215.173.1")!!
-        val quicIp = IpPackets.parseIpLiteral("162.159.135.232")!!
+        val quicIp = IpPackets.parseIpLiteral("104.16.132.229")!!
         val quicPkt = IpPackets.buildIpv4Udp(clientIp, quicIp, 50000, 443, byteArrayOf(1, 2, 3, 4))
         val icmpv4 = IpPackets.buildIcmpv4Unreachable(quicPkt)
         expect(icmpv4 != null) { "ICMPv4 packet must be synthesized" }
@@ -820,7 +853,7 @@ fun main() {
         eq(icmpv4[21].toInt() and 0xFF, 3, "ICMPv4 Code 3 (Port Unreachable)")
 
         // 4) SNI locator and planFirstPayload
-        val hostBytes = "roblox.com".toByteArray(Charsets.US_ASCII)
+        val hostBytes = "wikipedia.org".toByteArray(Charsets.US_ASCII)
         val sniExtLen = 5 + hostBytes.size
         val extsLen = 4 + sniExtLen
         val bodyLen = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extsLen
@@ -844,14 +877,14 @@ fun main() {
 
         val sniPos = IpPackets.findClientHelloSni(ch)
         expect(sniPos != null) { "must locate SNI offset in ClientHello" }
-        eq(String(ch, sniPos!!.first, sniPos.second, Charsets.US_ASCII), "roblox.com", "extracted SNI string")
+        eq(String(ch, sniPos!!.first, sniPos.second, Charsets.US_ASCII), "wikipedia.org", "extracted SNI string")
 
         val planned = IpPackets.planFirstPayload(ch, listOf(ch))
         expect(planned.size >= 2) { "planFirstPayload must fragment ClientHello" }
         for (f in planned) {
             eq(f[0].toInt() and 0xFF, 0x16, "each planned fragment is a valid TLS 0x16 record")
-            expect(!String(f, Charsets.ISO_8859_1).contains("roblox.com")) {
-                "no single planned fragment contains full roblox.com SNI"
+            expect(!String(f, Charsets.ISO_8859_1).contains("wikipedia.org")) {
+                "no single planned fragment contains full wikipedia.org SNI"
             }
         }
     }

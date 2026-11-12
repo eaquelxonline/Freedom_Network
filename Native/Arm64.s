@@ -1,20 +1,20 @@
-// THE DPI — AArch64 (ARM64) Assembly (NEON). Android primary architecture.
+// Freedom Network — AArch64 (ARM64) Assembly (NEON). Android primary architecture.
 //
-// NEON-vectorized counterparts of Core.s (x86_64):
-// 1. the_dpi_ascii_lowercase(dst=x0, src=x1, len=x2)
+// NEON-vectorized counterparts of x86_64.s (x86_64):
+// 1. freedom_ascii_lowercase(dst=x0, src=x1, len=x2)
 //      ARM64 has native unsigned byte compares (cmhs), so the range test needs no sign-bias trick.
-// 2. the_dpi_csum_fold(buf=x0, len=x1, initial=x2) -> w0 (u16)
+// 2. freedom_csum_fold(buf=x0, len=x1, initial=x2) -> w0 (u16)
 //      NEON RFC 1071 16-bit one's-complement big-endian accumulator (`rev16` + `uadalp` + `uaddlv`).
-// 3. the_dpi_csum_delta(old_check=w0, old_word=w1, new_word=w2) -> w0 (u16)
+// 3. freedom_csum_delta(old_check=w0, old_word=w1, new_word=w2) -> w0 (u16)
 //      RFC 1624 incremental checksum update in branchless scalar instructions.
-// 4. the_dpi_scan_pattern(hay=x0, hay_len=x1, needle=x2, needle_len=x3) -> x0 (usize)
+// 4. freedom_scan_pattern(hay=x0, hay_len=x1, needle=x2, needle_len=x3) -> x0 (usize)
 //      NEON 16-byte broadcast (`dup v1.16b` + `cmeq` + `umaxv`) pattern scanner for TLS SNI/ECH
 //      and HTTP Host header inspection.
 
 .text
-.globl the_dpi_ascii_lowercase
+.globl freedom_ascii_lowercase
 .p2align 4
-the_dpi_ascii_lowercase:
+freedom_ascii_lowercase:
     cbz     x2, 2f
     movi    v1.16b, #0x41              // 'A'
     movi    v2.16b, #0x5a              // 'Z'
@@ -49,9 +49,9 @@ the_dpi_ascii_lowercase:
 2:
     ret
 
-.globl the_dpi_csum_fold
+.globl freedom_csum_fold
 .p2align 4
-the_dpi_csum_fold:
+freedom_csum_fold:
     mov     x3, x2                     // 64-bit accumulator = initial
     cbz     x1, 14f
     movi    v4.4s, #0                  // 32-bit lane accumulator
@@ -97,9 +97,9 @@ the_dpi_csum_fold:
     and     w0, w0, #0xffff
     ret
 
-.globl the_dpi_csum_delta
+.globl freedom_csum_delta
 .p2align 4
-the_dpi_csum_delta:
+freedom_csum_delta:
     mvn     w0, w0
     and     w0, w0, #0xffff
     mvn     w1, w1
@@ -116,9 +116,9 @@ the_dpi_csum_delta:
     and     w0, w0, #0xffff
     ret
 
-.globl the_dpi_scan_pattern
+.globl freedom_scan_pattern
 .p2align 4
-the_dpi_scan_pattern:
+freedom_scan_pattern:
     cbz     x3, 28f
     cmp     x3, x1
     bhi     29f

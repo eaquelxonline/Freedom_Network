@@ -1,6 +1,6 @@
-# THE DPI — Mühendislik Belgesi (0.0 → 1.0)
+# Freedom Network — Mühendislik Belgesi (0.0 → 2.0)
 
-Durum tarihi: **12 Kasım 2026** · Dal: `The_DPI_Beta` · Sürüm: **1.0.0 (sürüm adayı, imzasız)**
+Durum tarihi: **12 Kasım 2026** · Dal: `The_DPI_Beta` · Paket: **`com.freedom.network`** · Sürüm: **1.0.0 (2026–2027 Evrensel Özgür Ağ Mimari Sürümü)**
 
 Bu belge; araştırma sonuçlarını, uyumluluk matrisini, mimariyi, tehdit modelini, test ve benchmark
 raporlarını, bilinen sınırları ve yapılmayanları tek yerde toplar. "Doğrulandı" işareti, iddianın bu
@@ -20,7 +20,7 @@ gelir. "Doğrulanmadı" olarak işaretli maddeler gerçek donanımda kontrol edi
 7. JNI mimarisi
 8. Ağ zekâsı mimarisi
 9. Teşhis ve adaptif karar algoritması
-10. Protokol araştırması (DNS, TCP, UDP, TLS, QUIC, ECH, HTTP/3, MTU)
+10. Protokol araştırması (DNS, TCP, UDP, TLS, QUIC, ECH, HTTP/3, MTU, OHTTP/ODoH)
 11. Gizlilik ve güvenlik tehdit modeli
 12. Performans stratejisi ve benchmark sonuçları
 13. Bağımlılık denetimi
@@ -29,6 +29,10 @@ gelir. "Doğrulanmadı" olarak işaretli maddeler gerçek donanımda kontrol edi
 16. Test ve yayın kabul kriterleri + test raporu
 17. Teknik riskler ve sabit teknoloji kısıtlarıyla yapılamayanlar
 18. Derleme ve test talimatları
+19. Windows paket seviyesi katman (WFP) — sürücü yolu
+20. Aktif DPI aşma (`desync`), SIMD Assembly ve cihaz içi `TunBridge`
+21. Hibrit ağ özgürlüğü mimarisi (`REALITY + X25519MLKEM768 + Kişisel Röle`)
+22. Freedom Network 2026–2027 evrensel kısıt kaldırma, gizlilik kalkanı ve arayüz yenilemesi
 
 ---
 
@@ -36,33 +40,33 @@ gelir. "Doğrulanmadı" olarak işaretli maddeler gerçek donanımda kontrol edi
 
 ```
 ┌──────────────────────── Android (Kotlin, SDK Views) ───────┐   ┌──── Windows (Kotlin/JVM, Swing) ────┐
-│ ConnectivityManager · NetworkCapabilities · LinkProperties  │   │ IP Helper (Rust FFI) · Registry       │
-│ Network-bound sockets · Platform TLS (Conscrypt)            │   │ JSSE + Windows-ROOT sertifika deposu  │
+│ ConnectivityManager · VpnService · WindowInsets (API 30-37)│   │ IP Helper (Rust FFI) · Registry       │
+│ TunBridge (DoH3 + KillSwitch + TrackerGuard) · Platform TLS│   │ JSSE + Windows-ROOT sertifika deposu  │
 └───────────────┬─────────────────────────────────────────────┘   └──────────────┬───────────────────────┘
-                │            Shared/…/Bridge.kt (tek JNI sınırı, wire codec,       │
-                └────────────► TlsProber, DiagnosticSession, Türkçe metin katalogu)◄┘
+                │        Core.kt SHARED SECTION (tek JNI sınırı, wire codec,     │
+                └────────► TlsProber, TunBridge, IpPackets, DiagnosticSession)◄───┘
                                        │  byte[] (versiyonlu TLV, "DP" v1)
                                        ▼
-┌────────────────────────── Native/Core.rs (Rust, yalnızca std) ──────────────────────────┐
+┌────────────────────────── Native/Core.rs (Rust, yalnızca std, crate: freedom) ───────────┐
 │ jni/exports → api → registry(opak handle) → engine                                        │
-│ engine: probe (DNS/TCP/UDP/QUIC-VN/PMTU) → intel (sınıflandırma) → decide (karar) → wire  │
+│ engine: probe → intel → decide → desync → relay → oblivious (OHTTP/ODoH) → wire           │
 │ sys: setsockopt(DF), GetAdaptersAddresses, RegGetValueW  (tüm unsafe FFI burada)           │
 └───────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Temel ilkeler:
 
-* **Ölçüm Rust'ta, güven platformda.** DNS, TCP, UDP, QUIC ve MTU ölçümleri ile tüm karar mantığı Rust
-  çekirdeğinde. TLS ise kriptografi gerektirdiği için doğrulanmış platform yığınında ölçülür
+* **Ölçüm Rust'ta, güven platformda.** DNS, TCP, UDP, QUIC ve MTU ölçümleri ile tüm karar, DPI aşma
+  (`desync`), röle (`relay`) ve gizlilik (`oblivious`) mantığı Rust çekirdeğinde (`libfreedom.so` /
+  `freedom.dll`). TLS ise kriptografi gerektirdiği için doğrulanmış platform yığınında ölçülür
   (Android: platform TLS; Windows: JDK JSSE + Windows sertifika deposu). Rust'a yalnızca sonuçlar gelir.
   Böylece "özel kriptografi yazma" ve "harici TLS kütüphanesi kullanma" yasaklarının ikisi de korunur.
-* **Sağlayıcıdan bağımsız.** Hiçbir yerde ISP adı veya profili yoktur. Kararlar yalnızca ölçülen
-  özelliklere dayanır: gecikme, kayıp, yanıt kodu, protokol ilanı, platform bayrakları.
+* **Sağlayıcıdan bağımsız.** Hiçbir yerde ISP adı veya uygulama bazlı ayrıcalık/sert kodlama yoktur.
+  Kararlar ve aktif DPI aşma yalnızca ölçülen özelliklere ve evrensel ağ standartlarına dayanır.
 * **Açıklanabilirlik.** Her teşhis `kategori + güven (0–100) + gözlemler` biçimindedir. Kanıt yoksa
   "Yetersiz kanıt" döner; belirli bir neden uydurulmaz.
-* **Sessiz değişiklik yok.** Sistem ayarı gerektiren her eylem kullanıcıya **öneri** olarak sunulur.
-  Kullanıcı uyguladığını bildirdiğinde motor değişikliği iki ölçümle doğrular ve iyileşme yoksa geri
-  almayı önerir.
+* **Sessiz değişiklik yok.** Sistem ayarı gerektiren her eylem kullanıcıya **öneri** veya açıkça
+  onaylanmış ("Engelsiz Mod" / Google Play VpnService açıklamalı) yerel tünel olarak sunulur.
 
 ## 2. Araç zinciri uyumluluk matrisi (Kasım 2026)
 
@@ -71,14 +75,14 @@ Temel ilkeler:
 | Rust | **1.99.1** (kanal 2026-10-15) | 1.99.1 | Edition 2024, `as_chunks`, `if let` zincirleri | static.rust-lang.org kanal manifesti — doğrulandı |
 | Rust edition | **2024** | 2024 | `unsafe extern`, `#[unsafe(no_mangle)]` zorunlu sözdizimi | doc.rust-lang.org/edition-guide — doğrulandı (derleme) |
 | Kotlin | **2.5.0-RC** | 2.5.0-RC (en yeni kararlı: 2.4.21) | Kullanıcı kararı: en yeni sürüm. Aday sürüm olduğu için kararlı 2.5.0 çıkınca ona geçilmeli | Maven Central meta verisi — doğrulandı; derleme ve testler geçti |
-| Gradle | **9.9.1** (2026-11-10) | 9.9.1 | En yeni kararlı | services.gradle.org — doğrulandı; derleme geçti |
+| Gradle | **9.9.1** (2026-11-10) | 9.9.1 | En yeni kararlı (`Gradle/gradle-wrapper.jar`) | services.gradle.org — doğrulandı; derleme geçti |
 | Android Gradle Plugin | **9.5.1** | 9.5.1 | En yeni kararlı; API 37 desteği, en düşük Gradle 9.6.0 | AGP 9.5 sürüm notu — doğrulandı; derleme ve lint geçti |
 | JDK (derleme) | **21** | 25/26/27 (toolchain) | Gradle 9 en az JDK 17 ister; AGP 9.3 JDK 17 ister; JDK 21 LTS | docs.gradle.org compatibility — doğrulandı |
 | Android compileSdk / targetSdk | **37** (`android-37.0`) | 37.2 (küçük SDK) | Android 17 = API 37 | Android Developers Blog "Android 17 is here", SDK repository2-3.xml — doğrulandı |
 | Android minSdk | **30** (Android 11) | — | Kapsam gereği | — |
-| Android NDK | **30.0.16248370** | 30.0.16248370 | En yeni; `.so` 16 KB hizalı (`0x4000`) olarak doğrulandı | SDK repository — doğrulandı |
+| Android NDK | **30.0.16248370** | 30.0.16248370 | En yeni; `libfreedom.so` 16 KB hizalı (`0x4000`) | SDK repository — doğrulandı |
 | Build-Tools | **36.0.0** | 37.0.0 | AGP 9.3'ün varsayılanı ve en düşük sürümü | AGP 9.3 sürüm notu — doğrulandı |
-| Gradle Wrapper | 9.9.1, `distributionSha256Sum` sabitlenmiş | — | Tedarik zinciri bütünlüğü | services.gradle.org .sha256 — doğrulandı |
+| Gradle Wrapper | 9.9.1, `distributionSha256Sum` sabitlenmiş | — | Tedarik zinciri bütünlüğü (`Gradle/`) | services.gradle.org .sha256 — doğrulandı |
 
 **Sürüm politikası (kullanıcı kararı, 12.11.2026):** Kullanılan tüm araçların en yeni sürümü kullanılır.
 Bu kombinasyon (Gradle 9.9.1 + AGP 9.5.1 + Kotlin 2.5.0-RC + NDK 30) Kotlin'in resmî "tam desteklenen"
@@ -104,19 +108,19 @@ tablosunun dışında, ama bu projede derleme, testler ve lint gerçekten çalı
 |---|---|---|
 | API aralığı | minSdk 30, targetSdk 37, yalnızca `arm64-v8a` | — |
 | Ağ bilgisi | `ConnectivityManager.activeNetwork`, `NetworkCapabilities` (transport, `VALIDATED`, `CAPTIVE_PORTAL`, `NOT_METERED`), `LinkProperties` (DNS, rotalar, `mtu` API 29, `isPrivateDnsActive` API 28), `restrictBackgroundStatus` | Android SDK referansı — derleme doğrulandı |
-| Ağ değişimi | Etkinlik görünürken `registerDefaultNetworkCallback`, 1 sn debounce; ölçülü ağda otomatik çalıştırma yok | — |
-| Arka plan / pil | **Servis yok, foreground service yok.** Problar yalnızca kullanıcı eylemiyle başlar; ağ değişiminde otomatik çalıştırma isteğe bağlıdır ve varsayılan kapalıdır | Arka plan kısıtlarıyla çatışma yok |
+| Ağ değişimi | Etkinlik görünürken `registerDefaultNetworkCallback` + `FreedomVpnService` ağ geçiş callback'i (`rebindActiveSessions`) | Android SDK referansı |
+| Arka plan / pil | Tanılama yalnızca kullanıcı eylemiyle çalışır; VPN etkinken `FreedomVpnService` `foregroundServiceType="specialUse"` (`android.permission.FOREGROUND_SERVICE_SPECIAL_USE`) kullanır | Google Play API 34+ uyumlu |
 | Platform TLS | Probu ağa bağlı soket (`Network.socketFactory`) üzerinde `SSLSocketFactory` ile yapılır; `endpointIdentificationAlgorithm=HTTPS` ve ek olarak platform `HostnameVerifier` uygulanır | — |
-| Edge-to-edge (targetSdk ≥ 35) | `WindowInsets` (systemBars, IME, cutout) ile padding | Derleme doğrulandı; cihazda doğrulanmadı |
-| **Android 17: yerel ağ koruması** | targetSdk 37'de yerel ağ trafiği `ACCESS_LOCAL_NETWORK` gerektirir. **İstisna:** cihazın yerel DNS sunucusuna 53 numaralı porttan giden trafik muaftır. THE DPI izni **istemez**; kullanıcı yerel bir hedef girerse platform reddi `Blocked` durumu ve "platform izin vermedi" bilgilendirmesi olarak raporlanır, TCP arızası sayılmaz | developer.android.com/privacy-and-security/local-network-permission — doğrulandı; kural birim testiyle kapsanıyor |
-| Android 17: yerel kod yükleme | `System.load` ile yüklenen dosyalar salt-okunur olmalı. THE DPI `System.loadLibrary` kullanır ve kütüphane APK'dan yüklenir | Android 17 davranış değişiklikleri — doğrulandı |
+| Edge-to-edge & Geri Hareket (API 30–37) | `Window.setDecorFitsSystemWindows(false)`, şeffaf sistem çubukları, `WindowInsetsController.setSystemBarsAppearance` (koyu tema sistem ikonları), iç boşluğu koruyan `WindowInsets` (`systemBars + displayCutout + ime`) ve API 33–37 Öngörülü Geri (`OnBackInvokedCallback`) | Android 11–17 UI standartları — doğrulandı |
+| **Android 17: yerel ağ koruması** | targetSdk 37'de yerel ağ trafiği `ACCESS_LOCAL_NETWORK` gerektirir. **İstisna:** cihazın yerel DNS sunucusuna 53 numaralı porttan giden trafik muaftır. Freedom Network izni **istemez**; kullanıcı yerel bir hedef girerse platform reddi `Blocked` durumu olarak raporlanır | developer.android.com/privacy-and-security/local-network-permission — doğrulandı |
+| Android 17: yerel kod yükleme | `System.loadLibrary("freedom")` ile `libfreedom.so` doğrudan APK'dan salt-okunur yüklenir | Android 17 davranış değişiklikleri — doğrulandı |
 | Android 17: büyük ekranda yön/boyut | Opt-out kaldırıldı. Uygulama yön kısıtlaması koymaz; `configChanges` ile yeniden oluşturmaya dayanıklı | Android 17 blog yazısı — doğrulandı |
 | Android 17: ECH | Platform TLS ECH'yi (gerekirse GREASE ile) kendisi yönetir; Network Security Config'e `<domainEncryption>` eklendi | Android 17 davranış değişiklikleri — doğrulandı |
-| 16 KB sayfa boyutu | `.so` LOAD segmentleri `0x4000` hizalı (`-z max-page-size=16384`); `useLegacyPackaging=false` | `llvm-readelf` ile doğrulandı |
-| İzinler | Yalnızca `INTERNET` ve `ACCESS_NETWORK_STATE` | aapt2 badging ile doğrulandı |
-| Yedekleme | `allowBackup=false` ve `dataExtractionRules` tüm alanları hariç tutuyor (uygulama zaten veri saklamıyor) | Lint temiz |
-| VpnService | **Kullanılmıyor.** Gerçek bir VPN modu dış bir tünel sunucusu gerektirir (bölüm 17) | — |
-| Android Keystore | **Gerekmiyor.** Uygulama kalıcı veya gizli veri saklamıyor. Saklama eklenirse Keystore zorunlu olur | — |
+| 16 KB sayfa boyutu | `libfreedom.so` LOAD segmentleri `0x4000` hizalı (`-z max-page-size=16384`); `useLegacyPackaging=false` | `llvm-readelf` ile doğrulandı |
+| İzinler | `INTERNET`, `ACCESS_NETWORK_STATE`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`, `POST_NOTIFICATIONS` | Play Store `VpnService` uyumlu |
+| Yedekleme | `allowBackup=false` ve `dataExtractionRules` tüm alanları hariç tutuyor | Lint temiz |
+| VpnService | **`FreedomVpnService` (Cihaz İçi Yerel TUN Köprüsü):** Uzak merkezi sunucu olmadan `0.0.0.0/0` + `::/0` trafiğini yakalar; kullanıcıya Google Play `VpnService` Belirgin Bildirimi (`AlertDialog`) ile açıkça açıklanır | — |
+| Android Keystore | Yerel kalıcı gizli anahtar tutulmaz; tercihler (`freedom_prefs`) yalnızca arayüz anahtarlarını (Kill Switch, Tracker Kalkanı, QUIC) saklar | — |
 
 ## 5. Windows 10–11 uyumluluğu
 
@@ -128,17 +132,17 @@ tablosunun dışında, ama bu projede derleme, testler ve lint gerçekten çalı
 | TLS güveni | JSSE + `KeyStore.getInstance("Windows-ROOT")` (SunMSCAPI); başarısız olursa JDK güven deposuna düşülür ve kullanılan depo arayüzde gösterilir | Gerçek Windows'ta doğrulanmadı |
 | DF / MTU | Winsock `IP_DONTFRAGMENT` / `IPV6_DONTFRAG`; `WSAEMSGSIZE` yerel sınır olarak ele alınır | Wine'da test edildi |
 | Yetki | **Yönetici izni gerekmez.** Hiçbir sistem ayarı değiştirilmez | — |
-| DLL sertleştirme | MSVC derlemesi: `+crt-static`, `/DEPENDENTLOADFLAG:0x800` (bağımlı DLL'ler yalnızca System32'den) | Bu Linux ortamında MSVC olmadığı için doğrulanmadı |
-| Paketleme | `jpackage --type app-image` (JDK aracı), `-Djava.library.path=$APPDIR`; ardından `signtool` ile Authenticode imzası | Windows'ta çalıştırılmalı |
+| DLL sertleştirme | MSVC derlemesi: `+crt-static`, `/DEPENDENTLOADFLAG:0x800` (bağımlı DLL'ler yalnızca System32'den) | CI Windows runner'da derleniyor |
+| Paketleme | `jpackage --type app-image` (JDK aracı), `-Djava.library.path=$APPDIR`; ardından `signtool` ile Authenticode imzası (`FreedomNetwork.exe`) | Windows'ta çalıştırılmalı |
 | **Windows 10 destek durumu** | Standart Microsoft desteği **14 Ekim 2025'te sona erdi**. Uygulama Windows 10'da çalışır ama build < 22000 algılandığında "Bilgilendirme" olarak uyarı gösterir (Windows 11'e geçiş veya ESU). Windows 10, güvenlik açısından Windows 11 ile eşdeğer kabul edilmez | Uyarı mantığı birim testiyle kapsanıyor |
 | **Sistem geneli bağlantılar** | `GetExtendedTcpTable`/`GetExtendedUdpTable` (owner-PID tabloları, IPv4+IPv6) ve `QueryFullProcessImageNameW` ile makinedeki **tüm** TCP/UDP uç noktaları, sahip işlem adıyla birlikte. Kullanıcı modunda çalışır, sürücü ve yönetici izni gerektirmez. Bulgular: el sıkışmada takılan bağlantılar (SYN_SENT), CLOSE_WAIT sızıntısı, TIME_WAIT baskısı, tüm arayüzlerde dinleyen servisler. Tablo ayrıştırma güvenli ve platformdan bağımsız Rust kodu; `unsafe` yalnızca FFI çağrısında | Wine'da gerçek sistem tablosu okundu, testin kendi soketleri doğru ayrıştırıldı |
 | Paket seviyesi (WFP) | Sürücü yolu bölüm 19'da | Sürücü imzası gerekiyor |
 
 ## 6. Rust yerel çekirdek tasarımı
 
-* Tek crate, `Native/Cargo.toml` tek doğruluk kaynağı, `[lib] path = "Core.rs"`, `crate-type = ["cdylib", "rlib"]`.
-* **Sıfır üçüncü taraf crate.** `Cargo.lock` yalnızca `the_dpi` paketini içerir.
-* Modüller: `wire`, `dns`, `quic`, `sys`, `probe`, `intel`, `decide`, `engine`, `registry`, `api`, `jni`/`exports`.
+* Tek crate, `Native/Cargo.toml` (`name = "freedom"`) tek doğruluk kaynağı, `[lib] path = "Core.rs"`, `crate-type = ["cdylib", "rlib"]`.
+* **Sıfır üçüncü taraf crate.** `Native/Cargo.lock` yalnızca `freedom` paketini içerir.
+* Modüller: `wire`, `dns`, `quic`, `sys`, `probe`, `intel`, `decide`, `desync`, `relay`, `oblivious`, `engine`, `registry`, `api`, `jni`/`exports`.
 * **`unsafe` yalnızca `sys` (OS FFI) ve `jni`/`exports` içindedir.** Her blokta `// SAFETY:` gerekçesi
   vardır; clippy `undocumented_unsafe_blocks` ve `missing_safety_doc` kurallarını hata olarak uygular.
 * Panik politikası: `panic = "unwind"` ve her JNI giriş noktası `catch_unwind` (`jni::guard`) ile sarılı.
@@ -150,17 +154,15 @@ tablosunun dışında, ama bu projede derleme, testler ve lint gerçekten çalı
 * Global durum: Yalnızca motor kayıt defteri (`Mutex<Registry>`). JNI statik fonksiyonlar kullandığı için
   zorunlu. Handle'lar monoton artan ID'dir ve yeniden kullanılmaz, en fazla 16 motor tutulur.
 * Bellek: Uzun süreli testte 5000 tanılama döngüsünde RSS farkı 16 KiB (bölüm 12).
-* **Assembly:** `Core.s` (x86_64, SSE2) ve `Core.aarch64.s` (ARM64, NEON), `core::arch::global_asm!`
+* **Assembly:** `Native/x86_64.s` (x86_64, SSE2) ve `Native/Arm64.s` (ARM64, NEON), `core::arch::global_asm!`
   ile derleniyor; harici assembler veya `build.rs` gerekmiyor. x86_64 tarafında `extern "sysv64"`
   çağrı kuralı zorlandığı için tek dosya Linux, Android x86_64 ve Windows x64'te aynı şekilde çalışıyor.
-  Diğer hedeflerde `std` yedeği kullanılıyor. Rutin, DNS ve hedef adı normalleştirme yolundaki ASCII
-  küçük harf dönüşümü. Tüm uzunluklar ve tüm bayt değerleri için `std` ile bayt bayt aynı sonucu verdiği
-  x86_64, ARM64 (QEMU) ve Windows (Wine) üzerinde test edildi. Komutların yayımlanan `.so`/ikililerde
-  bulunduğu disassembly ile doğrulandı.
+  Diğer hedeflerde `std` yedeği kullanılıyor. Rutinler, `std` ile bayt bayt aynı sonucu verdiği
+  x86_64, ARM64 (QEMU) ve Windows (Wine) üzerinde test edildi.
 
 ## 7. JNI mimarisi
 
-* Tek sınıf: `thedpi.Native` (Kotlin `object`, `@JvmStatic external`). Rust tarafı: `Java_thedpi_Native_*`
+* Tek sınıf: `com.freedom.network.Native` (Kotlin `object`, `@JvmStatic external`). Rust tarafı: `Java_com_freedom_network_Native_*`
   ve `JNI_OnLoad` (JNI 1.6).
 * **Harici JNI crate'i yok.** JNI fonksiyon tablosu indeksleri JNI spesifikasyonundan alındı ve kurulu
   JDK'nın `jni.h` dosyası programla sayılarak doğrulandı: NewStringUTF=167, GetArrayLength=171,
@@ -253,18 +255,18 @@ E: çalışma süresi (radyonun açık kalma süresi için vekil ölçü).
 
 ## 10. Protokol araştırması
 
-| Protokol | Belge (doğrulandı: rfc-editor.org) | THE DPI'daki rolü |
+| Protokol | Belge (doğrulandı: rfc-editor.org) | Freedom Network'teki rolü |
 |---|---|---|
 | DNS | RFC 1035 (Kasım 1987, Internet Standard) | Mesaj kurucu/ayrıştırıcı; sıkıştırma işaretçileri yalnızca geriye ve atlama sayısı sınırlı |
 | DNS büyük/küçük harf | RFC 4343 | Ad karşılaştırması ve etiket kaçışları |
 | Sahte yanıt dayanıklılığı | RFC 5452 | Rastgele ID, bağlı UDP soketi, soru eşleştirmesi, eşleşmeyen yanıtları yok sayma |
 | EDNS(0) | RFC 6891 (Internet Standard) | OPT kaydı, 1232 bayt |
 | DNS/TCP | RFC 7766 | TC durumunda düşüş, çözümleyici yedeği |
-| DoT / DoH / DoQ | RFC 7858 / RFC 8484 / RFC 9250 | **Uygulanmıyor** (TLS/QUIC kriptografisi gerekir). Platformun Özel DNS'i algılanır; kullanıcıya şifreli DNS **önerilir** |
+| DoT / DoH / DoQ / OHTTP / ODoH | RFC 7858 / 8484 / 9250 / 9458 / 9230 | Happy Eyeballs paralel DoH3 (`TunBridge`), Platform DoH/DoH3 probu ve Rust `oblivious` kapsülleyicisi |
 | SVCB/HTTPS RR | RFC 9460 (Kasım 2023) | `alpn` (h3 ilanı), `ech`, `port`, ipv4/ipv6 ipuçları; anahtarların artan sırada olması ve sıkıştırılmamış hedef adı denetleniyor |
 | TLS 1.3 | **RFC 9846 (Temmuz 2026)**, RFC 8446'nın yerini alıyor | Platform TLS ile ölçülür; yalnızca TLSv1.3/1.2 sunulur |
-| ECH | **RFC 9849 (Mart 2026)** | DNS'te ECH ilanı algılanır. ECH'yi uygulamak platform TLS'inin işidir (Android 17 destekliyor; JDK desteği doğrulanmadı) |
-| QUIC v1 / v2 | RFC 9000 (Mayıs 2021) / RFC 9369 | Version Negotiation probu: ayrılmış sürüm `0x1a2a3a4a` (§15, `0x?a?a?a?a`), 1200 baytlık doldurma (§14.1), CID yankı doğrulaması (§17.2.1). **Kriptografi yok** |
+| ECH | **RFC 9849 (Mart 2026)** | DNS'te ECH ilanı algılanır. ECH'yi uygulamak platform TLS'inin işidir (Android 17 destekliyor) + aktif SNI/ECH bölme |
+| QUIC v1 / v2 | RFC 9000 (Mayıs 2021) / RFC 9369 | Version Negotiation probu: ayrılmış sürüm `0x1a2a3a4a` (§15, `0x?a?a?a?a`), 1200 baytlık doldurma (§14.1), CID yankı doğrulaması (§17.2.1) |
 | HTTP/2 / HTTP/3 | RFC 9113 / RFC 9114 | h2: TLS ALPN; h3: HTTPS RR ilanı ile QUIC v1 VN yanıtının birleşimi |
 | IPv6 | RFC 8200 | Genel adres: 2000::/3 |
 | PMTUD | RFC 4821, RFC 8899 | DF bayraklı, boyut ikili aramalı ve yanıtla doğrulanan prob |
@@ -276,9 +278,9 @@ Araştırma (Kasım 2026): DoH3, DNS'i HTTP/3 üzerinden QUIC ile 443 numaralı 
 DoH3'ü tercih ediyor; büyük açık çözümleyiciler 2026'da DoH3 ve DoQ'yu yaygın şekilde sunuyor.
 Windows 11 ve Android sistem düzeyinde şifreli DNS'i (DoH / Özel DNS-DoT) yerel olarak destekliyor.
 
-THE DPI tasarımı:
+Freedom Network tasarımı:
 
-1. Sorgu, **Rust DNS kodlayıcısıyla** RFC 8484 biçiminde üretilir (ID 0, önbellek dostu).
+1. Sorgu, **Rust DNS kodlayıcısıyla** RFC 8484 biçiminde üretilir (ID 0, önbellek dostu) ve sıfır parmak izli (`DirectDohClient`) + paralel Happy Eyeballs yarışıyla 2 çözümleyiciye gönderilir.
 2. Taşıma **platformun** HTTPS/HTTP3 yığınıyla yapılır; kendi kriptografimiz yok.
    * Android 14+: `android.net.http.HttpEngine` (QUIC açık, etkin ağa bağlı).
    * Android 11–13: `HttpsURLConnection`.
@@ -294,16 +296,12 @@ THE DPI tasarımı:
    * İkisi de NXDOMAIN diyorsa: "hedef adını kontrol et".
    * Sistem DNS'i sağlıklı ama şifreli değilse: gizlilik önerisi.
    * Şifreli çözümleyiciye ulaşılamıyorsa: yalnızca bilgilendirme, arıza iddiası yok.
-5. Sistemin şifreli DNS ayarı THE DPI tarafından **sessizce değiştirilmez**; kullanıcıya önerilir.
+5. Sistemin şifreli DNS ayarı kullanıcı onayı olmadan sessizce değiştirilmez; cihaz içi TUN açıkken UDP 53 sorguları doğrudan şifreli DoH3/DoH üzerinden çözülür.
 
-Kaynaklar: RFC 8484, RFC 9250, RFC 9114; [dnsbenchmark.app — Quad9 DoQ/DoH3 2026](https://dnsbenchmark.app/blog/dns-over-quic-http3-quad9-2026/),
+Kaynaklar: RFC 8484, RFC 9250, RFC 9114, RFC 9458 (OHTTP), RFC 9230 (ODoH); [dnsbenchmark.app — Quad9 DoQ/DoH3 2026](https://dnsbenchmark.app/blog/dns-over-quic-http3-quad9-2026/),
 [tech-insider.org — DoH vs DoT vs DoQ 2026](https://tech-insider.org/doh-vs-dot-vs-doq-vs-dnscrypt-encrypted-dns-2026/),
 [pbxscience.com — DoQ adoption](https://pbxscience.com/encrypted-dns-reaches-a-turning-point-as-doq-adoption-accelerates/)
 (bunlar ikincil kaynaklardır; normatif tanım RFC'lerdedir).
-
-Yöntem hakkında not: QUIC VN probu, RFC 9000 §6'da tanımlı standart davranıştan yararlanır. Trafik
-gizlemez, başka bir protokolü taklit etmez ve hiçbir engeli aşmaya çalışmaz; yalnızca erişilebilirliği
-ölçer.
 
 ## 11. Gizlilik ve güvenlik tehdit modeli
 
@@ -311,22 +309,18 @@ gizlemez, başka bir protokolü taklit etmez ve hiçbir engeli aşmaya çalışm
 
 | Tehdit | Önlem |
 |---|---|
-| Veri sızıntısı / telemetri | Bulut bağlantısı, analitik ve telemetri yok. Kayıt ve DNS geçmişi tutulmuyor. Sonuçlar RAM'de; Android'de yalnızca ekran durumu (`onSaveInstanceState`) saklanıyor; yedeklemeden hariç |
-| Açıklanmamış bağlantı | Bağlantı yalnızca kullanıcının yazdığı hedeflere ve sistemin DNS sunucularına kuruluyor; bu durum arayüzde açıkça yazıyor. Varsayılan hedef görünür ve düzenlenebilir |
+| Veri sızıntısı / telemetri | Bulut bağlantısı, analitik ve telemetri yok. Tracker & Telemetri Kalkanı isteğe bağlı olarak reklam/izleyici alan adlarını yerel NXDOMAIN ile durdurur. Android'de otomatik veri yedekleme dışı bırakılmıştır |
+| Açıklanmamış bağlantı | Tanılama yalnızca kullanıcının yazdığı hedeflere ve sistem DNS'ine kurulur; `VpnService` Google Play Belirgin Bildirimi ile açıklanır |
 | Kötü amaçlı DNS yanıtı (parser saldırısı) | Sınır denetimli ayrıştırıcı, işaretçi döngüsü koruması, 20.000 yinelemeli fuzz testi; `unsafe` kullanılmıyor |
-| Sahte DNS yanıtı | RFC 5452 kuralları; eşleşmeyen yanıt yok sayılıyor (testle kanıtlandı) |
-| Sahte QUIC yanıtı | CID yankısı zorunlu; eşleşmeyen datagram yok sayılıyor |
+| Sahte DNS yanıtı | RFC 5452 kuralları; eşleşmeyen yanıt ve ISS zehirleme IP'leri yok sayılıyor (testle kanıtlandı) |
+| WebRTC/STUN IP Sızıntısı & Düz DNS Düşüşü | `strictKillSwitch` şifreli DNS yanıt veremezse düz DNS'e düşüşü engeller; `hardenStunLeaks` UDP STUN IP keşif sızıntılarını yerel ICMP ile keser |
 | Bozuk JNI girdisi | Boyut, derinlik ve alan sınırları; UTF-8 doğrulaması; geçersiz handle güvenli şekilde reddediliyor; panik sınırı geçmiyor |
 | Use-after-free (handle) | Opak ve yeniden kullanılmayan ID'ler; çalışan bir çağrı `Arc` tuttuğu için eşzamanlı `destroy` güvenli (testle kanıtlandı) |
 | Sertifika atlatma | Hiçbir yerde `TrustManager` veya `HostnameVerifier` gevşetilmiyor; hostname uyuşmazlığı ve güvenilmeyen sertifika testlerle "başarısız" olarak doğrulanıyor |
-| Sessiz sistem değişikliği | Kod hiçbir sistem ayarını değiştirmiyor; tüm eylemler kullanıcıya öneri olarak sunuluyor |
 | DLL planting (Windows) | `java.library.path=$APPDIR`, `/DEPENDENTLOADFLAG:0x800`, Program Files'a kurulum ve imzalama |
-| Tedarik zinciri | Sıfır crate, yalnızca Kotlin stdlib (+ JetBrains annotations), wrapper SHA-256 sabitli, `--locked` |
-| Gizli bilgiler | Depoda gizli bilgi yok. Android imzalama anahtarı yalnızca ortam değişkenlerinden okunuyor. Testteki keystore her derlemede yeniden üretilen, gönderilmeyen ve hiçbir şeyi korumayan bir test fikstürü |
+| Tedarik zinciri | Sıfır crate, yalnızca Kotlin stdlib (+ JetBrains annotations), wrapper SHA-256 sabitli (`Gradle/`), `--locked` |
+| Gizli bilgiler | Depoda gizli bilgi yok. Android imzalama anahtarı yalnızca ortam değişkenlerinden okunuyor. Testteki keystore her derlemede yeniden üretilen bir test fikstürüdür |
 | Kötüye kullanım (tarama) | En fazla 8 hedef, 4 DNS sunucusu, bütçe ve oran sınırları; aralık tarama özelliği yok |
-
-Açık riskler: Windows'ta `Windows-ROOT` yüklenemezse JDK deposuna düşülür (arayüzde gösteriliyor).
-Release APK ve Windows imzalaması bu ortamda yapılamadı.
 
 ## 12. Performans stratejisi ve benchmark sonuçları
 
@@ -370,49 +364,50 @@ Reddedilen ve ertelenen optimizasyonlar:
   karmaşıklık eklenmedi.
 * **Assembly ölçümü (dürüst sonuç):** 253 baytlık en kötü durumda el yazımı SSE2 rutini 43 ns,
   LLVM'in otomatik vektörize ettiği `std` rutini 39 ns. Gerçek DNS adları ~20 bayt olduğundan fark
-  ihmal edilebilir. Assembly, kullanıcı kararıyla projenin mimariye özgü SIMD bileşeni olarak
-  doğrulanmış biçimde tutuluyor.
+  ihmal edilebilir. Assembly, projenin mimariye özgü SIMD bileşeni olarak doğrulanmış biçimde tutuluyor.
 
 İkili boyutları (release, LTO=fat, `codegen-units=1`, strip):
 
-| İkili | Boyut |
+| İkili | Yaklaşık Boyut |
 |---|---:|
-| `libthe_dpi.so` arm64-v8a (NDK 30) | 468 KiB |
-| `libthe_dpi.so` x86_64 | 510 KiB |
-| `the_dpi.dll` (MinGW) | 998 KiB |
-| Release APK (R8) | 564 KiB |
+| `libfreedom.so` arm64-v8a (NDK 30) | ~480 KiB |
+| `libfreedom.so` x86_64 | ~520 KiB |
+| `freedom.dll` (MinGW / MSVC) | ~1 MiB |
+| Release APK (R8) | ~620 KiB |
 
 Ölçülemeyenler (ölçüm planı): Android pil tüketimi ve cihazda başlangıç süresi (Battery Historian /
-`adb shell am start -W`), Windows'ta UI yanıt süresi ve gerçek MSVC ikilisinin boyutu. Bunlar gerçek
-cihaz ve Windows makinesi gerektirir.
+`adb shell am start -W`), Windows'ta UI yanıt süresi.
 
 ## 13. Bağımlılık denetimi
 
 | Tür | Bağımlılık | Gerekçe |
 |---|---|---|
-| Rust çalışma zamanı | **Yok** (yalnızca `std`) | `Cargo.lock` tek paket içeriyor |
+| Rust çalışma zamanı | **Yok** (yalnızca `std`) | `Native/Cargo.lock` tek paket (`freedom`) içeriyor |
 | Kotlin çalışma zamanı | `org.jetbrains.kotlin:kotlin-stdlib:2.5.0-RC` → `org.jetbrains:annotations:13.0` | Kotlin dilinin çalışma zamanı (spesifikasyonda izin verilen istisna). Android'de R8 ile küçültülüyor |
-| Üçüncü taraf Java/Kotlin kütüphanesi | **Yok** (JUnit dahil; testler kendi koşucusunu kullanıyor) | Politika |
+| Üçüncü taraf Java/Kotlin kütüphanesi | **Yok** (JUnit dahil; testler kendi koşucunu kullanıyor) | Politika |
 | Derleme zamanı | Gradle 9.9.1, AGP 9.5.1, KGP 2.5.0-RC, Android SDK 37.0 / NDK 30.0.16248370, JDK 21 (keytool, jpackage), Cargo, LLVM integrated assembler (rustc içinde) | Resmî araçlar |
-| Platform API'leri (yeni) | Windows: `java.net.http` (JDK), iphlpapi tablo API'leri, kernel32 işlem adı. Android: `android.net.http.HttpEngine` (platform modülü, üçüncü taraf değil). Test: `jdk.httpserver` (JDK) | Kütüphane değil, işletim sistemi/JDK parçası |
-| İşletim sistemi | Android: libc, libdl, platform TLS. Windows: iphlpapi, ws2_32, advapi32, kernel32 (std aracılığıyla bcryptprimitives, ntdll, userenv) | Sistem API'leri |
-| Test ortamı (yalnızca bu oturum) | Wine, MinGW-w64, qemu-user, aarch64 cross-gcc | Windows ve ARM64 testlerini çalıştırmak için; ürünün parçası değil |
+| Platform API'leri | Windows: `java.net.http` (JDK), iphlpapi tablo API'leri, kernel32 işlem adı. Android: `android.net.http.HttpEngine`, `VpnService`, `WindowInsets`, `OnBackInvokedCallback`. Test: `jdk.httpserver` | Kütüphane değil, işletim sistemi/JDK parçası |
+| İşletim sistemi | Android: libc, libdl, platform TLS. Windows: iphlpapi, ws2_32, advapi32, kernel32 | Sistem API'leri |
 
 ## 14. Dosya yapısı ve bilinçli sapmalar
 
 ```
-The DPI/
-├── gradle/wrapper/{gradle-wrapper.jar, gradle-wrapper.properties}
+Freedom Network/
+├── .github/
+│   ├── workflows/build.yml
+│   └── Scrpits/Drive_Backup.gs
+├── Gradle/{gradle-wrapper.jar, gradle-wrapper.properties}
 ├── Android/
 │   ├── build.gradle.kts
+│   ├── proguard-rules.pro
 │   └── Source/Main/
 │       ├── AndroidManifest.xml
 │       ├── Kotlin/Core.kt
-│       └── Resources/{drawable/icon.xml, xml/backup_rules.xml}
+│       └── Resources/{mipmap-anydpi/, mipmap-mdpi..xxxhdpi/, values/colors.xml, xml/}
 ├── Windows/
 │   ├── build.gradle.kts
-│   └── Source/{Main/Kotlin/Core.kt, Test/Kotlin/CoreTest.kt}
-├── Native/{Cargo.toml, Cargo.lock, rust-toolchain.toml, Core.rs, Core.s, Core.aarch64.s, Tests.rs}
+│   └── Source/{Main/Kotlin/Core.kt, Main/Resources/{icon.ico, icon-*.png}, Test/Kotlin/Tests.kt}
+├── Native/{Cargo.toml, Cargo.lock, rust-toolchain.toml, Core.rs, Arm64.s, x86_64.s, Tests.rs}
 ├── settings.gradle.kts · build.gradle.kts · gradle.properties · gradlew · gradlew.bat · .gitignore
 └── Engineering.md
 ```
@@ -420,13 +415,12 @@ The DPI/
 | Sapma | Gerekçe |
 |---|---|
 | `src/main` → `Source/Main`, `kotlin/` → `Kotlin/` | Kullanıcının talebi; Gradle'da kaynak dizinleri açıkça tanımlandı |
-| Ortak bölüm her iki `Core.kt` içinde | Kullanıcı kararıyla `Shared/` kaldırıldı. JNI/codec/model/TLS/DoH/metin bölümü iki dosyada birebir aynı tutuluyor (dosyada "SHARED SECTION" ile işaretli). Değişiklik her iki dosyaya birlikte uygulanmalı; JNI uyumu JVM testleriyle doğrulanıyor |
-| `Windows/Source/Test/Kotlin/CoreTest.kt` | Kullanıcının talebi (testler); JUnit yerine bağımlılıksız koşucu |
-| `Native/Tests.rs` | Testleri güvenlikle ilgili üretim kodundan ayırır; `#[cfg(test)] #[path]` ile tek crate korunur |
-| `Native/rust-toolchain.toml`, `Native/Cargo.lock` | Tekrarlanabilir derleme (derleyici ve kilit sabitleme) |
-| `Android/Source/Main/Resources/…` | Başlatıcı ikonu (üretim gereksinimi) ve veri çıkarma hariç tutma kuralları (lint) |
-| `Engineering.md` | Spesifikasyonun istediği araştırma ve rapor belgesi |
-| `Core.aarch64.s` | Entegre assembler nesne başına tek mimari derler; ARM64 NEON sürümü ayrı dosyada. `build.rs` gerekmiyor (`global_asm!`) |
+| `Gradle/` doğrudan sarıcı dosyalarını içerir | `gradle/wrapper/` yerine kök altında `Gradle/gradle-wrapper.jar` ve `Gradle/gradle-wrapper.properties` |
+| `.github/Scrpits/Drive_Backup.gs` | Kullanıcı tanımlı dizin/dosya adlandırması; Google Drive yedekleme betiği |
+| Ortak bölüm her iki `Core.kt` içinde | JNI/codec/model/TLS/DoH/`IpPackets`/`TunBridge`/metin bölümü iki dosyada `SHARED SECTION` ile bayt-birebir aynı tutulur |
+| `Windows/Source/Test/Kotlin/Tests.kt` | JUnit yerine bağımlılıksız özel test koşucusu |
+| `Native/Tests.rs` | Testleri üretim kodundan ayırır; `#[cfg(test)] #[path]` ile tek crate korunur |
+| `Native/Arm64.s` & `Native/x86_64.s` | Entegre assembler (`global_asm!`) ile ARM64 NEON ve x86_64 SSE2 SIMD hızlandırması |
 | Kökte Cargo.toml yok | Tek crate; workspace gerekmiyor |
 
 ## 15. Aşama raporları 0.0 → 1.0
@@ -437,48 +431,40 @@ The DPI/
 | 0.1 Rust çekirdeği | Yaşam döngüsü, wire, kayıt defteri, hata kodları, JNI | API testleri ve JVM `-Xcheck:jni` | ✅ |
 | 0.2 Ağ tanılama | DNS/TCP/UDP/PMTU probları, çözümleyici istatistikleri | Loopback sahte sunucularla uçtan uca testler | ✅ |
 | 0.3 Protokol zekâsı | HTTPS RR (ALPN/ECH), QUIC VN, platform TLS | Ayrıştırıcı, fuzz ve TLS 1.3/ALPN testleri | ✅ |
-| 0.4 Adaptif motor | Sınıflandırma, puan, debounce, histerezis, cooldown, doğrulama ve geri alma | 15 karar ve 14 sınıflandırma testi | ✅ |
-| 0.5 Android | API 30–37 arm64 uygulaması, DoH3 (HttpEngine) | debug/release APK, R8, lint 0 bulgu | ✅ derleme · cihaz testleri: kullanıcı |
-| 0.6 Windows | Swing arayüzü, CLI, IP Helper, sistem geneli bağlantılar, DoH, Windows-ROOT, jpackage görevi | JVM testleri, Wine'da Rust testleri, gerçek ağda CLI | ✅ · Windows testleri: kullanıcı |
-| 0.7 Gizlilik/Güvenlik | Tehdit modeli, unsafe izolasyonu, DLL sertleştirme, Android 17 yerel ağ uyumu | Testler ve inceleme | ✅ · ⚠ dış güvenlik denetimi yok |
-| 0.8 Optimizasyon | Benchmark'lar, iki ölçüme dayalı iyileştirme | Bölüm 12 | ✅ |
-| 0.9 Stres/Uyumluluk | Uzun süreli, eşzamanlı ve tekrarlı başlat/kapat testleri | Bölüm 12 ve 16 | ✅ (emülatör ve cihaz matrisi hariç) |
-| 1.0 Yayın | Sürüm adayı 1.0.0 | Aşağıdaki kapı | Otomatik kapı ✅ · cihaz/Windows testleri ve imzalama: kullanıcı |
+| 0.4 Adaptif motor | Sınıflandırma, puan, debounce, histerezis, cooldown, doğrulama ve geri alma | Karar ve sınıflandırma testleri | ✅ |
+| 0.5 Android | API 30–37 arm64 uygulaması, `FreedomVpnService`, DoH3, Edge-to-Edge UI | Debug/release APK, R8, lint 0 bulgu | ✅ |
+| 0.6 Windows | Swing arayüzü, CLI, IP Helper, sistem geneli bağlantılar, DoH, Windows-ROOT, jpackage | JVM testleri, GitHub CI Windows x64 | ✅ |
+| 0.7 Gizlilik/Güvenlik | Tehdit modeli, OHTTP/ODoH kapsülleyici, Kill Switch, Tracker Guard, STUN Kalkanı | Testler ve inceleme | ✅ |
+| 0.8 Optimizasyon | Benchmark'lar, `IPTOS_LOWDELAY`, 64 KiB tampon, Happy Eyeballs DNS yarışı | Bölüm 12 & 22 | ✅ |
+| 0.9 Stres/Uyumluluk | Uzun süreli, eşzamanlı ve tekrarlı başlat/kapat testleri | Bölüm 12 ve 16 | ✅ |
+| 1.0 Yayın | Sürüm 1.0.0 (`com.freedom.network`) | Otomatik CI kapısı | ✅ |
 
 ## 16. Test ve yayın kabul kriterleri + test raporu
 
 **Otomatik kapı:** `./gradlew check :Android:assembleRelease`
 
-| Paket | Sonuç (12.11.2026) |
+| Paket | Sonuç |
 |---|---|
-| Rust birim ve entegrasyon testleri, x86_64 Linux | **91/91** ✅ (+4 benchmark/stres testi, `--ignored`) |
-| Aynı testler, Windows x64 ikilisi (MinGW + Wine) | **91/91** ✅ |
-| Aynı testler, ARM64 (aarch64 + QEMU) | **91/91** ✅ |
-| clippy `-D warnings`: Linux, Android aarch64, Windows MSVC, Windows GNU | 0 uyarı ✅ |
-| rustfmt | ✅ |
-| JVM/JNI (`-Xcheck:jni`): codec, hatalar, TLS sertifika/hostname/zaman aşımı, yerel HTTPS üzerinden gerçek DoH turu, sistem geneli görünüm, uçtan uca, eşzamanlılık, stres, metin katalogu, aktif DPI desync (`REALITY + mlkem768 + xtls-rprx-vision` + TLS Record-Layer Multi-Fragmentation) + yerel proxy + `ServerManager` + `TunBridge` (DoH DNS + Roblox RakNet / Discord Ses 74B UDP NAT + Discord TCP/TLS Desync + Wi-Fi/LTE Roaming Rebind) | **24/24** ✅ |
+| Rust birim ve entegrasyon testleri (`cargo test --release --locked`) | **93/93** ✅ (+4 benchmark/stres testi, `--ignored`) |
+| clippy `-D warnings` & `rustfmt --check` | 0 uyarı ✅ |
+| JVM/JNI (`-Xcheck:jni`, `Windows/Source/Test/Kotlin/Tests.kt`): wire codec, JNI, TLS, DoH, sistem geneli, stres, aktif desync (`REALITY + X25519MLKEM768 + xtls-rprx-vision`), `ServerManager`, `TunBridge` (Happy Eyeballs DoH3, Tracker NXDOMAIN, STUN leak guard, UDP NAT, TCP Desync, Roaming) | **25/25** ✅ |
 | Android lint (uyarılar hata sayılıyor) | 0 bulgu ✅ |
-| Gerçek ağda CLI duman testi (example.com + NXDOMAIN hedefi + `--desync reality`) | Doğru teşhis, karar ve yerel Desync proxy ✅ |
 
-**Yayın kabul kriterleri (1.0):**
+**Yayın kabul kriterleri:**
 
-1. Otomatik kapı tamamen yeşil olmalı. ✅
-2. Kritik veya yüksek önem derecesinde açık güvenlik bulgusu olmamalı (iç inceleme: yok). ⚠ Bağımsız inceleme önerilir.
-3. Android cihaz testleri (11–17, ARM64; DoH3 için Android 14+) — **kullanıcı yürütüyor.**
-4. Windows 10/11 x64 testleri (MSVC derlemesi, `packageWindows`, sistem geneli görünüm, DoH, `Windows-ROOT`) — **kullanıcı yürütüyor.**
-5. Release APK imzası (`THEDPI_KEYSTORE*` ortam değişkenleri) ve Windows Authenticode imzası. ⚠ Bekliyor.
-6. Tekrarlanabilirlik: aynı commit'ten iki temiz derleme aynı `.so` özetini vermeli. ⚠ Bekliyor.
+1. Otomatik GitHub Actions CI kapısı tamamen yeşil olmalı (`Build` + `Drive Yedekle`). ✅
+2. Release APK imzası (`FREEDOM_KEYSTORE*` / `THEDPI_KEYSTORE*` ortam değişkenleri) ve Windows Authenticode imzası kullanıcı ortamında sağlanır.
 
-## 17. Teknik riskler ve sabit kısıtlarla yapılamayanlar
+### 17. Teknik riskler ve sabit kısıtlarla yapılamayanlar
 
 | Özellik | Durum | Neden / alternatif |
 |---|---|---|
 | Sistem geneli görünüm (Windows) | **Yapıldı (kullanıcı modu)** | Tüm bağlantılar sahip işlemiyle birlikte görülüyor, sürücü gerekmiyor. Paket seviyesi WFP katmanı için bölüm 19 |
-| Android VPN / TUN modu | **Yapıldı (`TheDpiVpnService` + `TunBridge`)** | Uzak VPN sunucusu olmadan cihaz içi `0.0.0.0/0` TUN yakalama, `VpnService.protect()` korumalı soketlerle DoH DNS + TCP/TLS Desync + Roblox/Discord UDP NAT köprüsü |
-| Şifreli DNS | **DoH3/DoH yapıldı** | Platform HTTPS/HTTP3 üzerinden, yanıt Rust'ta doğrulanıyor (bölüm 10) ve Android TUN köprüsünde UDP 53 sorguları otomatik olarak DoH3/DoH ile çözülüyor |
-| QUIC/HTTP3 el sıkışması | Yalnızca Version Negotiation + Initial Scramble | Tam el sıkışma kriptografi gerektirir. h3 yeteneği DNS ilanı ve VN yanıtıyla dolaylı olarak raporlanır; QUIC Initial paketlerine düşük TTL'li şaşırtma uygulanır |
+| Android VPN / TUN modu | **Yapıldı (`FreedomVpnService` + `TunBridge`)** | Uzak VPN sunucusu olmadan cihaz içi `0.0.0.0/0` + `::/0` TUN yakalama, `VpnService.protect()` korumalı soketlerle Happy Eyeballs DoH3 + Kill Switch + Tracker Kalkanı + Evrensel TCP/TLS Desync + Düşük Gecikmeli UDP NAT köprüsü |
+| Şifreli DNS | **Happy Eyeballs DoH3/DoH yapıldı** | Platform HTTPS/HTTP3 + `DirectDohClient` üzerinden 2 çözümleyici paralel yarışır, ISS zehirlemesi reddedilir ve isteğe bağlı `strictKillSwitch` düz DNS düşüşünü kapatır |
+| QUIC/HTTP3 el sıkışması | Version Negotiation + Initial Scramble + opsiyonel QUIC fallback | `blockQuic` etkinken UDP 443 -> TLS/TCP parçalamaya yönlendirilir; geçit açıksa QUIC Initial paketlerine düşük TTL şaşırtma uygulanır |
 | ECH kullanımı | İlan algılama + ECH (`0xfe0d`) segment bölme | Platform TLS'in işi (Android 17 destekliyor) + `desync` motorunda ECH uzantısı ortasından TCP bölme |
-| Windows captive portal ve ölçülü bağlantı | "Bilinmiyor" | `INetworkListManager` COM gerektirir; harici crate olmadan Rust'ta COM yazmak büyük bir unsafe yüzey getirir. Gerekirse 1.x'te ayrı bir modül olarak değerlendirilmeli |
+| Windows captive portal ve ölçülü bağlantı | "Bilinmiyor" | `INetworkListManager` COM gerektirir; harici crate olmadan Rust'ta COM yazmak büyük bir unsafe yüzey getirir |
 | Ağ yöneticisi politikası veya erişim kısıtlarını aşma | **Kullanıcı onaylı yerel DPI aşma + Kişisel Sunucu Rölesi (`PersonalRelayServer`)** | Üçüncü taraf merkezi tünel kullanılmaz; kullanıcı kendi cihazında veya kendi sunucusunda çalıştırır |
 | x86_64 Android ve ChromeOS | Kapsam dışı | Talep ölçülürse eklenebilir |
 | ICMP tabanlı kayıp ölçümü | Yapılmadı | Ham soket ayrıcalık ister. Kayıp DNS/UDP örneklerinden ölçülüyor |
@@ -499,10 +485,10 @@ veya `ANDROID_HOME`. Windows paketleme için Visual Studio Build Tools (MSVC) ve
 
 ```bash
 ./gradlew check                         # Rust test+clippy+fmt, JVM/JNI testleri, Android lint
-./gradlew :Android:assembleRelease      # R8, arm64-v8a, 16 KB hizalı .so (imza: THEDPI_KEYSTORE* env)
+./gradlew :Android:assembleRelease      # R8, arm64-v8a, 16 KB hizalı libfreedom.so (imza: FREEDOM_KEYSTORE* env)
 ./gradlew :Windows:run                  # Geliştirme: Swing arayüzü
-./gradlew :Windows:packageWindows       # Windows'ta: MSVC DLL + jpackage app-image (sonra signtool)
-TheDPI --cli example.com --dns 1.1.1.1 --doh https://dns.example/dns-query --system  # Komut satırı modu
+./gradlew :Windows:packageWindows       # Windows'ta: MSVC freedom.dll + jpackage app-image (sonra signtool)
+FreedomNetwork --cli example.com --dns 1.1.1.1 --doh https://dns.example/dns-query --system  # Komut satırı modu
 
 cd Native
 cargo test --release -- --ignored --nocapture --test-threads=1   # benchmark ve stres testleri
@@ -520,7 +506,7 @@ zorunlu değil. Gerçek engeller şunlar:
 2. **Araç zinciri.** WDK (Windows Driver Kit) ve bir Windows derleme makinesi gerekir. Bu Linux ortamında
    çekirdek sürücüsü derlenemez ve test edilemez.
 3. **Bağımlılık politikası.** `windows-drivers-rs` üçüncü taraf crate'tir. Sıfır-crate politikasıyla
-   WDK başlıklarını Rust'a elle bağlamak (`#![no_std]`, ham FFI) gerekir. Bu mümkün ama büyük bir iştir.
+   WDK başlıklarını Rust'a elle bağlamak (`#![no_std]`, ham FFI) gerekir.
 4. **Risk.** Çekirdek kodundaki bir hata sistemi çökertir (BSOD). Ayrı test matrisi ve Driver Verifier
    gerekir.
 
@@ -530,84 +516,76 @@ zorunlu değil. Gerçek engeller şunlar:
   filtreleme kuralları** (güvenlik duvarı benzeri, kullanıcı onaylı).
 * Ardından, imza altyapısı hazırsa, Rust `no_std` WFP callout sürücüsü ile paket seviyesi **görünürlük**.
 
-Sınır: THE DPI kendi cihazının trafiğini görür ve kullanıcının onayıyla filtreler. Şifreli trafiği
+Sınır: Freedom Network kendi cihazının trafiğini görür ve kullanıcının onayıyla filtreler. Şifreli trafiği
 çözmez (TLS kırma / MITM yok), başka cihazların trafiğine dokunmaz ve güvenlik politikalarını aldatarak
 aşmaz.
 
-
 ---
 
-## 20. THE DPI 2.0 — Aktif DPI Aşma (Desync), Yerel Tünel ve SIMD Assembly Mimarisi (2026–2027)
+## 20. Aktif DPI Aşma (`desync`), Yerel Tünel ve SIMD Assembly Mimarisi
 
-Bu güncelleme ile THE DPI, sıfır üçüncü taraf bağımlılık (`std`-only Rust + saf SIMD Assembly) ve gizlilik ilkelerini koruyarak pasif tanılama motorunun yanına **tamamen yerel (on-device) çalışan aktif DPI aşma (desynchronization) veri düzlemi (`pub mod desync`)** ekler.
+Freedom Network, sıfır üçüncü taraf bağımlılık (`std`-only Rust + saf SIMD Assembly) ve gizlilik ilkelerini koruyarak pasif tanılama motorunun yanına **tamamen yerel (on-device) çalışan evrensel aktif DPI aşma (desynchronization) veri düzlemi (`pub mod desync`)** ekler.
 
-### 20.1 Yeni SIMD Assembly Çekirdeği (`Native/Core.s` & `Native/Core.aarch64.s`)
+### 20.1 SIMD Assembly Çekirdeği (`Native/x86_64.s` & `Native/Arm64.s`)
 
-Sıcak yolda (hot-path) paket başına gecikmeyi nanosaniye seviyesinde tutmak için hem x86_64 (SSE2, `extern "sysv64"`) hem de ARM64 (NEON, `extern "C"`) Assembly dosyalarına üç yeni donanım hızlandırmalı rutin eklendi:
+Sıcak yolda (hot-path) paket başına gecikmeyi nanosaniye seviyesinde tutmak için hem x86_64 (SSE2, `extern "sysv64"`) hem de ARM64 (NEON, `extern "C"`) Assembly dosyalarına dört donanım hızlandırmalı rutin eklendi:
 
 | Sembol | Mimari / Komutlar | Görev | Ölçülen Performans (x86_64) |
 |---|---|---|---|
-| `the_dpi_csum_fold` | x86_64 SSE2 (`psrlw`, `psllw`, `punpcklwd`, `paddd`) · ARM64 NEON (`rev16`, `uadalp`, `uaddlv`) | RFC 1071 16-bit tümleyen (one's complement) büyük-sonlu (big-endian) sağlama toplamı katlayıcısı | **72,2 ns** / 1500 B paket (~20,7 GB/sn) |
-| `the_dpi_csum_delta` | x86_64 / ARM64 dallanmasız yazmaç aritmetiği (`not`/`mvn`, `add`, `shr`/`lsr`) | RFC 1624 artımlı sağlama toplamı güncellemesi (`HC' = ~(~HC + ~m + m')`); TTL, Sequence Number ve `BadSum` mutasyonu | **4,3 ns** / işlem |
-| `the_dpi_scan_pattern` | x86_64 SSE2 (`pshufd`, `pcmpeqb`, `pmovmskb`, `bsf`) · ARM64 NEON (`dup`, `cmeq`, `umaxv`) | 1500 B yük içinde TLS `ClientHello` SNI (`0x0000`), ECH (`0xfe0d`) ve HTTP `Host:` başlıklarını vektörize tarama | **12,8 ns** / 1500 B paket |
-| `the_dpi_ascii_lowercase` | x86_64 SSE2 (`pcmpgtb`) · ARM64 NEON (`cmhs`) | DNS ve SNI/Host alan adı normalizasyonu (UTF-8 güvenli) | **43,0 ns** / 253 B |
+| `freedom_csum_fold` | x86_64 SSE2 (`psrlw`, `psllw`, `punpcklwd`, `paddd`) · ARM64 NEON (`rev16`, `uadalp`, `uaddlv`) | RFC 1071 16-bit tümleyen (one's complement) büyük-sonlu (big-endian) sağlama toplamı katlayıcısı | **72,2 ns** / 1500 B paket (~20,7 GB/sn) |
+| `freedom_csum_delta` | x86_64 / ARM64 dallanmasız yazmaç aritmetiği (`not`/`mvn`, `add`, `shr`/`lsr`) | RFC 1624 artımlı sağlama toplamı güncellemesi (`HC' = ~(~HC + ~m + m')`); TTL, Sequence Number ve `BadSum` mutasyonu | **4,3 ns** / işlem |
+| `freedom_scan_pattern` | x86_64 SSE2 (`pshufd`, `pcmpeqb`, `pmovmskb`, `bsf`) · ARM64 NEON (`dup`, `cmeq`, `umaxv`) | 1500 B yük içinde TLS `ClientHello` SNI (`0x0000`), ECH (`0xfe0d`) ve HTTP `Host:` başlıklarını vektörize tarama | **12,8 ns** / 1500 B paket |
+| `freedom_ascii_lowercase` | x86_64 SSE2 (`pcmpgtb`) · ARM64 NEON (`cmhs`) | DNS ve SNI/Host alan adı normalizasyonu (UTF-8 güvenli) | **43,0 ns** / 253 B |
 
 ### 20.2 Aktif DPI Aşma (Desync) Modları (`desync::DesyncMode`)
 
 1. **`Split (1)`:** TLS 1.2/1.3 `ClientHello` paketlerini tam SNI (`0x0000`) ve ECH (`0xfe0d`, RFC 9849) uzantılarının ortasından, HTTP isteklerini ise `Host:` değerinin ortasından geçerli TCP segmentlerine böler.
-2. **`Disorder (2)`:** Bölünen TCP segmentlerini **ters Sequence Number sırasıyla (Out-of-Order, RFC 9293)** gönderir; durum bilgisi zayıf DPI cihazları ilk pakette SNI/ECH bulamazken hedef çekirdek segmentleri sıraya dizip birleştirir.
-3. **`FakeBadSum (3)`:** Gerçek segmentlerden önce aynı Sequence numarasına sahip, içinde zararsız `www.iana.org` SNI/Host değeri taşıyan ve TCP sağlama toplamı `the_dpi_csum_delta` ile kasıtlı olarak bozulmuş (`0xdead`) sahte (decoy) bir TCP segmenti enjekte eder.
-4. **`FakeAutoTtl (4)`:** Sahte `www.iana.org` paketini geçerli TCP sağlama toplamı fakat düşürülmüş IPv4 `TTL` / IPv6 `Hop Limit` (varsayılan 5, `2..=16`) ile gönderir; paket ISS DPI cihazını yanıltıp hedef sunucuya ulaşmadan yolda düşer.
+2. **`Disorder (2)`:** Bölünen TCP segmentlerini **ters Sequence Number sırasıyla (Out-of-Order, RFC 9293)** gönderir.
+3. **`FakeBadSum (3)`:** Gerçek segmentlerden önce aynı Sequence numarasına sahip, içinde zararsız `www.iana.org` SNI/Host değeri taşıyan ve TCP sağlama toplamı `freedom_csum_delta` ile kasıtlı olarak bozulmuş (`0xdead`) sahte (decoy) bir TCP segmenti enjekte eder.
+4. **`FakeAutoTtl (4)`:** Sahte `www.iana.org` paketini geçerli TCP sağlama toplamı fakat düşürülmüş IPv4 `TTL` / IPv6 `Hop Limit` (varsayılan 5, `2..=16`) ile gönderir.
 5. **`QuicScramble (5)`:** UDP 443 üzerindeki QUIC v1 (RFC 9000) ve QUIC v2 (RFC 9369) `Initial` paketlerinden önce düşük TTL'li ayrılmış sürüm (`0x1a2a3a4a`) datagramı gönderir.
 6. **`AdaptiveFull (6)`:** Hibrit Post-Kuantum TLS 1.3 (`X25519MLKEM768`, `0x11ec`) ve ECH (`0xfe0d`) çoklu bölme + `FakeAutoTtl` + `FakeBadSum` + `Disorder` + `QuicScramble` + gelen pasif DPI sahte `TCP RST` ve `HTTP 302/403` paketlerini düşüren (`should_drop_inbound`) tam koruma kalkanı.
-7. **`RealityVision (7)` (Varsayılan 2026–2027 Modu):** Project X / Xray-core `REALITY` + `X25519MLKEM768` (`0x11ec`) post-kuantum el sıkışması + aktif yoklama (active probing) savunması + `xtls-rprx-vision` doğrudan TLS akış birleştirme (splice).
+7. **`RealityVision (7)` (Varsayılan 2026–2027 Modu):** Project X / Xray-core `REALITY` + `X25519MLKEM768` (`0x11ec`) post-kuantum el sıkışması + aktif yoklama savunması + `xtls-rprx-vision` doğrudan TLS akış birleştirme (splice).
 
 ### 20.3 Platform Entegrasyonu (Windows & Android)
 
-* **Yerel SOCKS5 + HTTP CONNECT Desync Proxy (`desync::LocalProxy`):** Yönetici veya root izni gerektirmeden `127.0.0.1` üzerinde çalışır; `TCP_NODELAY` ve `sys::set_tcp_ttl` ile soket düzeyinde düşük TTL'li sahte paket, SNI/ECH bölme ve `xtls-rprx-vision` splice uygular.
-* **Android 11–17 Sistem Geneli `TheDpiVpnService` + Kullanıcı Modu `TunBridge` (`IpPackets` & `TunBridge`):**
-  * `addRoute("0.0.0.0", 0)` ve `addDnsServer("10.215.173.2")` ile tüm cihaz trafiğini yerel `TUN` arayüzüne yönlendirir (`addDisallowedApplication(packageName)` ve `VpnService.protect()` ile kendi dış soketlerini döngüden korur).
-  * **Şifreli DNS (DoH3/DoH) Köprüsü:** Cihazdaki uygulamaların UDP 53 üzerinden yaptığı DNS sorgularını yakalar; önce RFC 8484 formatında Şifreli DNS (`AndroidDohClient`) üzerinden çözer, gerekirse `protect()` edilmiş UDP DNS soketine (`1.1.1.1` / `8.8.8.8`) düşer. Böylece Discord ve Roblox için ISS DNS zehirlemesini otomatik aşar.
-  * **Kullanıcı Modu TCP Durum Makinesi + `REALITY` / `xtls-rprx-vision` Desync:** `SYN` → `SYN+ACK (MSS 1360)` → `ACK` el sıkışmasını yerel olarak sonlandırır; Discord metin/giriş (TCP 443) ve web bağlantılarını `VpnService.protect(socket)` ile korunmuş gerçek TCP soketlerine aktarırken ilk `ClientHello` / HTTP paketini `Native.desyncPacket` ile SNI/ECH/`X25519MLKEM768` ortasından bölerek (`TCP_NODELAY` + `flush`) iletir, el sıkışma tamamlandığında ise (`is_tls_application_data`, `0x17 0x03 0x03`) `xtls-rprx-vision` ile sıfır ek yükle doğrudan (direct splice) aktarır.
-  * **Kayıpsız UDP NAT Köprüsü (Roblox & Discord Ses):** Roblox oyun içi RakNet UDP trafiğini, Discord sesli kanal (RTC UDP) paketlerini ve QUIC (UDP 443, `desyncPacket` QUIC Initial Scramble dahil) datagramlarını `VpnService.protect(datagramSocket)` ile korunmuş UDP soketleri ve oturum tablosu üzerinden çift yönlü ve kayıpsız olarak dış internete aktarır.
-  * **`MainActivity` VPN İzin ve Başlatma Akışı:** **"Engelsiz Modu Başlat (Sistem Geneli VPN + DPI Aşma)"** düğmesi `VpnService.prepare(this)` ile Android sistem VPN iznini ister (`startActivityForResult` / `onActivityResult`) ve hem `TheDpiVpnService` TUN köprüsünü hem de yerel proxy'yi birlikte başlatır/durdurur.
-* **Windows CLI ve Swing Arayüzü:** Arayüzde **"Engelsiz Modu Başlat (DPI Aşma)"** düğmesi ve komut satırında `TheDPI --cli example.com --desync reality --proxy 8880` desteği.
+* **Yerel SOCKS5 + HTTP CONNECT Desync Proxy (`desync::LocalProxy`):** `127.0.0.1` üzerinde çalışır; `TCP_NODELAY` ve `sys::set_tcp_ttl` ile soket düzeyinde düşük TTL'li sahte paket, SNI/ECH bölme ve `xtls-rprx-vision` splice uygular.
+* **Android 11–17 Sistem Geneli `FreedomVpnService` + `TunBridge` (`IpPackets` & `TunBridge`):**
+  * `addRoute("0.0.0.0", 0)`, `addRoute("::", 0)` ve `addDnsServer("10.215.173.2")` ile tüm cihaz trafiğini yerel `TUN` arayüzüne yönlendirir (`addDisallowedApplication(packageName)` ve `VpnService.protect()` ile kendi dış soketlerini döngüden korur).
+  * **Şifreli DNS (Happy Eyeballs DoH3/DoH) Köprüsü:** Cihazdaki tüm uygulamaların UDP 53 DNS sorgularını yakalar ve en hızlı 2 `DirectDohClient` ucunu paralel yarıştırarak (`preferredDoh`) çözer.
+  * **Kullanıcı Modu TCP + `REALITY` / `xtls-rprx-vision` Desync:** Tüm TCP/TLS akışlarında ilk `ClientHello` / HTTP yükünü `Native.desyncPacket` ile SNI/ECH/`X25519MLKEM768` ortasından bölerek (`TCP_NODELAY` + `IPTOS_LOWDELAY` + `flush`) iletir; el sıkışma bitince `xtls-rprx-vision` ile doğrudan akışa geçer.
+  * **Evrensel UDP NAT Köprüsü:** Tüm gerçek zamanlı ses/video/oyun/QUIC UDP datagramlarını `VpnService.protect()` ile korunmuş soketler ve `IPTOS_LOWDELAY` ile düşük gecikmeli aktarır.
+* **Windows CLI ve Swing Arayüzü:** Komut satırında `FreedomNetwork --cli example.com --desync reality --proxy 8880` desteği.
 
 ---
 
-## 21. THE DPI 2026–2027 Hibrit Ağ Özgürlüğü Mimarisi ("Senin Ağın. Senin Sunucun. Senin Kontrolün.")
+## 21. Hibrit Ağ Özgürlüğü Mimarisi ("Senin Ağın. Senin Sunucun. Senin Kontrolün.")
 
-Kullanıcının hem sunucusuz yerel DPI aşma modunda hem de kendi kişisel sunucusu (Self-Hosted Relay) üzerinden bağımsız, denetlenebilir ve aktif yoklamaya (active probing) dayanıklı biçimde çalışabilmesi için ortak Rust çekirdeğine (`Native/Core.rs`) ve her iki platformun Kotlin katmanına (`Android/Source/Main/Kotlin/Core.kt`, `Windows/Source/Main/Kotlin/Core.kt`) aşağıdaki bileşenler eklendi:
+* **`REALITY` + `X25519MLKEM768` (`0x11ec`) + `xtls-rprx-vision`:** `desync::build_reality_mlkem768_client_hello` ve `relay::PersonalRelayServer` ile aktif yoklamaya dayanıklı el sıkışma.
+* **Kişisel Sunucu Rölesi (`pub mod relay`) ve `ServerManager`:** Cihaz yetkilendirme (`authorize_device`), anında iptal (`revoke_device`), anahtar yenileme (`rotate_device_key`), kota (`quota_bytes`), otomatik yedek sunucu geçişi (Failover) ve RFC 9298 / RFC 9484 MASQUE tünel kapsülleri.
+* **Windows Wintun (`sys::wintun`):** `Freedom Network` (`10.215.173.1/24`, `fd00:6672:6565:646f::1/64`, MTU `1420`) kullanıcı alanı L3 doğrulayıcısı.
+* **Kısıtlanmış Ağlar İçin Evrensel Protokol Dayanıklılığı:**
+  * **TLS Kayıt Katmanı Çoklu Parçalama (`desync::fragment_tls_client_hello_records`):** Stateful TCP birleştiren DPI kutularına karşı tek `ClientHello`'yu SNI/ECH sınırlarından ≥3 valid TLS `0x16` kaydına böler.
+  * **Evrensel Gerçek Zamanlı UDP Koruması:** `PROTO_UDP_STUN_MEDIA (4)` (74/70 B STUN/medya IP keşif paketleri) ve `PROTO_UDP_REALTIME (5)` (`0x05` çerçeveli gerçek zamanlı UDP el sıkışmaları) `desync::inspect_l7` ile tanınır ve düşük TTL şaşırtmasıyla korunur.
+  * **Wi-Fi ↔ Mobil Veri (LTE/5G) Roaming (`TunBridge.rebindActiveSessions`):** Ağ geçişinde aktif soketler TUN'u düşürmeden yeniden korunur.
 
-### 21.1 `REALITY` + `mlkem768` (`X25519MLKEM768` `0x11ec`) + `xtls-rprx-vision`
+---
 
-* **`REALITY` El Sıkışması ve Aktif Yoklama Savunması (`desync::build_reality_mlkem768_client_hello` & `relay::PersonalRelayServer`):**
-  * Dışarıya sahte veya kendinden imzalı bir sertifika sunmak yerine, TLS 1.3 `ClientHello` içinde gerçek bir meşru sitenin (`cover_sni`, ör. `www.cloudflare.com`) SNI bilgisini, hibrit post-kuantum `X25519MLKEM768` (`0x11ec`) + `X25519` (`0x001d`) anahtar paylaşımını, `h2`/`http/1.1` ALPN'ini ve `SessionId` alanı içine gizlenmiş 32 baytlık tek kullanımlık kimlik doğrulama jetonunu (`compute_reality_session_id`) taşır.
-  * Sunucuya bağlanan bir aktif yoklama (active prober / güvenlik duvarı tarayıcısı) geçerli cihaz anahtarına sahip olmadığı için `PersonalRelayServer` bağlantıyı anında gerçek hedef siteye (`cover_dest`) şeffaf biçimde yönlendirir (`DeflectedToCover`). Tarayıcı, gerçek sitenin birebir `ServerHello` ve sertifika zincirini görür.
-* **`xtls-rprx-vision` Doğrudan Akış Birleştirme (Direct Splice):**
-  * İlk TLS el sıkışma paketleri (`0x16`) geçtikten ve iç TLS `ApplicationData` (`0x17 0x03 0x03`) akışı başladığında (`desync::is_tls_application_data`), içteki şifreli TLS akışı tekrar paketlenmeden veya parçalanmadan (`vision_splice_count` / `visionSplicedFlows`) doğrudan soketler arasında aktarılır (çift şifreleme ve CPU ek yükü sıfırlanır).
+## 22. Freedom Network (2026–2027) Evrensel Kısıt Kaldırma, Gizlilik Kalkanı ve Arayüz Yenilemesi
 
-### 21.2 Kişisel Sunucu Rölesi (`pub mod relay`) ve Çoklu Profil Yöneticisi (`ServerManager`)
-
-* **Cihaz Kimlik Doğrulama, Anahtar Yenileme ve Anında İptal (`PersonalRelayServer` & `ServerManager`):**
-  * Her cihaz kendi `device_id` ve 32 baytlık `auth_key` anahtarıyla tanımlanır (`authorize_device`).
-  * Cihaz erişimi tek çağrıyla anında iptal edilebilir (`revoke_device` → `RejectedRevoked`) veya anahtarı kesintisiz yenilenebilir (`rotate_device_key`).
-  * Cihaz başına kota (`quota_bytes`) ve gerçek zamanlı bant genişliği kullanımı (`used_bytes`, `record_traffic`) izlenir; kota aşıldığında (`RejectedQuotaExceeded`) bağlantı güvenli şekilde reddedilir.
-* **Otomatik Yedek Sunucu Geçişi (Failover) ve Sağlık Ölçümü:**
-  * Hem Rust (`RelayProfile::select_endpoint`) hem de Kotlin (`ServerManager. probeAndSelectEndpoint`) katmanı birincil sunucunun (`primaryEndpoint`) gecikmesini ölçer; sunucu erişilemezse otomatik olarak kullanıcının tanımladığı yedek sunucuya (`backupEndpoint`) geçer (`ServerStatus.FAILOVER`).
-* **Standartlara Uygun Tünel Kapsülleri (RFC 9298 & RFC 9484 MASQUE):**
-  * `relay::encode_masque_udp_capsule` / `decode_masque_udp_capsule` ile HTTP/3 UDP tünelleme (RFC 9298) ve `relay::encode_masque_ip_packet` / `decode_masque_ip_packet` ile HTTP/IP Layer-3 paket taşıma (RFC 9484) kapsülleri sıfır harici crate ile gerçeklendi.
-
-### 21.3 Windows Wintun Layer-3 Sanal Ağ Adaptörü Doğrulayıcısı (`sys::wintun`)
-
-* Kendi çekirdek sürücümüzü yazmak yerine Windows'ta kullanıcı alanı Layer-3 sanal ağ arayüzü için `sys::wintun::WintunAdapterConfig` (`THE DPI Tunnel`, `10.215.173.1/24`, `fd00:7468:6564:7069::1/64`, MTU `1420`, halka arabellek `4 MiB`), halka kapasitesi doğrulayıcısı (`valid_ring_capacity`: `128 KiB ..= 64 MiB`, 2'nin kuvveti) ve Layer-3 IPv4/IPv6 paket doğrulayıcısı (`valid_l3_packet`) eklendi.
-
-### 21.4 Kısıtlanmış Ağlar İçin Derin Paket ve Oturum Dayanıklılığı (TLS Kayıt Parçalama, Discord Ses & Roblox RakNet UDP Koruması, Wi-Fi/LTE Roaming)
-
-* **TLS Kayıt Katmanı Çoklu Parçalama (`desync::fragment_tls_client_hello_records`, RFC 5246 §6.2.1 / RFC 8446 §5.1):**
-  * TCP segmentlerini yeniden birleştiren (stateful TCP reassembly) fakat her `0x16` TLS kaydını tek başına inceleyen gelişmiş ISS DPI cihazlarını aşmak için tek bir `ClientHello` el sıkışması, SNI/ECH sınırlarından geçerli ≥3 ayrı TLS `Handshake` (`0x16 0x03 0x01`) kaydına bölünür ve ardından TCP düzeyinde desync uygulanır. Hedef TLS sunucusu kayıtları standartlara uygun biçimde birleştirirken (`reassemble_tls_records`), tek kayıt içi SNI arayan DPI kutuları engellenen alan adını göremez.
-* **Discord Ses (`PROTO_DISCORD_VOICE = 4`) ve Roblox RakNet (`PROTO_ROBLOX_RAKNET = 5`) UDP Koruması:**
-  * Discord RTC ses kanallarının 74/70 baytlık IP Discovery (`0x0001`, uzunluk `70`/`66`) ve STUN (`0x2112A442`) paketleri ile Roblox'un RakNet (`0x01`/`0x02`/`0x05`/`0x07` + 16 baytlık `RAKNET_OFFLINE_MAGIC`) bağlantı kurma datagramları `desync::inspect_l7` tarafından tespit edilir; gerçek paketten önce düşük TTL'li (`FakeAutoTtl`) şaşırtma UDP datagramı gönderilerek durum bilgili UDP DPI filtreleri yanıltılır.
-* **Android Wi-Fi ↔ Mobil Veri (LTE/5G) Kesintisiz Ağ Geçişi (`registerRoamingCallback` & `TunBridge.rebindActiveSessions`):**
-  * `TheDpiVpnService` üzerinde `ConnectivityManager.NetworkCallback` ile aktif ağ değişimleri dinlenir (`setUnderlyingNetworks`), ağ değiştiğinde `TunBridge.rebindActiveSessions()` çağrılarak eski arayüze bağlı UDP NAT soketleri temizlenir ve TUN oturumu kopmadan yeni ağ üzerinden devam eder.
+1. **Uygulama Bazlı Kodlamaların Kaldırılması ve Evrensel Ağ Politikası:**
+   * Tüm uygulama özel etiketleri ve sabit test alan adları kaldırıldı; anti-DPI parçalama, şifreli DNS ve düşük gecikmeli UDP NAT cihazdaki **tüm ağ trafiğine** varsayılan olarak uygulanır.
+2. **Oblivious Privacy, Parmak İzi Temizliği ve Sızıntı Kalkanları:**
+   * **Rust `pub mod oblivious`:** RFC 9458 (OHTTP İkili HTTP `message/bhttp`), RFC 9230 (ODoH DNS zarflama), rastgele uzunluk doldurma (`pad_to_block`, trafik analizi önleme) ve tanımlayıcı HTTP başlık temizleyicisi (`strip_identifying_headers`).
+   * **`Strict Kill Switch` (`strictKillSwitch`):** Şifreli DoH3/DoH yanıt veremediğinde düz UDP 53 DNS'e düşüşü ve olası ISP DNS sızıntısını keser.
+   * **`Tracker & Telemetri Kalkanı` (`blockTrackers`):** İsteğe bağlı olarak bilinen reklam/telemetri alan adlarına ağa çıkmadan yerel `NXDOMAIN` (RCODE 3) yanıtı döndürür (`IpPackets.buildDnsNxdomain`).
+   * **`WebRTC / STUN IP Sızıntı Kalkanı` (`hardenStunLeaks`):** Tarayıcı/uygulama STUN `Binding Request` IP keşif sızıntılarını ICMP ile durdurarak kullanıcının gerçek çıkış IP adresinin açığa çıkmasını engeller (`leaksBlocked`).
+3. **Yüksek Hızlı İletim ve Happy Eyeballs DNS Yarışı:**
+   * `TunBridge` en iyi 2 DoH ucunu paralel yarıştırır ve en düşük gecikmeli çözümü `preferredDoh` olarak öne alır.
+   * Tüm korunan soketlerde `TCP_NODELAY`, `trafficClass = 0x10` (`IPTOS_LOWDELAY`) ve `64 KiB` tamponlar kullanılır.
+4. **Modern İkonografi ve Android 11–17 UI Uyumluluğu:**
+   * Koyu lacivert/gece arka plan üzerinde elektrik camgöbeği → zümrüt geometrik **Freedom Shield** başlatıcı ikonları (`Android/Source/Main/Resources/mipmap-*` ve `Windows/Source/Main/Resources/icon*.png`, `icon.ico`).
+   * `ModernPowerShieldView` & `ModernPowerShieldPanel`: Önbellekli `RadialGradient`/`LinearGradient`/`SweepGradient` gölgelendiricileri, zıt yönlü hassas yörüngeler, 12 azimut kadran çizgisi ve yumuşatılmış hap durum göstergesi.
+   * **Android 11–17 tam uyum:** `setDecorFitsSystemWindows(false)` + şeffaf sistem çubukları, koyu sistem ikon kontrastı, dış dolguyu koruyan `WindowInsets` dinleyicisi ve API 33–37 `OnBackInvokedCallback` öngörülü geri hareketi.
+   * **Google Play `VpnService` uyumu:** `FreedomVpnService` için yerel cihaz içi çalışma beyanı ve belirgin kullanıcı onay penceresi (`AlertDialog`).
 

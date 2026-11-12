@@ -1,4 +1,4 @@
-// THE DPI — Android module: API 30–37 (Android 11–17), arm64-v8a, Rust .so built by Cargo.
+// Freedom Network — Android module: API 30–37 (Android 11–17), arm64-v8a, Rust .so built by Cargo.
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -9,12 +9,12 @@ val nativeDir: Directory = rootProject.layout.projectDirectory.dir("Native")
 val jniOut = layout.buildDirectory.dir("generated/jniLibs")
 
 android {
-    namespace = "com.the.dpi"
+    namespace = "com.freedom.network"
     compileSdk = 37
     ndkVersion = "30.0.16248370"
 
     defaultConfig {
-        applicationId = "com.the.dpi"
+        applicationId = "com.freedom.network"
         minSdk = 30
         targetSdk = 37
         versionCode = 1
@@ -38,13 +38,13 @@ android {
     }
 
     // Release signing material is never committed: provided through the environment only.
-    val keystore = System.getenv("THEDPI_KEYSTORE")
+    val keystore = System.getenv("FREEDOM_KEYSTORE") ?: System.getenv("THEDPI_KEYSTORE")
     if (keystore != null) {
         signingConfigs.create("release") {
             storeFile = file(keystore)
-            storePassword = System.getenv("THEDPI_KEYSTORE_PASSWORD")
-            keyAlias = System.getenv("THEDPI_KEY_ALIAS")
-            keyPassword = System.getenv("THEDPI_KEY_PASSWORD")
+            storePassword = System.getenv("FREEDOM_KEYSTORE_PASSWORD") ?: System.getenv("THEDPI_KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("FREEDOM_KEY_ALIAS") ?: System.getenv("THEDPI_KEY_ALIAS")
+            keyPassword = System.getenv("FREEDOM_KEY_PASSWORD") ?: System.getenv("THEDPI_KEY_PASSWORD")
         }
     }
 
@@ -95,7 +95,7 @@ kotlin {
 // ---- Rust core for arm64-v8a, linked with the NDK clang driver, 16 KB page aligned.
 val cargoBuildAndroid = tasks.register<Exec>("cargoBuildAndroid") {
     group = "build"
-    description = "Builds libthe_dpi.so for aarch64-linux-android with the NDK linker."
+    description = "Builds libfreedom.so for aarch64-linux-android with the NDK linker."
     mustRunAfter(":nativeFormatCheck", ":nativeLint", ":nativeTest", ":nativeBuildHost")
     val windowsHost = System.getProperty("os.name").startsWith("Windows")
     val hostTag = if (windowsHost) "windows-x86_64" else "linux-x86_64"
@@ -111,7 +111,7 @@ val cargoBuildAndroid = tasks.register<Exec>("cargoBuildAndroid") {
 
 val copyAndroidNative = tasks.register<Copy>("copyAndroidNative") {
     dependsOn(cargoBuildAndroid)
-    from(nativeDir.file("target/aarch64-linux-android/release/libthe_dpi.so"))
+    from(nativeDir.file("target/aarch64-linux-android/release/libfreedom.so"))
     into(jniOut.map { it.dir("arm64-v8a") })
 }
 

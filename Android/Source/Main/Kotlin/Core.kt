@@ -1,11 +1,11 @@
-// THE DPI — Android 11–17 application (Kotlin, native Android SDK Views, Rust .so via JNI).
+// Freedom Network — Android 11–17 application (Kotlin, native Android SDK Views, Rust .so via JNI).
 //
-// Self-contained: the JNI boundary (class thedpi.Native), the wire codec mirrored from
-// Native/Core.rs, typed models, the platform-TLS prober, the diagnostic session
+// Self-contained: the JNI boundary (class com.freedom.network.Native), the wire codec mirrored
+// from Native/Core.rs, typed models, the platform-TLS prober, the diagnostic session
 // orchestrator, the Turkish text catalogue, and this platform's integration.
 // The shared section below is kept byte-identical with the other platform module.
 
-package thedpi
+package com.freedom.network
 
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.CountDownLatch
@@ -38,6 +38,7 @@ import java.io.FileOutputStream
 import android.graphics.Path
 import android.graphics.LinearGradient
 import android.graphics.RadialGradient
+import android.graphics.SweepGradient
 import android.graphics.Shader
 import android.graphics.DashPathEffect
 import android.view.MotionEvent
@@ -70,6 +71,7 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -79,6 +81,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -108,10 +111,10 @@ import javax.net.ssl.SSLSocketFactory
 
 // ------------------------------------------------------------------ JNI
 
-/** The single JNI boundary. Symbols: Java_thedpi_Native_* in Native/Core.rs. */
+/** The single JNI boundary. Symbols: Java_com_freedom_network_Native_* in Native/Core.rs. */
 object Native {
     const val EXPECTED_API = 1
-    const val LIBRARY = "the_dpi"
+    const val LIBRARY = "freedom"
 
     /** Null when the native library loaded; otherwise the reason it did not. */
     val loadError: Throwable? = try {
@@ -1078,7 +1081,7 @@ object Text {
         0 -> "İşlem gerekmiyor."
         1 -> "IPv6 yolu çalışmıyor, IPv4 çalışıyor. Modem/yönlendirici IPv6 ayarlarını kontrol edin; gerekirse ağ bağdaştırıcısında IPv4'ü önceliklendirin (yönetici izni gerekir)."
         2 -> "IPv4 yolu çalışmıyor, IPv6 çalışıyor. Modem/yönlendirici IPv4 (NAT/DHCP) ayarlarını kontrol edin."
-        3 -> "Sistem DNS'i sorunlu görünüyor. Güvendiğiniz bir şifreli DNS hizmetini kendiniz seçip ayarlayabilirsiniz (Android: Ayarlar › Ağ › Özel DNS; Windows: Ayarlar › Ağ › DNS sunucusu ataması › Şifreli DNS). THE DPI sistem DNS'ini sessizce değiştirmez. Gizlilik notu: seçtiğiniz DNS sağlayıcısı sorgularınızı görür."
+        3 -> "Sistem DNS'i sorunlu görünüyor. Güvendiğiniz bir şifreli DNS hizmetini kendiniz seçip ayarlayabilirsiniz (Android: Ayarlar › Ağ › Özel DNS; Windows: Ayarlar › Ağ › DNS sunucusu ataması › Şifreli DNS). Freedom Network sistem DNS'ini sessizce değiştirmez. Gizlilik notu: seçtiğiniz DNS sağlayıcısı sorgularınızı görür."
         4 -> "UDP/443 (QUIC) yolu yanıt vermiyor; uygulamalar normalde HTTP/2 (TCP) ile otomatik devam eder. Sorun yaşarsanız tarayıcıda QUIC/HTTP3'ü kapatabilirsiniz."
         5 -> "Ölçülen yol MTU'su ${param} bayt. Büyük paketler yolda düşüyor olabilir; bağdaştırıcı MTU değerini bu değere düşürmeyi değerlendirin (yönetici izni gerekir)."
         6 -> "Ağ bir giriş sayfası (captive portal) istiyor. Tarayıcıda giriş yapın; ardından tekrar tanılayın."
@@ -1140,7 +1143,7 @@ object Text {
             43 -> "$s: sistem DNS'i alan adı yok diyor, bağımsız şifreli DNS (${Text.encProtocol(o.args.getOrNull(0)?.toInt() ?: 0)}) çözüyor — çözümleyici düzeyinde tutarsızlık"
             44 -> "$s: şifreli DNS de alan adının olmadığını doğruluyor"
             45 -> "$s: DNS yanıtı zehirlenmiş / sansür IP'sine yönlendirildi (${a(0)}.${a(1)}.${a(2)}.${a(3)})"
-            39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; THE DPI bu izni istemez). Bu bir ağ arızası değildir."
+            39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; Freedom Network bu izni istemez). Bu bir ağ arızası değildir."
             else -> "Gözlem ${o.code} $s ${o.args}"
         }
     }
@@ -1294,7 +1297,7 @@ object Text {
 
     fun serverManager(mgr: ServerManager): String = buildString {
         val list = mgr.list()
-        appendLine("THE DPI — KİŞİSEL SUNUCU YÖNETİCİSİ (${list.size} profil)")
+        appendLine("FREEDOM NETWORK — KİŞİSEL SUNUCU YÖNETİCİSİ (${list.size} profil)")
         for (p in list) {
             val kota = if (p.quotaBytes > 0) "${p.usedBytes}/${p.quotaBytes} bayt" else "${p.usedBytes} bayt (sınırsız)"
             appendLine("  • ${p.name} [${serverStatus(p.status)}] → ${p.activeEndpoint} (REALITY hedefi: ${p.coverDest} · cihaz: ${p.deviceId} · gecikme: ${p.latencyMs} ms · kayıp: %${p.lossPct} · kota: $kota)")
@@ -1303,10 +1306,10 @@ object Text {
 
     fun proxyStatus(p: ProxyStatus): String = buildString {
         if (!p.active) {
-            appendLine("ENGELSİZ MOD (YEREL DPI AŞMA): Kapalı")
+            appendLine("FREEDOM NETWORK (YEREL DPI AŞMA): Kapalı")
             return@buildString
         }
-        appendLine("ENGELSİZ MOD (YEREL DPI AŞMA): Etkin · 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
+        appendLine("FREEDOM NETWORK (YEREL DPI AŞMA): Etkin · 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         appendLine("  Strateji   : ${desyncMode(p.mode)}")
         appendLine("  İstatistik : bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped} · Vision doğrudan aktarım ${p.visionSplice}")
     }
@@ -1325,22 +1328,25 @@ object Text {
         tlsFragmented: Int = 0,
         bytesUp: Long = 0,
         bytesDown: Long = 0,
+        trackersBlocked: Int = 0,
+        leaksBlocked: Int = 0,
+        killSwitch: Boolean = false,
     ): String = buildString {
         if (!vpnActive && !p.active) {
-            appendLine("ENGELSİZ MOD (SİSTEM GENELİ VPN + DPI AŞMA): Kapalı")
+            appendLine("FREEDOM NETWORK (SİSTEM GENELİ ÖZGÜR AĞ): Kapalı")
             return@buildString
         }
         val modeDesc = if (vpnActive) {
-            "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · DoH DNS + REALITY/Vision Desync + Roblox/Discord UDP NAT)"
+            "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · Şifreli DoH3/ODoH + REALITY/Vision Desync + Tam UDP NAT)"
         } else {
             "Yerel Proxy (127.0.0.1:${p.port})"
         }
-        appendLine("ENGELSİZ MOD: Etkin · $modeDesc")
+        appendLine("FREEDOM NETWORK: Etkin · $modeDesc")
         if (p.active) {
             appendLine("  Yerel Proxy: 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         }
-        appendLine("  Strateji   : ${desyncMode(p.mode)}")
-        appendLine("  TUN Köprüsü: TCP $tcpFlows (Desync $desyncedFlows, TLS Kayıt Parçalama $tlsFragmented, Vision Splice $visionSplicedFlows) · UDP/Oyun-Ses $udpFlows (QUIC Geçişi $quicFallbacks) · DNS $dnsQueries (Şifreli DoH $dohResolved, Zehirlenme Engellendi $poisonedBlocked)")
+        appendLine("  Strateji   : ${desyncMode(p.mode)}${if (killSwitch) " · Sızdırmaz Kill Switch AKTİF" else ""}")
+        appendLine("  TUN Köprüsü: TCP $tcpFlows (Desync $desyncedFlows, TLS Kayıt Parçalama $tlsFragmented, Vision Splice $visionSplicedFlows) · Gerçek Zamanlı UDP $udpFlows (QUIC Geçişi $quicFallbacks) · DNS $dnsQueries (Şifreli DoH $dohResolved, Zehir $poisonedBlocked, İzleyici $trackersBlocked, Sızıntı Engeli $leaksBlocked)")
         if (bytesUp > 0 || bytesDown > 0) {
             appendLine("  Veri Akışı : Yükleme ${bytesUp / 1024} KB · İndirme ${bytesDown / 1024} KB")
         }
@@ -1961,8 +1967,69 @@ object IpPackets {
         return if (records.size > 1) records else tcpChunks
     }
 
-    /** Builds a 74-byte Discord Voice UDP IP Discovery packet (`0x00 0x01 0x00 0x46` + SSRC). */
-    fun buildDiscordVoiceIpDiscovery(ssrc: Int, address: String = "", port: Int = 0): ByteArray {
+    /** Extracts the lowercase QNAME from a standard DNS wire query packet, or null. */
+    fun parseDnsQuestionName(msg: ByteArray): String? {
+        if (msg.size < 13 || u16(msg, 4) == 0) return null
+        val sb = StringBuilder()
+        var pos = 12
+        var guard = 0
+        while (pos < msg.size && guard++ < 128) {
+            val len = msg[pos].toInt() and 0xFF
+            if (len == 0) break
+            if ((len and 0xC0) != 0) return null
+            if (pos + 1 + len > msg.size) return null
+            if (sb.isNotEmpty()) sb.append('.')
+            for (i in 1..len) {
+                val c = (msg[pos + i].toInt() and 0xFF)
+                sb.append(if (c in 65..90) (c + 32).toChar() else c.toChar())
+            }
+            pos += 1 + len
+        }
+        return if (sb.isEmpty()) null else sb.toString()
+    }
+
+    /** Synthesizes a fast local NXDOMAIN DNS answer (RCODE=3) preserving query ID and question. */
+    fun buildDnsNxdomain(query: ByteArray): ByteArray {
+        if (query.size < 12) return query.copyOf()
+        val end = skipDnsName(query, 12)
+        val qEnd = if (end in 13..(query.size - 4)) end + 4 else query.size
+        val out = ByteArray(qEnd)
+        System.arraycopy(query, 0, out, 0, qEnd)
+        out[2] = ((query[2].toInt() and 0x01) or 0x81).toByte() // QR=1, copy RD
+        out[3] = 0x83.toByte() // RA=1, RCODE=3 (NXDOMAIN)
+        out[4] = 0; out[5] = if (qEnd > 12) 1 else 0
+        out[6] = 0; out[7] = 0
+        out[8] = 0; out[9] = 0
+        out[10] = 0; out[11] = 0
+        return out
+    }
+
+    private val TRACKER_SUFFIXES = arrayOf(
+        "doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
+        "analytics.google.com", "adservice.google.com", "app-measurement.com", "appsflyer.com",
+        "adjust.com", "branch.io", "mixpanel.com", "amplitude.com", "hotjar.com",
+        "taboola.com", "outbrain.com", "criteo.com", "pubmatic.com", "rubiconproject.com",
+        "scorecardresearch.com", "quantserve.com", "unityads.unity3d.com",
+        "ads-api.tiktok.com", "analytics.tiktok.com", "ads.reddit.com", "telemetry.mozilla.org",
+    )
+
+    /** True when [host] matches a known advertising or behavioral telemetry tracker domain. */
+    fun isTrackerOrAdDomain(host: String): Boolean {
+        val h = host.lowercase().trimEnd('.')
+        return TRACKER_SUFFIXES.any { s -> h == s || h.endsWith(".$s") }
+    }
+
+    /** True when [payload] is a classic STUN Binding Request / IP Discovery packet (`0x0001`). */
+    fun isStunBindingRequest(payload: ByteArray): Boolean {
+        if (payload.size < 20) return false
+        val msgType = u16(payload, 0)
+        if (msgType != 0x0001) return false
+        val magic = u32(payload, 4)
+        return magic == 0x2112A442L || payload.size == 74
+    }
+
+    /** Builds a 74-byte STUN UDP IP Discovery packet (`0x00 0x01 0x00 0x46` + SSRC). */
+    fun buildStunIpDiscovery(ssrc: Int, address: String = "", port: Int = 0): ByteArray {
         val pkt = ByteArray(74)
         putU16(pkt, 0, 0x0001)
         putU16(pkt, 2, 70)
@@ -1973,8 +2040,8 @@ object IpPackets {
         return pkt
     }
 
-    /** Builds a Roblox RakNet `ID_OPEN_CONNECTION_REQUEST_1` (`0x05`) UDP handshake datagram. */
-    fun buildRobloxRakNetOpenConnectionRequest1(totalSize: Int = 48): ByteArray {
+    /** Builds a real-time UDP protocol handshake datagram (`0x05` + offline framing magic). */
+    fun buildRealtimeUdpHandshake(totalSize: Int = 48): ByteArray {
         val size = maxOf(18, totalSize)
         val pkt = ByteArray(size)
         pkt[0] = 0x05
@@ -1985,7 +2052,7 @@ object IpPackets {
             0x12, 0x34, 0x56, 0x78,
         )
         System.arraycopy(magic, 0, pkt, 1, magic.size)
-        pkt[17] = 11 // RakNet protocol version
+        pkt[17] = 11
         return pkt
     }
 }
@@ -1993,12 +2060,10 @@ object IpPackets {
 /**
  * RFC 8484 DoH client that needs **no DNS of its own**: endpoints are IP literals
  * (`https://1.1.1.1/dns-query`) or well-known resolver names mapped to their anycast IPs, so
- * the ISP resolver (which answers `discord.com` with the `195.175.254.2` block page) is never
+ * the ISP resolver (which may return poisoned sinkhole IPs such as `195.175.254.2`) is never
  * consulted and a VPN TUN cannot recurse into itself. Every socket is passed to
- * [protectSocket] (Android `VpnService.protect`). IP-literal hosts send no SNI; the server
- * certificate is validated by the platform trust store and the host/IP SAN is verified
- * through endpoint identification plus an optional platform [verifier]. HTTP/1.1
- * keep-alive connections are pooled per endpoint.
+ * [protectSocket] (Android `VpnService.protect`). Requests send minimal zero-fingerprint headers
+ * over pooled HTTP/1.1 keep-alive connections and verify server identity via HTTPS SAN rules.
  */
 class DirectDohClient(
     private val protectSocket: (Socket) -> Boolean = { true },
@@ -2033,7 +2098,7 @@ class DirectDohClient(
             try {
                 conn.sock.soTimeout = timeoutMs
                 val hostHeader = if (host.contains(':')) "[$host]" else host
-                val head = "POST $path HTTP/1.1\r\nHost: $hostHeader\r\nUser-Agent: TheDPI\r\n" +
+                val head = "POST $path HTTP/1.1\r\nHost: $hostHeader\r\n" +
                     "Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n" +
                     "Content-Length: ${body.size}\r\nConnection: keep-alive\r\n\r\n"
                 conn.out.write(head.toByteArray(Charsets.US_ASCII))
@@ -2164,21 +2229,20 @@ class DirectDohClient(
 }
 
 /**
- * User-mode TUN -> Protected Socket Bridge (`tun2socks` + DoH DNS + UDP NAT + Active DPI Desync).
+ * Freedom Network User-Mode TUN -> Protected Socket Bridge (`tun2socks` + Happy Eyeballs DoH3 +
+ * Privacy/Tracker Shield + Strict Kill Switch + Universal TCP/TLS/ECH Desync + Low-Latency UDP NAT).
  *
- * Bridges raw IPv4 packets from the Android `VpnService` TUN descriptor (`0.0.0.0/0`) to real
- * outbound TCP/UDP sockets protected with `VpnService.protect()`:
- * 1. **Encrypted DNS (UDP/TCP 53)**: Intercepts DNS queries and resolves them via RFC 8484
- *    DoH3/DoH (`DohClient`) first so ISP DNS poisoning on `discord.com` / `roblox.com` is
- *    bypassed; falls back to `protect()`ed UDP DNS sockets (`1.1.1.1` / `8.8.8.8`).
- * 2. **TCP + TLS/HTTP Desync (Discord TCP 443, HTTPS, Web)**: Terminates the local TUN TCP
- *    3-way handshake, inspects the initial `ClientHello` / HTTP request via the Rust+SIMD
- *    `desyncPacket` engine (`REALITY` + `X25519MLKEM768` + `xtls-rprx-vision`), writes the
- *    split `SNI`/`ECH`/`Host:` segments with `TCP_NODELAY` over a `protect()`ed outbound `Socket`,
- *    and directly splices subsequent TLS 1.3 `ApplicationData` records (`0x17 0x03 0x03`).
- * 3. **Lossless UDP NAT Relay (Roblox RakNet UDP, Discord Voice RTC UDP, QUIC UDP 443)**:
- *    Maintains per-flow NAT bindings over `protect()`ed `DatagramSocket`s and relays UDP
- *    datagrams bidirectionally with zero packet drops.
+ * Bridges raw IPv4/IPv6 packets from the TUN descriptor (`0.0.0.0/0` + `::/0`) to real outbound
+ * TCP/UDP sockets protected with `VpnService.protect()`:
+ * 1. **Encrypted DNS & Tracker Shield (UDP/TCP 53)**: Resolves via parallel Happy Eyeballs
+ *    RFC 8484 DoH3/DoH (`DohClient`), strips ISP DNS poisoning, and optionally blocks telemetry/ad
+ *    trackers (`blockTrackers`) and plaintext UDP fallback (`strictKillSwitch`).
+ * 2. **Universal TCP + TLS 1.3 / ECH / PQ Desync**: Terminates the local TUN TCP handshake,
+ *    fragments `SNI`/`ECH`/`Host:` across TLS records and TCP segments via the Rust+SIMD
+ *    `desyncPacket` engine (`REALITY` + `X25519MLKEM768` + `xtls-rprx-vision`), with `TCP_NODELAY`
+ *    and `IPTOS_LOWDELAY` socket tuning.
+ * 3. **Universal UDP NAT & Leak Protection**: Maintains per-flow NAT bindings for real-time audio,
+ *    video, QUIC, and interactive UDP streams, while optionally blocking STUN IP-discovery leaks.
  */
 class TunBridge(
     private val session: DiagnosticSession,
@@ -2196,6 +2260,9 @@ class TunBridge(
         dropRst = true,
     ),
     private val blockQuic: Boolean = true,
+    private val strictKillSwitch: Boolean = false,
+    private val blockTrackers: Boolean = false,
+    private val hardenStunLeaks: Boolean = false,
     private val logger: ((String, String) -> Unit)? = null,
 ) : AutoCloseable {
     private fun log(tag: String, msg: String) {
@@ -2207,7 +2274,7 @@ class TunBridge(
     private val running = AtomicBoolean(false)
     private val writeLock = Any()
     private val ioPool: ExecutorService = Executors.newCachedThreadPool { r ->
-        Thread(r, "thedpi-tun-io").apply { isDaemon = true }
+        Thread(r, "freedom-tun-io").apply { isDaemon = true }
     }
     private var readerThread: Thread? = null
     private val tcpTable = ConcurrentHashMap<FlowKey, TcpFlow>()
@@ -2228,6 +2295,8 @@ class TunBridge(
     val tlsRecordFragmented = AtomicInteger(0)
     val dnsCacheHits = AtomicInteger(0)
     val ipv6Rejected = AtomicInteger(0)
+    val trackersBlocked = AtomicInteger(0)
+    val leaksBlocked = AtomicInteger(0)
     val bytesUp = java.util.concurrent.atomic.AtomicLong(0)
     val bytesDown = java.util.concurrent.atomic.AtomicLong(0)
 
@@ -2247,8 +2316,11 @@ class TunBridge(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
-        log("TunBridge", "TunBridge worker başlatıldı (DoH=${dohEndpoints.size}, DNS=${upstreamDnsServers.size})")
-        readerThread = Thread({ readLoop() }, "thedpi-tun-reader").apply {
+        log(
+            "TunBridge",
+            "Freedom Network TunBridge başlatıldı (DoH=${dohEndpoints.size}, killSwitch=$strictKillSwitch, trackers=$blockTrackers, stunShield=$hardenStunLeaks)",
+        )
+        readerThread = Thread({ readLoop() }, "freedom-tun-reader").apply {
             isDaemon = true
             start()
         }
@@ -2303,7 +2375,7 @@ class TunBridge(
 
     private fun dispatchPacket(raw: ByteArray) {
         if (raw.isNotEmpty() && ((raw[0].toInt() ushr 4) and 0x0F) == 6) {
-            // IPv6 is not bridged: answer immediately so dual-stack apps switch to IPv4 at once.
+            // IPv6 is not bridged: answer immediately so dual-stack apps switch to IPv4 without leak.
             ipv6Rejected.incrementAndGet()
             IpPackets.buildIcmpv6Unreachable(raw)?.let { writeTun(it) }
             return
@@ -2315,9 +2387,13 @@ class TunBridge(
                 if (udp.dstPort == 53) {
                     handleDnsUdp(udp)
                 } else if (blockQuic && udp.dstPort == 443) {
-                    // QUIC Initial carries the SNI in a form the stream splitter cannot protect;
-                    // refuse it so Chrome/Discord/Roblox fall back to fragmented TLS over TCP.
+                    // When QUIC fallback protection is enabled, steer QUIC to fragmented TLS/TCP
+                    // so ISP SNI/ECH inspection cannot drop the session.
                     quicFallbacks.incrementAndGet()
+                    IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
+                } else if (hardenStunLeaks && IpPackets.isStunBindingRequest(udp.payload)) {
+                    // Prevent WebRTC/STUN IP discovery probes from exposing local/ISP IP addresses.
+                    leaksBlocked.incrementAndGet()
                     IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
                 } else {
                     handleUdp(udp)
@@ -2359,7 +2435,15 @@ class TunBridge(
 
     private fun resolveDnsQuery(query: ByteArray, @Suppress("UNUSED_PARAMETER") requestedServerIp: Int): ByteArray? {
         if (query.size < 12) return null
-        // 0) TTL-bounded cache keyed by the query without its ID
+        // 0) Privacy & Tracker Shield sinkhole before leaving the device
+        if (blockTrackers) {
+            val qname = IpPackets.parseDnsQuestionName(query)
+            if (qname != null && IpPackets.isTrackerOrAdDomain(qname)) {
+                trackersBlocked.incrementAndGet()
+                return IpPackets.buildDnsNxdomain(query)
+            }
+        }
+        // 1) TTL-bounded cache keyed by the query without its ID
         val cacheKey = query.copyOfRange(2, query.size).joinToString("") { "%02x".format(it) }
         val now = System.currentTimeMillis()
         dnsCache[cacheKey]?.let { (expiry, msg) ->
@@ -2375,7 +2459,7 @@ class TunBridge(
             dnsCache[cacheKey] = (now + ttl * 1000L) to msg
             return withId(msg, query)
         }
-        // 1) Encrypted DNS (RFC 8484, ID 0) — the ISP resolver is never consulted.
+        // 2) Encrypted DNS (RFC 8484, ID 0) with Happy Eyeballs parallel racing on top 2 resolvers
         val client = dohClient
         val endpoints = dohEndpoints.filter(Doh::validEndpoint)
         if (client != null && endpoints.isNotEmpty()) {
@@ -2383,8 +2467,41 @@ class TunBridge(
             dohWire[0] = 0
             dohWire[1] = 0
             val first = preferredDoh.coerceIn(0, endpoints.size - 1)
+            val tried = HashSet<Int>(2)
+            if (endpoints.size >= 2) {
+                val second = (first + 1) % endpoints.size
+                tried.add(first)
+                tried.add(second)
+                val winner = AtomicReference<Pair<Int, ByteArray>?>(null)
+                val done = CountDownLatch(1)
+                val finished = AtomicInteger(0)
+                for (cand in intArrayOf(first, second)) {
+                    ioPool.execute {
+                        try {
+                            val resp = runCatching { client.post(endpoints[cand], dohWire, 2200) }.getOrNull()
+                            val body = resp?.body
+                            if (resp?.transport == 1 && body != null && body.size >= 12) {
+                                if (IpPackets.containsPoisonedDns(body)) {
+                                    poisonedDnsBlocked.incrementAndGet()
+                                } else if (winner.compareAndSet(null, cand to body)) {
+                                    done.countDown()
+                                }
+                            }
+                        } finally {
+                            if (finished.incrementAndGet() >= 2) done.countDown()
+                        }
+                    }
+                }
+                runCatching { done.await(2300, TimeUnit.MILLISECONDS) }
+                winner.get()?.let { (winIdx, winBody) ->
+                    preferredDoh = winIdx
+                    dohResolved.incrementAndGet()
+                    return remember(winBody)
+                }
+            }
             for (k in endpoints.indices) {
                 val idx = (first + k) % endpoints.size
+                if (!tried.add(idx)) continue
                 val resp = runCatching { client.post(endpoints[idx], dohWire, 2500) }.getOrNull() ?: continue
                 val body = resp.body
                 if (resp.transport == 1 && body != null && body.size >= 12) {
@@ -2398,7 +2515,12 @@ class TunBridge(
                 }
             }
         }
-        // 2) Fallback: protected UDP to public resolvers only; injected/poisoned replies are skipped.
+        // Strict Kill Switch prevents plaintext DNS fallback when encrypted DoH fails.
+        if (strictKillSwitch) {
+            leaksBlocked.incrementAndGet()
+            return null
+        }
+        // 3) Fallback: protected UDP to public resolvers only; injected/poisoned replies are skipped.
         for (srv in upstreamDnsServers) {
             if (srv.isBlank()) continue
             val host = srv.substringBefore(':')
@@ -2460,7 +2582,9 @@ class TunBridge(
         val socket: DatagramSocket? = runCatching {
             DatagramSocket().also {
                 protectDatagram(it)
-                it.soTimeout = 30_000
+                runCatching { it.trafficClass = 0x10 }
+                runCatching { it.receiveBufferSize = 65536; it.sendBufferSize = 65536 }
+                it.soTimeout = 45_000
             }
         }.getOrNull()
         private val closed = AtomicBoolean(false)
@@ -2714,6 +2838,8 @@ class TunBridge(
                 sock.bind(null)
                 protectSocket(sock)
                 sock.tcpNoDelay = true
+                runCatching { sock.trafficClass = 0x10 }
+                runCatching { sock.receiveBufferSize = 65536; sock.sendBufferSize = 65536 }
                 runCatching { sock.keepAlive = true }
                 sock.soTimeout = 90_000
                 val dstInet = if (key.dstIp == virtualDnsIp) {
@@ -2731,7 +2857,7 @@ class TunBridge(
                 ioPool.execute { pumpOutbound(sock, out) }
 
                 val input = sock.getInputStream()
-                val buf = ByteArray(1360)
+                val buf = ByteArray(1400)
                 while (running.get() && !closed.get()) {
                     val n = input.read(buf)
                     if (n > 0) bytesDown.addAndGet(n.toLong())
@@ -2846,16 +2972,16 @@ class TunBridge(
 /**
  * CrashLogger & Dahili Debugger:
  * Uygulamanın Android 11–17 cihazlardaki tüm adımlarını, çökmelerini ve hata yığınlarını
- * doğrudan yerel depolama dizinine (`/Android/data/com.the.dpi/files/`) kaydeder.
+ * doğrudan yerel depolama dizinine (`/Android/data/com.freedom.network/files/`) kaydeder.
  *
- * Scoped Storage kuralları gereğince getExternalFilesDir(null) dizini (`/Android/data/com.the.dpi/files`)
+ * Scoped Storage kuralları gereğince getExternalFilesDir(null) dizini (`/Android/data/com.freedom.network/files`)
  * için herhangi bir özel çalışma zamanı izni (READ/WRITE_EXTERNAL_STORAGE) gerekmez.
  * Kullanıcı telefonundaki Dosya Yöneticisi ile doğrudan bu klasöre girip logları inceleyebilir.
  */
 object CrashLogger {
-    private const val TAG = "TheDpiCrashLogger"
-    private const val CRASH_FILE_NAME = "thedpi_crash.log"
-    private const val DEBUG_FILE_NAME = "thedpi_debug.log"
+    private const val TAG = "FreedomCrashLogger"
+    private const val CRASH_FILE_NAME = "freedom_crash.log"
+    private const val DEBUG_FILE_NAME = "freedom_debug.log"
     private const val MAX_DEBUG_LOG_BYTES = 1024 * 1024 // 1 MB döner günlük
 
     @Volatile private var appContext: Context? = null
@@ -2927,7 +3053,7 @@ object CrashLogger {
         val ctx = appContext
         val sb = java.lang.StringBuilder()
         sb.append("================================================================================\n")
-        sb.append("THE DPI (com.the.dpi) — ÇÖKME / HATA RAPORU (CRASH DUMP)\n")
+        sb.append("FREEDOM NETWORK (com.freedom.network) — ÇÖKME / HATA RAPORU (CRASH DUMP)\n")
         sb.append("Zaman          : $nowStr\n")
         sb.append("Cihaz          : ${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})\n")
         sb.append("Donanım        : Board=${Build.BOARD}, Hardware=${Build.HARDWARE}\n")
@@ -2959,7 +3085,7 @@ object CrashLogger {
         val report = sb.toString()
         android.util.Log.e(TAG, report)
 
-        // 1. Harici /Android/data/com.the.dpi/files/thedpi_crash.log
+        // 1. Harici /Android/data/com.freedom.network/files/freedom_crash.log
         try {
             val extDir = ctx?.getExternalFilesDir(null)
             if (extDir != null) {
@@ -2973,7 +3099,7 @@ object CrashLogger {
             }
         } catch (_: Throwable) {}
 
-        // 2. Dahili context.filesDir/thedpi_crash.log
+        // 2. Dahili context.filesDir/freedom_crash.log
         try {
             val intDir = ctx?.filesDir
             if (intDir != null) {
@@ -3017,23 +3143,23 @@ object CrashLogger {
 }
 
 /** Android Application sınıfı: Uygulama ayağa kalktığında ilk çalışan giriş noktası. */
-class TheDpiApp : Application() {
+class FreedomApp : Application() {
     override fun onCreate() {
         super.onCreate()
         CrashLogger.init(this)
-        CrashLogger.log("TheDpiApp", "==================================================")
-        CrashLogger.log("TheDpiApp", "The DPI (com.the.dpi) v1.0.0 Başlatıldı")
-        CrashLogger.log("TheDpiApp", "Cihaz: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, SDK ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.joinToString(", ")})")
+        CrashLogger.log("FreedomApp", "==================================================")
+        CrashLogger.log("FreedomApp", "Freedom Network (com.freedom.network) v1.0.0 Başlatıldı")
+        CrashLogger.log("FreedomApp", "Cihaz: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, SDK ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.joinToString(", ")})")
         if (Native.available) {
             try {
-                CrashLogger.log("TheDpiApp", "Native Rust motoru yüklendi: v${Native.engineVersion()} (API ${Native.apiVersion()})")
+                CrashLogger.log("FreedomApp", "Native Rust motoru yüklendi: v${Native.engineVersion()} (API ${Native.apiVersion()})")
             } catch (t: Throwable) {
-                CrashLogger.log("TheDpiApp", "Native motor sürüm sorgusunda hata: ${t.message}", t)
+                CrashLogger.log("FreedomApp", "Native motor sürüm sorgusunda hata: ${t.message}", t)
             }
         } else {
-            CrashLogger.log("TheDpiApp", "UYARI: Native Rust motoru yüklenemedi: ${Native.loadError?.message}", Native.loadError)
+            CrashLogger.log("FreedomApp", "UYARI: Native Rust motoru yüklenemedi: ${Native.loadError?.message}", Native.loadError)
         }
-        CrashLogger.log("TheDpiApp", "==================================================")
+        CrashLogger.log("FreedomApp", "==================================================")
     }
 }
 
@@ -3330,13 +3456,11 @@ class AndroidDohClient(
 /**
  * Local on-device Android VpnService that captures system-wide device traffic (`0.0.0.0/0`)
  * via a local TUN interface and bridges it to external networks through [TunBridge]:
- * - Encrypted DNS (DoH3/DoH) + protected UDP DNS fallback for port 53
- * - TCP/TLS 1.3 & HTTP Active Desync (`SNI`/`ECH`/`Host:` segmentation) over `protect()`ed sockets
- *   for Discord text/login (TCP 443) and web traffic
- * - Lossless UDP NAT forwarding over `protect()`ed `DatagramSocket`s for Roblox in-game RakNet
- *   traffic, Discord Voice RTC channels, and QUIC v1/v2.
+ * - Happy Eyeballs Encrypted DNS (DoH3/DoH) + Privacy Tracker Guard + Strict Kill Switch
+ * - Universal TCP/TLS 1.3 & ECH Active Desync (`SNI`/`ECH`/`Host:` segmentation)
+ * - Low-latency UDP NAT forwarding over `protect()`ed `DatagramSocket`s with WebRTC/STUN leak protection.
  */
-class TheDpiVpnService : VpnService() {
+class FreedomVpnService : VpnService() {
     @Volatile private var tun: ParcelFileDescriptor? = null
     @Volatile private var session: DiagnosticSession? = null
     @Volatile private var bridge: TunBridge? = null
@@ -3345,12 +3469,12 @@ class TheDpiVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
-        CrashLogger.log("TheDpiVpnService", "onCreate çağrıldı")
+        CrashLogger.log("FreedomVpnService", "onCreate çağrıldı")
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        CrashLogger.log("TheDpiVpnService", "onStartCommand çağrıldı (action=${intent?.action})")
+        CrashLogger.log("FreedomVpnService", "onStartCommand çağrıldı (action=${intent?.action})")
         if (intent?.action == ACTION_STOP) {
             stopTunnel()
             stopSelf()
@@ -3358,8 +3482,12 @@ class TheDpiVpnService : VpnService() {
         }
         val customDoh = intent?.getStringArrayListExtra(EXTRA_DOH)?.filter { it.isNotBlank() }.orEmpty()
         val customDns = intent?.getStringArrayListExtra(EXTRA_DNS)?.filter { it.isNotBlank() }.orEmpty()
+        val killSwitch = intent?.getBooleanExtra(EXTRA_KILL_SWITCH, true) ?: true
+        val blockTrackers = intent?.getBooleanExtra(EXTRA_BLOCK_TRACKERS, true) ?: true
+        val stunShield = intent?.getBooleanExtra(EXTRA_STUN_SHIELD, true) ?: true
+        val quicPassthrough = intent?.getBooleanExtra(EXTRA_QUIC_PASSTHROUGH, false) ?: false
         if (running.compareAndSet(false, true)) {
-            startTunnel(customDoh, customDns)
+            startTunnel(customDoh, customDns, killSwitch, blockTrackers, stunShield, quicPassthrough)
         }
         return START_STICKY
     }
@@ -3367,10 +3495,10 @@ class TheDpiVpnService : VpnService() {
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
-            "THE DPI Engelsiz Mod Tüneli",
+            "Freedom Network Özgür Ağ Tüneli",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "THE DPI sistem geneli TUN köprüsü ve sansür kalkanı durum bildirimi"
+            description = "Freedom Network sistem geneli şifreli TUN köprüsü ve sansür kalkanı"
             setShowBadge(false)
         }
         val nm = getSystemService(NotificationManager::class.java)
@@ -3389,14 +3517,14 @@ class TheDpiVpnService : VpnService() {
         val stopIntent = PendingIntent.getService(
             this,
             1,
-            Intent(this, TheDpiVpnService::class.java).apply {
+            Intent(this, FreedomVpnService::class.java).apply {
                 action = ACTION_STOP
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         return Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("THE DPI — Engelsiz Mod Aktif")
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setContentTitle("Freedom Network — Koruma Aktif")
             .setContentText(statusText)
             .setContentIntent(pendingIntent)
             .addAction(Notification.Action.Builder(null, "Durdur", stopIntent).build())
@@ -3405,19 +3533,26 @@ class TheDpiVpnService : VpnService() {
     }
 
     @android.annotation.SuppressLint("InlinedApi")
-    private fun startTunnel(customDoh: List<String>, customDns: List<String>) {
-        CrashLogger.log("TheDpiVpnService", "startTunnel başlatılıyor... (doh=${customDoh.size}, dns=${customDns.size})")
+    private fun startTunnel(
+        customDoh: List<String>,
+        customDns: List<String>,
+        killSwitch: Boolean,
+        blockTrackers: Boolean,
+        stunShield: Boolean,
+        quicPassthrough: Boolean,
+    ) {
+        CrashLogger.log("FreedomVpnService", "startTunnel başlatılıyor... (doh=${customDoh.size}, killSwitch=$killSwitch, trackers=$blockTrackers, stunShield=$stunShield)")
         createNotificationChannel()
-        val notif = buildNotification("Sistem Geneli TUN Köprüsü Devrede (DoH + REALITY/Vision)")
+        val notif = buildNotification("Sistem Geneli Şifreli Tünel Aktif (DoH3 + ECH/REALITY + Kalkan)")
         try {
             if (Build.VERSION.SDK_INT >= 34) { // Android 14+ (UPSIDE_DOWN_CAKE)
                 startForeground(NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             } else {
                 startForeground(NOTIFICATION_ID, notif)
             }
-            CrashLogger.log("TheDpiVpnService", "startForeground başarıyla çağrıldı (Foreground Service aktif).")
+            CrashLogger.log("FreedomVpnService", "startForeground başarıyla çağrıldı (Foreground Service aktif).")
         } catch (e: Throwable) {
-            CrashLogger.log("TheDpiVpnService", "startForeground uyarı/hata: ${e.message}", e)
+            CrashLogger.log("FreedomVpnService", "startForeground uyarı/hata: ${e.message}", e)
         }
 
         try {
@@ -3425,7 +3560,7 @@ class TheDpiVpnService : VpnService() {
             session = s
             s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
             val builder = Builder()
-                .setSession("THE DPI Engelsiz Mod")
+                .setSession("Freedom Network")
                 .setMtu(1500)
                 .addAddress(TunBridge.VPN_CLIENT_IP, 30)
                 .addRoute("0.0.0.0", 0)
@@ -3434,23 +3569,23 @@ class TheDpiVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
             builder.allowBypass()
             val disResult = runCatching { builder.addDisallowedApplication(packageName) }
-            CrashLogger.log("TheDpiVpnService", "addDisallowedApplication($packageName) -> ${if (disResult.isSuccess) "başarılı" else disResult.exceptionOrNull()?.message}")
+            CrashLogger.log("FreedomVpnService", "addDisallowedApplication($packageName) -> ${if (disResult.isSuccess) "başarılı" else disResult.exceptionOrNull()?.message}")
             // Route IPv6 into TUN so TunBridge answers with immediate ICMPv6 unreachable,
             // preventing dual-stack apps from leaking past the VPN to the ISP.
             runCatching {
-                builder.addAddress("fd00:7468:6564:7069::1", 64)
+                builder.addAddress("fd00:6672:6565:646f::1", 64)
                 builder.addRoute("::", 0)
             }
             val pfd = builder.EstablishSafe()
             tun = pfd
             if (pfd != null) {
-                CrashLogger.log("TheDpiVpnService", "TUN arabirimi başarıyla açıldı (fd=${pfd.fd})")
+                CrashLogger.log("FreedomVpnService", "TUN arabirimi başarıyla açıldı (fd=${pfd.fd})")
                 // Sockets inside DirectDohClient and TunBridge are explicitly protected with protect(),
-                // and com.the.dpi is excluded from VPN routing via addDisallowedApplication, preventing loops.
+                // and com.freedom.network is excluded from VPN routing via addDisallowedApplication.
                 val doh = DirectDohClient(
                     protectSocket = { sock ->
                         val ok = protect(sock)
-                        if (!ok) CrashLogger.log("TheDpiVpnService", "protectSocket(doh) false döndü!")
+                        if (!ok) CrashLogger.log("FreedomVpnService", "protectSocket(doh) false döndü!")
                         ok
                     },
                 )
@@ -3460,12 +3595,12 @@ class TheDpiVpnService : VpnService() {
                     tunOutput = FileOutputStream(pfd.fileDescriptor),
                     protectSocket = { sock ->
                         val ok = protect(sock)
-                        if (!ok) CrashLogger.log("TheDpiVpnService", "protectSocket(tun) false döndü!")
+                        if (!ok) CrashLogger.log("FreedomVpnService", "protectSocket(tun) false döndü!")
                         ok
                     },
                     protectDatagram = { ds ->
                         val ok = protect(ds)
-                        if (!ok) CrashLogger.log("TheDpiVpnService", "protectDatagram(tun) false döndü!")
+                        if (!ok) CrashLogger.log("FreedomVpnService", "protectDatagram(tun) false döndü!")
                         ok
                     },
                     dohClient = doh,
@@ -3477,25 +3612,28 @@ class TheDpiVpnService : VpnService() {
                         splitPos = 2,
                         dropRst = true,
                     ),
-                    blockQuic = true,
+                    blockQuic = !quicPassthrough,
+                    strictKillSwitch = killSwitch,
+                    blockTrackers = blockTrackers,
+                    hardenStunLeaks = stunShield,
                     logger = { tag, msg -> CrashLogger.log(tag, msg) },
                 )
                 bridge = b
                 ActiveBridgeHolder.current = b
                 isRunning.set(true)
                 b.start()
-                CrashLogger.log("TheDpiVpnService", "TunBridge döngüsü başlatıldı.")
+                CrashLogger.log("FreedomVpnService", "TunBridge döngüsü başlatıldı.")
                 val cm = getSystemService(ConnectivityManager::class.java)
                 cm?.activeNetwork?.let { activeNet ->
                     runCatching { setUnderlyingNetworks(arrayOf(activeNet)) }
                 }
                 registerRoamingCallback()
             } else {
-                CrashLogger.log("TheDpiVpnService", "TUN arabirimi açılamadı (pfd == null)!")
+                CrashLogger.log("FreedomVpnService", "TUN arabirimi açılamadı (pfd == null)!")
                 stopTunnel()
             }
         } catch (e: Throwable) {
-            CrashLogger.log("TheDpiVpnService", "startTunnel kritik hata: ${e.message}", e)
+            CrashLogger.log("FreedomVpnService", "startTunnel kritik hata: ${e.message}", e)
             stopTunnel()
         }
     }
@@ -3520,12 +3658,12 @@ class TheDpiVpnService : VpnService() {
         try {
             establish()
         } catch (t: Throwable) {
-            CrashLogger.log("TheDpiVpnService", "Builder.establish() başarısız: ${t.message}", t)
+            CrashLogger.log("FreedomVpnService", "Builder.establish() başarısız: ${t.message}", t)
             null
         }
 
     private fun stopTunnel() {
-        CrashLogger.log("TheDpiVpnService", "stopTunnel çağrıldı.")
+        CrashLogger.log("FreedomVpnService", "stopTunnel çağrıldı.")
         running.set(false)
         isRunning.set(false)
         ActiveBridgeHolder.current = null
@@ -3543,27 +3681,31 @@ class TheDpiVpnService : VpnService() {
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } catch (t: Throwable) {
-            CrashLogger.log("TheDpiVpnService", "stopForeground hatası: ${t.message}", t)
+            CrashLogger.log("FreedomVpnService", "stopForeground hatası: ${t.message}", t)
         }
     }
 
     override fun onRevoke() {
-        CrashLogger.log("TheDpiVpnService", "VPN izni kullanıcı veya sistem tarafından geri çekildi (onRevoke).")
+        CrashLogger.log("FreedomVpnService", "VPN izni kullanıcı veya sistem tarafından geri çekildi (onRevoke).")
         stopTunnel()
         super.onRevoke()
     }
 
     override fun onDestroy() {
-        CrashLogger.log("TheDpiVpnService", "onDestroy çağrıldı.")
+        CrashLogger.log("FreedomVpnService", "onDestroy çağrıldı.")
         stopTunnel()
         super.onDestroy()
     }
 
     companion object {
-        const val ACTION_STOP = "com.the.dpi.STOP_TUNNEL"
-        const val EXTRA_DOH = "com.the.dpi.EXTRA_DOH"
-        const val EXTRA_DNS = "com.the.dpi.EXTRA_DNS"
-        const val NOTIFICATION_CHANNEL_ID = "thedpi_vpn_channel"
+        const val ACTION_STOP = "com.freedom.network.STOP_TUNNEL"
+        const val EXTRA_DOH = "com.freedom.network.EXTRA_DOH"
+        const val EXTRA_DNS = "com.freedom.network.EXTRA_DNS"
+        const val EXTRA_KILL_SWITCH = "com.freedom.network.EXTRA_KILL_SWITCH"
+        const val EXTRA_BLOCK_TRACKERS = "com.freedom.network.EXTRA_BLOCK_TRACKERS"
+        const val EXTRA_STUN_SHIELD = "com.freedom.network.EXTRA_STUN_SHIELD"
+        const val EXTRA_QUIC_PASSTHROUGH = "com.freedom.network.EXTRA_QUIC_PASSTHROUGH"
+        const val NOTIFICATION_CHANNEL_ID = "freedom_vpn_channel"
         const val NOTIFICATION_ID = 2026
         val isRunning = AtomicBoolean(false)
     }
@@ -3573,12 +3715,11 @@ internal object ActiveBridgeHolder {
     @Volatile var current: TunBridge? = null
 }
 
-// Modern Vector Icon Renderer (Pure Canvas Path - Standard 24x24 Lucide / Feather Vector Geometry)
+// Modern Vector Icon Renderer (Pure Canvas Path - Standard 24x24 Lucide / Feather + Freedom Emblem Geometry)
 internal object AndroidVectorIcons {
-    // 24x24 standard vector paths (Lucide specifications)
+    // 24x24 standard vector paths
     // Preallocated once — zero memory allocations during Canvas onDraw!
     private val shieldPath = Path().apply {
-        // M12 2L20 5V12C20 18 12 22 12 22C12 22 4 18 4 12V5L12 2Z
         moveTo(12f, 2f)
         lineTo(20f, 5f)
         lineTo(20f, 12f)
@@ -3588,8 +3729,40 @@ internal object AndroidVectorIcons {
         close()
     }
 
+    // Faceted 24x24 Freedom Network Cyber Shield outer polygon & ascending wings
+    private val freedomOuterShield = Path().apply {
+        moveTo(12f, 1.8f)
+        lineTo(20.6f, 5.2f)
+        lineTo(19.4f, 13.8f)
+        lineTo(12f, 22.2f)
+        lineTo(4.6f, 13.8f)
+        lineTo(3.4f, 5.2f)
+        close()
+    }
+
+    private val freedomInnerCore = Path().apply {
+        moveTo(12f, 4.4f)
+        lineTo(17.9f, 6.8f)
+        lineTo(17.0f, 13.0f)
+        lineTo(12f, 19.2f)
+        lineTo(7.0f, 13.0f)
+        lineTo(6.1f, 6.8f)
+        close()
+    }
+
+    private val freedomUpperWing = Path().apply {
+        moveTo(7.8f, 11.4f)
+        lineTo(12f, 7.2f)
+        lineTo(16.2f, 11.4f)
+    }
+
+    private val freedomLowerWing = Path().apply {
+        moveTo(8.8f, 14.4f)
+        lineTo(12f, 11.2f)
+        lineTo(15.2f, 14.4f)
+    }
+
     private val boltPath = Path().apply {
-        // M13 2L3 14H12L11 22L21 10H12L13 2Z
         moveTo(13f, 2f)
         lineTo(3f, 14f)
         lineTo(12f, 14f)
@@ -3608,7 +3781,8 @@ internal object AndroidVectorIcons {
     }
     private val lockBodyRect = RectF(4f, 11f, 20f, 22f)
 
-    private val gamepadBodyRect = RectF(2f, 6f, 22f, 18f)
+    private val radarOuterCircle = RectF(3f, 3f, 21f, 21f)
+    private val radarInnerCircle = RectF(7.5f, 7.5f, 16.5f, 16.5f)
 
     private val globeOvalRect = RectF(2f, 2f, 22f, 22f)
     private val globeMeridianPath = Path().apply {
@@ -3621,7 +3795,6 @@ internal object AndroidVectorIcons {
     }
 
     private val pulsePath = Path().apply {
-        // M22 12H18L15 21L9 3L6 12H2
         moveTo(2f, 12f)
         lineTo(6f, 12f)
         lineTo(9f, 3f)
@@ -3671,6 +3844,28 @@ internal object AndroidVectorIcons {
         canvas.restore()
     }
 
+    fun drawFreedomShieldEmblem(canvas: Canvas, cx: Float, cy: Float, size: Float, primaryColor: Int, accentColor: Int) {
+        withMatrix(canvas, cx, cy, size) {
+            fillPaint.color = Color.argb(46, Color.red(primaryColor), Color.green(primaryColor), Color.blue(primaryColor))
+            canvas.drawPath(freedomOuterShield, fillPaint)
+
+            fillPaint.color = Color.argb(62, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
+            canvas.drawPath(freedomInnerCore, fillPaint)
+
+            strokePaint.color = primaryColor
+            strokePaint.strokeWidth = 1.9f
+            canvas.drawPath(freedomOuterShield, strokePaint)
+
+            strokePaint.color = accentColor
+            strokePaint.strokeWidth = 2.2f
+            canvas.drawPath(freedomUpperWing, strokePaint)
+
+            strokePaint.color = Color.WHITE
+            strokePaint.strokeWidth = 2.0f
+            canvas.drawPath(freedomLowerWing, strokePaint)
+        }
+    }
+
     fun drawShield(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int, fill: Boolean = true) {
         withMatrix(canvas, cx, cy, size) {
             if (fill) {
@@ -3705,20 +3900,17 @@ internal object AndroidVectorIcons {
         }
     }
 
-    fun drawGamepad(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+    fun drawRadar(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
         withMatrix(canvas, cx, cy, size) {
-            fillPaint.color = Color.argb(35, Color.red(color), Color.green(color), Color.blue(color))
-            canvas.drawRoundRect(gamepadBodyRect, 4f, 4f, fillPaint)
+            fillPaint.color = Color.argb(30, Color.red(color), Color.green(color), Color.blue(color))
+            canvas.drawOval(radarOuterCircle, fillPaint)
             strokePaint.color = color
-            strokePaint.strokeWidth = 2f
-            canvas.drawRoundRect(gamepadBodyRect, 4f, 4f, strokePaint)
-            // D-Pad Cross
-            canvas.drawLine(6.5f, 12f, 10.5f, 12f, strokePaint)
-            canvas.drawLine(8.5f, 10f, 8.5f, 14f, strokePaint)
-            // Action Buttons
+            strokePaint.strokeWidth = 1.9f
+            canvas.drawOval(radarOuterCircle, strokePaint)
+            canvas.drawArc(radarInnerCircle, -45f, 250f, false, strokePaint)
+            canvas.drawLine(12f, 12f, 18.2f, 5.8f, strokePaint)
             fillPaint.color = color
-            canvas.drawCircle(15.5f, 12f, 1.2f, fillPaint)
-            canvas.drawCircle(18f, 10f, 1.2f, fillPaint)
+            canvas.drawCircle(12f, 12f, 1.8f, fillPaint)
         }
     }
 
@@ -3778,14 +3970,19 @@ internal object AndroidVectorIcons {
 
 /**
  * ModernPowerShieldView:
- * Cyber-security animated hero power button with multi-layer radar pulse, rotating orbital reticle,
- * ambient glowing aura, and smooth micro-press scaling feedback.
+ * High-contrast 2026-2027 Freedom Network Hero Control Disc with:
+ * - Cached RadialGradient ambient cyber aura & obsidian glass fill
+ * - SweepGradient rotating rim arc
+ * - Counter-rotating orbital dash halo & 12-tick azimuth precision bezel
+ * - Faceted Freedom Shield Emblem inside a luminous badge
+ * - High-legibility label and rounded status pill inside the disc
  */
 class ModernPowerShieldView(context: Context) : View(context) {
     var isActive = false
         set(value) {
             if (field != value) {
                 field = value
+                cachedActive = null
                 postInvalidateOnAnimation()
             }
         }
@@ -3795,8 +3992,16 @@ class ModernPowerShieldView(context: Context) : View(context) {
     private var orbitAngle = 0f
     private var pressScale = 1.0f
 
+    private var cachedW = -1
+    private var cachedH = -1
+    private var cachedActive: Boolean? = null
+    private var auraShader: RadialGradient? = null
+    private var discShader: LinearGradient? = null
+    private var rimSweepShader: SweepGradient? = null
+
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
     }
     private val auraPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -3804,24 +4009,30 @@ class ModernPowerShieldView(context: Context) : View(context) {
     private val buttonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
     }
+    private val badgeFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
     }
-    private val subTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val pillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
     }
-    private val density by lazy { resources.displayMetrics.density }
-    private val orbitalDash by lazy { DashPathEffect(floatArrayOf(12f * density, 8f * density), 0f) }
+    private val pillRect = RectF()
     private val orbitalRect = RectF()
+    private val density by lazy { resources.displayMetrics.density }
+    private val orbitalDash by lazy { DashPathEffect(floatArrayOf(10f * density, 7f * density), 0f) }
+    private val outerOrbitDash by lazy { DashPathEffect(floatArrayOf(4f * density, 9f * density), 0f) }
 
     private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-        duration = 2000L
+        duration = 2400L
         repeatCount = ValueAnimator.INFINITE
         repeatMode = ValueAnimator.RESTART
         addUpdateListener {
             pulseFraction = it.animatedValue as Float
-            orbitAngle = (orbitAngle + 1.6f) % 360f
+            orbitAngle = (orbitAngle + 1.15f) % 360f
             postInvalidateOnAnimation()
         }
     }
@@ -3850,12 +4061,12 @@ class ModernPowerShieldView(context: Context) : View(context) {
                 val cx = width / 2f
                 val cy = height / 2f
                 val maxR = minOf(cx, cy) * 0.94f
-                val btnR = maxR * 0.58f
+                val btnR = maxR * 0.62f
                 val dx = event.x - cx
                 val dy = event.y - cy
                 if (dx * dx + dy * dy <= (btnR * 1.35f) * (btnR * 1.35f)) {
                     isPressed = true
-                    pressScale = 0.93f
+                    pressScale = 0.94f
                     parent?.requestDisallowInterceptTouchEvent(true)
                     invalidate()
                     return true
@@ -3867,7 +4078,7 @@ class ModernPowerShieldView(context: Context) : View(context) {
                     val cx = width / 2f
                     val cy = height / 2f
                     val maxR = minOf(cx, cy) * 0.94f
-                    val btnR = maxR * 0.58f
+                    val btnR = maxR * 0.62f
                     val dx = event.x - cx
                     val dy = event.y - cy
                     if (dx * dx + dy * dy > (btnR * 1.65f) * (btnR * 1.65f)) {
@@ -3898,6 +4109,49 @@ class ModernPowerShieldView(context: Context) : View(context) {
         return super.onTouchEvent(event)
     }
 
+    private fun ensureShaders(cx: Float, cy: Float, btnR: Float) {
+        if (cachedW == width && cachedH == height && cachedActive == isActive) return
+        cachedW = width
+        cachedH = height
+        cachedActive = isActive
+
+        val auraColor = if (isActive) Color.argb(105, 16, 185, 129) else Color.argb(45, 56, 189, 248)
+        auraShader = RadialGradient(cx, cy, btnR * 1.48f, auraColor, Color.TRANSPARENT, Shader.TileMode.CLAMP)
+
+        discShader = if (isActive) {
+            LinearGradient(
+                cx - btnR * 0.4f, cy - btnR, cx + btnR * 0.4f, cy + btnR,
+                Color.parseColor("#042F2E"), Color.parseColor("#065F46"),
+                Shader.TileMode.CLAMP,
+            )
+        } else {
+            LinearGradient(
+                cx - btnR * 0.4f, cy - btnR, cx + btnR * 0.4f, cy + btnR,
+                Color.parseColor("#0A1222"), Color.parseColor("#132038"),
+                Shader.TileMode.CLAMP,
+            )
+        }
+
+        val sweepColors = if (isActive) {
+            intArrayOf(
+                Color.parseColor("#10B981"),
+                Color.parseColor("#34D399"),
+                Color.parseColor("#22D3EE"),
+                Color.parseColor("#059669"),
+                Color.parseColor("#10B981"),
+            )
+        } else {
+            intArrayOf(
+                Color.parseColor("#1E3A5F"),
+                Color.parseColor("#38BDF8"),
+                Color.parseColor("#0EA5E9"),
+                Color.parseColor("#1E293B"),
+                Color.parseColor("#1E3A5F"),
+            )
+        }
+        rimSweepShader = SweepGradient(cx, cy, sweepColors, null)
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val cx = width / 2f
@@ -3905,99 +4159,133 @@ class ModernPowerShieldView(context: Context) : View(context) {
         val maxR = minOf(cx, cy) * 0.94f
         if (maxR <= 0f) return
 
-        val density = resources.displayMetrics.density
-        val baseColor = if (isActive) Color.parseColor("#10B981") else Color.parseColor("#38BDF8")
-        val r = Color.red(baseColor)
-        val g = Color.green(baseColor)
-        val b = Color.blue(baseColor)
-        val btnR = maxR * 0.58f
+        val btnR = maxR * 0.62f
+        ensureShaders(cx, cy, btnR)
 
-        // 1) Concentric expanding radar pulse rings
+        val primaryColor = if (isActive) Color.parseColor("#10B981") else Color.parseColor("#38BDF8")
+        val accentColor = if (isActive) Color.parseColor("#22D3EE") else Color.parseColor("#818CF8")
+        val r = Color.red(primaryColor)
+        val g = Color.green(primaryColor)
+        val b = Color.blue(primaryColor)
+
+        // 1) Concentric expanding cyber radar waves
         if (isActive) {
             val waveCount = 3
             for (i in 0 until waveCount) {
                 val phase = (pulseFraction + i * (1f / waveCount)) % 1f
-                val ringR = btnR + (maxR - btnR) * phase
-                val alpha = ((1f - phase) * 160).toInt().coerceIn(0, 255)
+                val ringR = btnR * 1.06f + (maxR - btnR * 1.06f) * phase
+                val alpha = ((1f - phase) * 145).toInt().coerceIn(0, 255)
                 ringPaint.color = Color.argb(alpha, r, g, b)
-                ringPaint.strokeWidth = (2.8f - phase * 1.4f) * density
+                ringPaint.strokeWidth = (2.4f - phase * 1.3f) * density
                 canvas.drawCircle(cx, cy, ringR, ringPaint)
             }
         } else {
-            // Gentle breathing wave when idle
-            val ringR = btnR + (maxR - btnR) * 0.35f * pulseFraction
-            val alpha = ((1f - pulseFraction) * 50).toInt().coerceIn(0, 255)
+            val breathe = btnR * 1.06f + (maxR - btnR * 1.06f) * 0.42f * pulseFraction
+            val alpha = ((1f - pulseFraction) * 65).toInt().coerceIn(0, 255)
             ringPaint.color = Color.argb(alpha, r, g, b)
-            ringPaint.strokeWidth = 1.5f * density
-            canvas.drawCircle(cx, cy, ringR, ringPaint)
+            ringPaint.strokeWidth = 1.6f * density
+            canvas.drawCircle(cx, cy, breathe, ringPaint)
         }
 
-        // 2) Orbital reticle / rotating dashed cyber arc
-        if (isActive) {
-            val reticleR = btnR * 1.15f
-            ringPaint.color = Color.argb(175, r, g, b)
-            ringPaint.strokeWidth = 2.2f * density
-            ringPaint.pathEffect = orbitalDash
-            orbitalRect.set(cx - reticleR, cy - reticleR, cx + reticleR, cy + reticleR)
-            canvas.save()
-            canvas.rotate(orbitAngle, cx, cy)
-            canvas.drawArc(orbitalRect, 0f, 360f, false, ringPaint)
-            canvas.restore()
-            ringPaint.pathEffect = null
-        }
+        // 2) Counter-rotating double orbital reticles
+        val innerReticleR = btnR * 1.13f
+        ringPaint.color = Color.argb(if (isActive) 180 else 95, r, g, b)
+        ringPaint.strokeWidth = 2.0f * density
+        ringPaint.pathEffect = orbitalDash
+        orbitalRect.set(cx - innerReticleR, cy - innerReticleR, cx + innerReticleR, cy + innerReticleR)
+        canvas.save()
+        canvas.rotate(orbitAngle, cx, cy)
+        canvas.drawArc(orbitalRect, 0f, 360f, false, ringPaint)
+        canvas.restore()
 
-        // 3) Center Button with pressScale
+        val outerReticleR = btnR * 1.24f
+        ringPaint.color = Color.argb(if (isActive) 115 else 55, Color.red(accentColor), Color.green(accentColor), Color.blue(accentColor))
+        ringPaint.strokeWidth = 1.4f * density
+        ringPaint.pathEffect = outerOrbitDash
+        orbitalRect.set(cx - outerReticleR, cy - outerReticleR, cx + outerReticleR, cy + outerReticleR)
+        canvas.save()
+        canvas.rotate(-orbitAngle * 0.7f, cx, cy)
+        canvas.drawArc(orbitalRect, 0f, 360f, false, ringPaint)
+        canvas.restore()
+        ringPaint.pathEffect = null
+
+        // 3) Center Hero Disc with pressScale
         canvas.save()
         canvas.scale(pressScale, pressScale, cx, cy)
 
-        // Ambient glow
-        val auraR = btnR * 1.3f
-        auraPaint.shader = RadialGradient(
-            cx, cy, auraR,
-            Color.argb(if (isActive) 95 else 30, r, g, b),
-            Color.TRANSPARENT,
-            Shader.TileMode.CLAMP
-        )
-        canvas.drawCircle(cx, cy, auraR, auraPaint)
+        auraPaint.shader = auraShader
+        canvas.drawCircle(cx, cy, btnR * 1.45f, auraPaint)
         auraPaint.shader = null
 
-        // Inner circular button fill gradient
-        buttonPaint.shader = if (isActive) {
-            LinearGradient(
-                cx, cy - btnR, cx, cy + btnR,
-                Color.parseColor("#064E3B"), Color.parseColor("#059669"),
-                Shader.TileMode.CLAMP
-            )
-        } else {
-            LinearGradient(
-                cx, cy - btnR, cx, cy + btnR,
-                Color.parseColor("#0E1626"), Color.parseColor("#152238"),
-                Shader.TileMode.CLAMP
-            )
-        }
+        buttonPaint.shader = discShader
         canvas.drawCircle(cx, cy, btnR, buttonPaint)
         buttonPaint.shader = null
 
-        // Button border
-        ringPaint.color = if (isActive) Color.parseColor("#34D399") else Color.parseColor("#38BDF8")
-        ringPaint.strokeWidth = (if (isActive) 2.8f else 2.0f) * density
+        // Subtle inner azimuth ticks (12 precision marks)
+        ringPaint.color = Color.argb(if (isActive) 75 else 45, 226, 232, 240)
+        ringPaint.strokeWidth = 1.2f * density
+        for (tick in 0 until 12) {
+            val deg = tick * 30.0
+            val rad = Math.toRadians(deg)
+            val cosA = kotlin.math.cos(rad).toFloat()
+            val sinA = kotlin.math.sin(rad).toFloat()
+            val rIn = btnR * 0.87f
+            val rOut = btnR * 0.93f
+            canvas.drawLine(cx + cosA * rIn, cy + sinA * rIn, cx + cosA * rOut, cy + sinA * rOut, ringPaint)
+        }
+
+        // Rotating SweepGradient Glowing Rim
+        ringPaint.shader = rimSweepShader
+        ringPaint.strokeWidth = (if (isActive) 3.0f else 2.2f) * density
+        canvas.save()
+        canvas.rotate(orbitAngle * 0.5f, cx, cy)
         canvas.drawCircle(cx, cy, btnR, ringPaint)
+        canvas.restore()
+        ringPaint.shader = null
 
-        // Center Vector Power Icon (official Lucide geometry)
-        val iconSize = btnR * 0.54f
-        val iconColor = if (isActive) Color.WHITE else Color.parseColor("#38BDF8")
-        AndroidVectorIcons.drawPower(canvas, cx, cy - btnR * 0.16f, iconSize, iconColor)
+        // Inner circular halo badge + Freedom Shield Emblem
+        val badgeCx = cx
+        val badgeCy = cy - btnR * 0.25f
+        val badgeR = btnR * 0.30f
+        badgeFillPaint.color = if (isActive) Color.argb(65, 16, 185, 129) else Color.argb(40, 56, 189, 248)
+        canvas.drawCircle(badgeCx, badgeCy, badgeR, badgeFillPaint)
+        ringPaint.color = Color.argb(130, r, g, b)
+        ringPaint.strokeWidth = 1.2f * density
+        canvas.drawCircle(badgeCx, badgeCy, badgeR, ringPaint)
 
-        // Status text inside button
-        textPaint.textSize = 12f * density
-        textPaint.color = if (isActive) Color.WHITE else Color.parseColor("#F1F5F9")
-        val statusText = if (isActive) "ENGELSİZ AKTİF" else "DOKUN VE BAĞLAN"
-        canvas.drawText(statusText, cx, cy + btnR * 0.38f, textPaint)
+        AndroidVectorIcons.drawFreedomShieldEmblem(
+            canvas = canvas,
+            cx = badgeCx,
+            cy = badgeCy,
+            size = badgeR * 1.45f,
+            primaryColor = if (isActive) Color.parseColor("#34D399") else Color.parseColor("#38BDF8"),
+            accentColor = if (isActive) Color.parseColor("#22D3EE") else Color.parseColor("#7DD3FC"),
+        )
 
-        subTextPaint.textSize = 8.5f * density
-        subTextPaint.color = if (isActive) Color.parseColor("#6EE7B7") else Color.parseColor("#64748B")
-        val subText = if (isActive) "SİSTEM GENELİ VPN" else "Korumasız Ağ"
-        canvas.drawText(subText, cx, cy + btnR * 0.58f, subTextPaint)
+        // Bold Hero Title inside Disc
+        textPaint.textSize = (btnR * 0.145f).coerceIn(11f * density, 15f * density)
+        textPaint.color = Color.WHITE
+        val statusText = if (isActive) "KORUMA AKTİF" else "DOKUN VE BAĞLAN"
+        canvas.drawText(statusText, cx, cy + btnR * 0.25f, textPaint)
+
+        // Compact Status Pill inside Disc
+        pillTextPaint.textSize = (btnR * 0.095f).coerceIn(7.5f * density, 10f * density)
+        val subText = if (isActive) "SİSTEM GENELİ · DoH3 + ECH" else "AĞ KORUMASI HAZIR"
+        val textW = pillTextPaint.measureText(subText)
+        val pillPadH = 10f * density
+        val pillH = 17f * density
+        val pillCy = cy + btnR * 0.49f
+        pillRect.set(cx - textW / 2f - pillPadH, pillCy - pillH / 2f, cx + textW / 2f + pillPadH, pillCy + pillH / 2f)
+
+        badgeFillPaint.color = if (isActive) Color.argb(160, 6, 78, 59) else Color.argb(180, 15, 23, 42)
+        canvas.drawRoundRect(pillRect, pillH / 2f, pillH / 2f, badgeFillPaint)
+        ringPaint.color = if (isActive) Color.argb(180, 52, 211, 153) else Color.argb(110, 56, 189, 248)
+        ringPaint.strokeWidth = 1.0f * density
+        canvas.drawRoundRect(pillRect, pillH / 2f, pillH / 2f, ringPaint)
+
+        pillTextPaint.color = if (isActive) Color.parseColor("#A7F3D0") else Color.parseColor("#93C5FD")
+        val textBaseline = pillCy - (pillTextPaint.descent() + pillTextPaint.ascent()) / 2f
+        canvas.drawText(subText, cx, textBaseline, pillTextPaint)
 
         canvas.restore()
     }
@@ -4209,7 +4497,7 @@ class ModernMetricCard(context: Context, val iconType: Int, val titleText: Strin
                 when (iconType) {
                     0 -> AndroidVectorIcons.drawBolt(c, s / 2, s / 2, s, heroColor)
                     1 -> AndroidVectorIcons.drawLock(c, s / 2, s / 2, s, heroColor)
-                    2 -> AndroidVectorIcons.drawGamepad(c, s / 2, s / 2, s, heroColor)
+                    2 -> AndroidVectorIcons.drawRadar(c, s / 2, s / 2, s, heroColor)
                     else -> AndroidVectorIcons.drawGlobe(c, s / 2, s / 2, s, heroColor)
                 }
             }
@@ -4236,13 +4524,13 @@ class ModernMetricCard(context: Context, val iconType: Int, val titleText: Strin
 
 /**
  * MainActivity:
- * Complete 2026–2027 cyber-security architecture with 3 segmented tabs:
- * 1. KONTROL (Interactive Hero Power Shield, Throughput Waveform, 4 Live Metric Cards)
+ * Freedom Network — Complete 2026–2027 Android 11–17 architecture with 3 segmented tabs:
+ * 1. KONTROL (Freedom Hero Shield, Throughput Waveform, 4 Live Metric Cards, Security & Speed Shield Switches)
  * 2. TEŞHİS (ISP Out-of-Tunnel Diagnostic Runner, Probes, Real-time Censorship Report)
- * 3. GÜNLÜK (Integrated Debugger, In-App Logcat Viewer, Clipboard Copy, Crash Dump Inspector)
+ * 3. GÜNLÜK (Integrated Debugger, Log Viewer, Clipboard Copy, Crash Dump Inspector)
  */
 class MainActivity : Activity() {
-    private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "thedpi-worker").apply { isDaemon = true } }
+    private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "freedom-worker").apply { isDaemon = true } }
     private val main = Handler(Looper.getMainLooper())
     private val busy = AtomicBoolean(false)
     @Volatile private var session: DiagnosticSession? = null
@@ -4250,6 +4538,8 @@ class MainActivity : Activity() {
     @Volatile private var lastDecision: Decision? = null
     private var callback: ConnectivityManager.NetworkCallback? = null
     private lateinit var cm: ConnectivityManager
+    private var activeTabIndex = 0
+    private var backCallback: Any? = null
 
     // UI Elements
     private lateinit var powerShieldView: ModernPowerShieldView
@@ -4262,6 +4552,11 @@ class MainActivity : Activity() {
     private lateinit var cardUdp: ModernMetricCard
     private lateinit var cardDns: ModernMetricCard
 
+    // 2026-2027 Security & Speed Shield Toggles
+    private lateinit var switchKillSwitch: Switch
+    private lateinit var switchTrackerGuard: Switch
+    private lateinit var switchQuicPassthrough: Switch
+
     // Tab buttons & containers
     private lateinit var tabBtnControl: TextView
     private lateinit var tabBtnDiag: TextView
@@ -4269,6 +4564,7 @@ class MainActivity : Activity() {
     private lateinit var panelControl: LinearLayout
     private lateinit var panelDiag: LinearLayout
     private lateinit var panelLog: LinearLayout
+    private lateinit var tabSwitcher: (Int) -> Unit
 
     // Diag tab elements
     private lateinit var targets: EditText
@@ -4291,15 +4587,14 @@ class MainActivity : Activity() {
 
     private val tickerRunnable = object : Runnable {
         override fun run() {
-            val isVpn = TheDpiVpnService.isRunning.get()
+            val isVpn = FreedomVpnService.isRunning.get()
             val s = session
             val p = s?.proxyStats()
             val b = ActiveBridgeHolder.current
-            val isEngelsizActive = isVpn || (p?.active == true)
+            val isFreedomActive = isVpn || (p?.active == true)
 
-            powerShieldView.isActive = isEngelsizActive
+            powerShieldView.isActive = isFreedomActive
 
-            // Compute speed rates
             val now = System.currentTimeMillis()
             val currentUp = b?.bytesUp?.get() ?: 0L
             val currentDown = b?.bytesDown?.get() ?: 0L
@@ -4330,6 +4625,22 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         CrashLogger.log("MainActivity", "onCreate başladı")
         try {
+            // Android 11-17 Edge-to-Edge & Dark Cyber Theme System Bar Integration
+            window.setDecorFitsSystemWindows(false)
+            @Suppress("DEPRECATION")
+            if (Build.VERSION.SDK_INT < 35) {
+                window.statusBarColor = Color.TRANSPARENT
+                window.navigationBarColor = Color.TRANSPARENT
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+            }
+            window.insetsController?.setSystemBarsAppearance(
+                0,
+                android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                    android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS,
+            )
+
             cm = getSystemService(ConnectivityManager::class.java)
             setContentView(buildModernUi(savedInstanceState))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -4348,7 +4659,7 @@ class MainActivity : Activity() {
                 session = DiagnosticSession()
                 CrashLogger.log("MainActivity", "DiagnosticSession hazır: v${Native.engineVersion()}")
                 ui {
-                    diagStatus.text = "Motor ${Native.engineVersion()} hazır · 2026–2027 Hibrit Ağ Motoru"
+                    diagStatus.text = "Motor ${Native.engineVersion()} hazır · Freedom Network 2026–2027"
                     runButton.isEnabled = true
                 }
             } catch (e: NativeException) {
@@ -4376,31 +4687,83 @@ class MainActivity : Activity() {
         }
     }
 
+    @android.annotation.SuppressLint("UseSwitchCompatOrMaterialCode")
+    private fun createToggleSwitch(initialChecked: Boolean, onChanged: (Boolean) -> Unit): Switch {
+        val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+        val thumbColors = android.content.res.ColorStateList(
+            states,
+            intArrayOf(Color.parseColor("#34D399"), Color.parseColor("#CBD5E1")),
+        )
+        val trackColors = android.content.res.ColorStateList(
+            states,
+            intArrayOf(Color.parseColor("#065F46"), Color.parseColor("#334155")),
+        )
+        return Switch(this).apply {
+            isChecked = initialChecked
+            thumbTintList = thumbColors
+            trackTintList = trackColors
+            setOnCheckedChangeListener { _, checked -> onChanged(checked) }
+        }
+    }
+
+    private fun updatePredictiveBackRegistration(shouldIntercept: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val dispatcher = onBackInvokedDispatcher
+        val existing = backCallback as? android.window.OnBackInvokedCallback
+        if (shouldIntercept && existing == null) {
+            val cb = android.window.OnBackInvokedCallback {
+                tabSwitcher.invoke(0)
+            }
+            dispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
+            backCallback = cb
+        } else if (!shouldIntercept && existing != null) {
+            runCatching { dispatcher.unregisterOnBackInvokedCallback(existing) }
+            backCallback = null
+        }
+    }
+
     private fun buildModernUi(state: Bundle?): View {
+        val prefs = getSharedPreferences("freedom_prefs", Context.MODE_PRIVATE)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#070B14"))
-            setPadding(dp(14), dp(12), dp(14), dp(12))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
         }
 
-        // Top Header
+        // Top Header with Freedom Shield Emblem Badge
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(4), 0, dp(10))
+            setPadding(0, dp(2), 0, dp(10))
+        }
+        val brandIcon = object : View(this) {
+            init {
+                layoutParams = LinearLayout.LayoutParams(dp(26), dp(26)).apply {
+                    setMargins(0, 0, dp(8), 0)
+                }
+            }
+            override fun onDraw(c: Canvas) {
+                super.onDraw(c)
+                val s = minOf(width, height).toFloat()
+                AndroidVectorIcons.drawFreedomShieldEmblem(
+                    c, s / 2f, s / 2f, s * 0.92f,
+                    Color.parseColor("#10B981"), Color.parseColor("#38BDF8"),
+                )
+            }
         }
         val appTitle = TextView(this).apply {
-            text = "THE DPI"
-            textSize = 21f
+            text = "FREEDOM NETWORK"
+            textSize = 18.5f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            setTextColor(Color.parseColor("#10B981"))
+            setTextColor(Color.parseColor("#F8FAFC"))
         }
         val versionBadge = TextView(this).apply {
-            text = "  2026–2027 v2.0"
-            textSize = 11.5f
+            text = "  2026–2027 · v2.0"
+            textSize = 10.5f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#38BDF8"))
         }
+        header.addView(brandIcon)
         header.addView(appTitle)
         header.addView(versionBadge)
         root.addView(header)
@@ -4408,10 +4771,10 @@ class MainActivity : Activity() {
         // Segmented Tab Bar (KONTROL · TEŞHİS · GÜNLÜK)
         val tabBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = createCardShape("#0C1322", borderColor = "#1E293B", cornerDp = 10f)
-            setPadding(dp(3), dp(3), dp(3), dp(3))
+            background = createCardShape("#0C1322", borderColor = "#1E293B", cornerDp = 12f)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, 0, 0, dp(12))
+                setMargins(0, 0, 0, dp(10))
             }
         }
 
@@ -4421,7 +4784,7 @@ class MainActivity : Activity() {
                 textSize = 11.5f
                 gravity = Gravity.CENTER
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-                setPadding(0, dp(8), 0, dp(8))
+                setPadding(0, dp(9), 0, dp(9))
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
         }
@@ -4445,10 +4808,10 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
         }
 
-        // Animated Power Shield Hero Button
+        // Animated Freedom Hero Shield Button
         powerShieldView = ModernPowerShieldView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(230)).apply {
-                setMargins(0, dp(4), 0, dp(6))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(224)).apply {
+                setMargins(0, dp(2), 0, dp(4))
             }
             onToggleListener = { toggleDesync() }
         }
@@ -4457,7 +4820,7 @@ class MainActivity : Activity() {
         // Connection State Pill Badge
         statusPill = TextView(this).apply {
             text = "KORUMA DEVRE DIŞI · DOKUNARAK BAĞLANIN"
-            textSize = 11f
+            textSize = 10.5f
             gravity = Gravity.CENTER
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#94A3B8"))
@@ -4473,19 +4836,19 @@ class MainActivity : Activity() {
         // Real-Time Network Speed & Throughput Waveform
         sparklineView = ThroughputSparklineView(this).apply {
             background = createCardShape("#0A101D", borderColor = "#1E293B", cornerDp = 12f)
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(88)).apply {
-                setMargins(0, 0, 0, dp(10))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(84)).apply {
+                setMargins(0, 0, 0, dp(8))
             }
         }
         panelControl.addView(sparklineView)
 
-        // 4 Live Metric Cards (2x2 Grid)
+        // 4 Live Metric Cards (2x2 Grid — Universal Censorship Bypass, Privacy & Speed)
         val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         }
-        cardTcp = ModernMetricCard(this, iconType = 0, titleText = "TCP DESYNC", heroColor = Color.parseColor("#10B981"))
-        cardTls = ModernMetricCard(this, iconType = 1, titleText = "TLS PARÇALAMA", heroColor = Color.parseColor("#38BDF8"))
+        cardTcp = ModernMetricCard(this, iconType = 0, titleText = "TCP DESYNC & SPLICE", heroColor = Color.parseColor("#10B981"))
+        cardTls = ModernMetricCard(this, iconType = 1, titleText = "TLS / ECH KALKAN", heroColor = Color.parseColor("#38BDF8"))
         row1.addView(cardTcp)
         row1.addView(cardTls)
         panelControl.addView(row1)
@@ -4494,22 +4857,107 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         }
-        cardUdp = ModernMetricCard(this, iconType = 2, titleText = "ROBLOX / DISCORD UDP", heroColor = Color.parseColor("#A78BFA"))
-        cardDns = ModernMetricCard(this, iconType = 3, titleText = "ŞİFRELİ DoH DNS", heroColor = Color.parseColor("#FBBF24"))
+        cardUdp = ModernMetricCard(this, iconType = 2, titleText = "GERÇEK ZAMANLI UDP", heroColor = Color.parseColor("#A78BFA"))
+        cardDns = ModernMetricCard(this, iconType = 3, titleText = "ŞİFRELİ DoH3 / GİZLİLİK", heroColor = Color.parseColor("#FBBF24"))
         row2.addView(cardUdp)
         row2.addView(cardDns)
         panelControl.addView(row2)
 
+        // 2026-2027 Security & Speed Shield Switches Card
+        val shieldCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createCardShape("#0B1220", borderColor = "#1E293B", cornerDp = 14f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(4), dp(8), dp(4), dp(4))
+            }
+        }
+        val shieldHeader = TextView(this).apply {
+            text = "2026–2027 GİZLİLİK, IP SIZINTI & HIZ KALKANI"
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#38BDF8"))
+            setPadding(0, 0, 0, dp(6))
+        }
+        shieldCard.addView(shieldHeader)
+
+        fun buildSwitchRow(title: String, subtitle: String, sw: Switch, addBottomDivider: Boolean) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(5), 0, dp(5))
+            }
+            val textCol = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(0, 0, dp(8), 0)
+                }
+            }
+            val tView = TextView(this).apply {
+                text = title
+                textSize = 11.5f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(Color.parseColor("#E2E8F0"))
+            }
+            val sView = TextView(this).apply {
+                text = subtitle
+                textSize = 9.5f
+                setTextColor(Color.parseColor("#64748B"))
+            }
+            textCol.addView(tView)
+            textCol.addView(sView)
+            row.addView(textCol)
+            row.addView(sw)
+            shieldCard.addView(row)
+            if (addBottomDivider) {
+                val div = View(this).apply {
+                    setBackgroundColor(Color.parseColor("#1E293B"))
+                    layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1))
+                }
+                shieldCard.addView(div)
+            }
+        }
+
+        switchKillSwitch = createToggleSwitch(prefs.getBoolean(PREF_KILL_SWITCH, true)) { v ->
+            prefs.edit().putBoolean(PREF_KILL_SWITCH, v).apply()
+        }
+        switchTrackerGuard = createToggleSwitch(prefs.getBoolean(PREF_BLOCK_TRACKERS, true)) { v ->
+            prefs.edit().putBoolean(PREF_BLOCK_TRACKERS, v).apply()
+        }
+        switchQuicPassthrough = createToggleSwitch(prefs.getBoolean(PREF_QUIC_PASSTHROUGH, false)) { v ->
+            prefs.edit().putBoolean(PREF_QUIC_PASSTHROUGH, v).apply()
+        }
+
+        buildSwitchRow(
+            "Sıkı Kill Switch & WebRTC IP Kalkanı",
+            "Şifresiz DNS geri düşüşünü ve STUN yerel IP sızıntılarını engeller",
+            switchKillSwitch,
+            addBottomDivider = true,
+        )
+        buildSwitchRow(
+            "İzleyici & Telemetri DNS Filtresi",
+            "Reklam ve gizlilik ihlal eden alan adlarını cihazda engeller",
+            switchTrackerGuard,
+            addBottomDivider = true,
+        )
+        buildSwitchRow(
+            "HTTP/3 QUIC Doğrudan Geçiş (Düşük Gecikme)",
+            "QUIC engellenmeyen ağlarda doğrudan UDP/443 akışı sağlar",
+            switchQuicPassthrough,
+            addBottomDivider = false,
+        )
+        panelControl.addView(shieldCard)
+
         // Quick Bottom Action Button
         heroActionButton = Button(this).apply {
-            text = "KORUMAYI BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
+            text = "ÖZGÜR AĞI BAŞLAT (Tam Koruma + DPI Aşma)"
             textSize = 13.5f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#070B14"))
             background = createCardShape("#10B981", cornerDp = 14f)
             setPadding(dp(16), dp(14), dp(16), dp(14))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, dp(12), 0, dp(10))
+                setMargins(dp(4), dp(10), dp(4), dp(8))
             }
             setOnClickListener {
                 it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
@@ -4530,9 +4978,8 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
 
-        // Out-of-tunnel diagnostic notice
         val noticeCard = TextView(this).apply {
-            text = "Bilgi: Bu sekmedeki ağ tanılaması, operatörünüzün (ISP) sansür ve engelleme durumunu doğrudan gözlemlemek için tünel dışından ham hat üzerinden yapılır."
+            text = "Bilgi: Bu sekmedeki ağ tanılaması, operatörünüzün (ISP) genel sansür ve DPI durumunu doğrudan ölçmek için tünel dışından ham hat üzerinden yapılır."
             textSize = 10.5f
             setTextColor(Color.parseColor("#94A3B8"))
             background = createCardShape("#0E182A", borderColor = "#1E293B", cornerDp = 10f)
@@ -4552,7 +4999,7 @@ class MainActivity : Activity() {
 
         panelDiag.addView(inputLabel("Test hedefleri (her satıra bir tane):"))
         targets = EditText(this).apply {
-            setText(state?.getString(KEY_TARGETS) ?: "discord.com\nroblox.com")
+            setText(state?.getString(KEY_TARGETS) ?: "cloudflare.com\nwikipedia.org\nietf.org")
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
             textSize = 12f
             setTextColor(Color.WHITE)
@@ -4575,7 +5022,7 @@ class MainActivity : Activity() {
         }
         panelDiag.addView(altDns)
 
-        panelDiag.addView(inputLabel("Şifreli DoH adresleri (isteğe bağlı, boş bırakılırsa dahili DoH kullanılır):"))
+        panelDiag.addView(inputLabel("Şifreli DoH3/DoH adresleri (isteğe bağlı, boşsa çoklu DoH3 yarışı kullanılır):"))
         dohEndpoints = EditText(this).apply {
             setText(state?.getString(KEY_DOH) ?: "")
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
@@ -4597,7 +5044,6 @@ class MainActivity : Activity() {
         }
         panelDiag.addView(auto)
 
-        // Action Buttons Row
         val actRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
@@ -4639,7 +5085,6 @@ class MainActivity : Activity() {
         }
         panelDiag.addView(diagStatus)
 
-        // Diag Output Header + Copy Button
         val diagOutHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -4660,7 +5105,7 @@ class MainActivity : Activity() {
             background = createCardShape("#131D31", borderColor = "#1E293B", cornerDp = 6f)
             setPadding(dp(8), dp(4), dp(8), dp(4))
             setOnClickListener {
-                copyToClipboard("THE DPI Raporu", diagOutput.text.toString())
+                copyToClipboard("Freedom Network Raporu", diagOutput.text.toString())
             }
         }
         diagOutHeader.addView(outTitle)
@@ -4699,7 +5144,7 @@ class MainActivity : Activity() {
             }
         }
         val logPathTitle = TextView(this).apply {
-            text = "Dahili Debugger & Günlük Yolu"
+            text = "Freedom Network Dahili Debugger & Günlük Yolu"
             textSize = 11f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#10B981"))
@@ -4714,7 +5159,6 @@ class MainActivity : Activity() {
         logPathCard.addView(logPathTitle)
         logPathCard.addView(logPathVal)
 
-        // Action buttons row for Log
         val logBtnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -4734,7 +5178,7 @@ class MainActivity : Activity() {
         }
 
         val btnCopyLog = createLogBtn("Kopyala", "#2563EB").apply {
-            setOnClickListener { copyToClipboard("THE DPI Log", logOutput.text.toString()) }
+            setOnClickListener { copyToClipboard("Freedom Network Log", logOutput.text.toString()) }
         }
         val btnCrashCheck = createLogBtn("Çökme Raporu", "#475569").apply {
             setOnClickListener { readCrashLog() }
@@ -4775,8 +5219,9 @@ class MainActivity : Activity() {
 
         root.addView(contentFrame)
 
-        // Setup tab switching logic
-        fun setTab(index: Int) {
+        // Setup tab switching + Predictive Back hook
+        tabSwitcher = { index ->
+            activeTabIndex = index
             val activeBg = createCardShape("#1E293B", borderColor = "#334155", cornerDp = 8f)
             val inactiveBg = GradientDrawable().apply { setColor(Color.TRANSPARENT) }
 
@@ -4793,17 +5238,18 @@ class MainActivity : Activity() {
             scrollDiag.visibility = if (index == 1) View.VISIBLE else View.GONE
             scrollLog.visibility = if (index == 2) View.VISIBLE else View.GONE
 
+            updatePredictiveBackRegistration(index != 0)
             if (index == 2) refreshLogViewer()
         }
 
-        tabBtnControl.setOnClickListener { setTab(0) }
-        tabBtnDiag.setOnClickListener { setTab(1) }
-        tabBtnLog.setOnClickListener { setTab(2) }
-        setTab(0)
+        tabBtnControl.setOnClickListener { tabSwitcher(0) }
+        tabBtnDiag.setOnClickListener { tabSwitcher(1) }
+        tabBtnLog.setOnClickListener { tabSwitcher(2) }
+        tabSwitcher(state?.getInt(KEY_TAB) ?: 0)
 
         root.setOnApplyWindowInsetsListener { v, insets ->
             val b = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime() or WindowInsets.Type.displayCutout())
-            v.setPadding(b.left, b.top, b.right, b.bottom)
+            v.setPadding(b.left + dp(14), b.top + dp(10), b.right + dp(14), b.bottom + dp(10))
             WindowInsets.CONSUMED
         }
         return root
@@ -4821,24 +5267,26 @@ class MainActivity : Activity() {
 
         val udp = b?.udpFlows?.get() ?: 0
         val quicFall = b?.quicFallbacks?.get() ?: 0
-        cardUdp.update("$udp Akış", "NAT Ses/Oyun · QUIC: $quicFall")
+        val leaks = b?.leaksBlocked?.get() ?: 0
+        cardUdp.update("$udp Akış", "NAT UDP · QUIC: $quicFall · IP Sızıntı: $leaks")
 
         val dns = b?.dnsQueries?.get() ?: 0
         val doh = b?.dohResolved?.get() ?: 0
         val poison = b?.poisonedDnsBlocked?.get() ?: 0
-        cardDns.update("$dns Sorgu", "DoH: $doh · Zehir Engeli: $poison")
+        val trackers = b?.trackersBlocked?.get() ?: 0
+        cardDns.update("$dns Sorgu", "DoH3: $doh · Zehir/İz: $poison/$trackers")
 
-        val isEngelsizActive = isVpn || (p?.active == true)
-        if (isEngelsizActive) {
+        val isFreedomActive = isVpn || (p?.active == true)
+        if (isFreedomActive) {
             statusPill.text = if (isVpn) {
-                "SİSTEM GENELİ KORUMA DEVREDE (TUN + DoH + DESYNC)"
+                "FREEDOM NETWORK AKTİF · TÜM AĞ ŞİFRELİ TÜNELDE"
             } else {
                 "YEREL VEKİL AKTİF (127.0.0.1:${p?.port ?: 0})"
             }
             statusPill.setTextColor(Color.parseColor("#10B981"))
             statusPill.background = createCardShape("#064E3B", borderColor = "#059669", cornerDp = 20f)
 
-            heroActionButton.text = "KORUMAYI DURDUR (Engelsiz Modu Kapat)"
+            heroActionButton.text = "KORUMAYI DURDUR (Özgür Ağ Tünelini Kapat)"
             heroActionButton.setTextColor(Color.WHITE)
             heroActionButton.background = createCardShape("#DC2626", cornerDp = 12f)
         } else {
@@ -4846,7 +5294,7 @@ class MainActivity : Activity() {
             statusPill.setTextColor(Color.parseColor("#94A3B8"))
             statusPill.background = createCardShape("#0E1626", borderColor = "#1E293B", cornerDp = 20f)
 
-            heroActionButton.text = "KORUMAYI BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
+            heroActionButton.text = "ÖZGÜR AĞI BAŞLAT (Tam Koruma + DPI Aşma)"
             heroActionButton.setTextColor(Color.parseColor("#070B14"))
             heroActionButton.background = createCardShape("#10B981", cornerDp = 12f)
         }
@@ -4914,6 +5362,7 @@ class MainActivity : Activity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
+        outState.putInt(KEY_TAB, activeTabIndex)
         outState.putString(KEY_TARGETS, targets.text.toString())
         outState.putString(KEY_ALT, altDns.text.toString())
         outState.putString(KEY_DOH, dohEndpoints.text.toString())
@@ -4922,6 +5371,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        updatePredictiveBackRegistration(false)
         main.removeCallbacksAndMessages(null)
         worker.shutdownNow()
         session?.close()
@@ -4960,7 +5410,7 @@ class MainActivity : Activity() {
         val dohList = split(dohEndpoints.text.toString()).ifEmpty { TunBridge.DEFAULT_DOH_ENDPOINTS }
         runButton.isEnabled = false
         appliedButton.isEnabled = false
-        diagStatus.text = "Tanılanıyor (Poison-Free DoH & TLS)..."
+        diagStatus.text = "Tanılanıyor (Çoklu DoH3 Yarışı + TLS/ECH Kalkanı)..."
         worker.execute {
             try {
                 var text = ""
@@ -5001,7 +5451,7 @@ class MainActivity : Activity() {
     }
 
     private fun checkVpnConsentAndProceed(onConsent: () -> Unit) {
-        val prefs = getSharedPreferences("thedpi_prefs", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences("freedom_prefs", Context.MODE_PRIVATE)
         val consent = prefs.getBoolean("vpn_prominent_disclosure_accepted", false)
         if (consent) {
             onConsent()
@@ -5021,7 +5471,7 @@ class MainActivity : Activity() {
                 setPadding(0, 0, 0, (10 * resources.displayMetrics.density).toInt())
             }
             val titleText = TextView(context).apply {
-                text = "VpnService ve Veri Güvenliği"
+                text = "Freedom Network — VpnService ve Gizlilik Bildirimi"
                 textSize = 15f
                 typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 setTextColor(Color.WHITE)
@@ -5030,10 +5480,10 @@ class MainActivity : Activity() {
             addView(titleRow)
 
             val desc = TextView(context).apply {
-                text = "The DPI, internet trafiğinizdeki sansür, DPI (Derin Paket İnceleme) bloklamaları ve haksız erişim engellerini aşabilmek için Android VpnService API'sini kullanır.\n\n" +
-                        "• Sıfır Veri Kaydı (No-Logs): Kişisel bilgileriniz, IP adresiniz veya gezinme geçmişiniz asla toplanmaz, kaydedilmez ve üçüncü taraflarla paylaşılmaz.\n" +
-                        "• Yerel Paket İşleme: Trafik uzak bir VPN sunucusuna aktarılmaz; paket parçalama doğrudan cihazınız içinde gerçekleşir.\n" +
-                        "• Şifreli DNS: DNS sorgularınız operatör sansürüne karşı şifreli DoH üzerinden korunur."
+                text = "Freedom Network, ağınızdaki tüm kısıtlamaları kaldırmak, DPI (Derin Paket İnceleme) engellerini aşmak, izleyici/telemetri trafiğini süzmek ve IP sızıntılarını önlemek için Android VpnService API'sini kullanır.\n\n" +
+                        "• Sıfır Kayıt (Strict No-Logs): Gezinme geçmişiniz, DNS sorgularınız ve kişisel verileriniz asla kaydedilmez veya üçüncü taraflara gönderilmez.\n" +
+                        "• Cihaz İçi Koruma: Tüm paket desync işlemleri doğrudan cihazınız içinde yapılır.\n" +
+                        "• Şifreli DoH3 & Kill Switch: DNS sorguları paralel şifreli DoH3 üzerinden çözülür ve şifresiz sızıntılar engellenir."
                 textSize = 11.5f
                 setTextColor(Color.parseColor("#94A3B8"))
                 setLineSpacing(4f * resources.displayMetrics.density, 1f)
@@ -5060,12 +5510,12 @@ class MainActivity : Activity() {
             CrashLogger.log("MainActivity", "toggleDesync: session null!")
             return
         }
-        val vpnActive = TheDpiVpnService.isRunning.get()
+        val vpnActive = FreedomVpnService.isRunning.get()
         val proxyActive = s.proxyStats().active
         CrashLogger.log("MainActivity", "toggleDesync tıklandı: vpnActive=$vpnActive, proxyActive=$proxyActive")
         if (vpnActive || proxyActive) {
             runCatching {
-                startService(Intent(this, TheDpiVpnService::class.java).setAction(TheDpiVpnService.ACTION_STOP))
+                startService(Intent(this, FreedomVpnService::class.java).setAction(FreedomVpnService.ACTION_STOP))
             }
             worker.execute {
                 try {
@@ -5075,10 +5525,10 @@ class MainActivity : Activity() {
                     ui {
                         diagOutput.text = text + "\n" + diagOutput.text.toString()
                         powerShieldView.isActive = false
-                        diagStatus.text = "Engelsiz Mod durduruldu"
+                        diagStatus.text = "Freedom Network durduruldu"
                         updateDashboardMetrics(false, next, ActiveBridgeHolder.current)
                     }
-                    CrashLogger.log("MainActivity", "Engelsiz Mod durduruldu.")
+                    CrashLogger.log("MainActivity", "Freedom Network durduruldu.")
                 } catch (t: Throwable) {
                     CrashLogger.log("MainActivity", "stopProxy hatası", t)
                 }
@@ -5095,7 +5545,7 @@ class MainActivity : Activity() {
             }
             if (prepIntent != null) {
                 CrashLogger.log("MainActivity", "VPN hazırlık intent'i başlatılıyor...")
-                diagStatus.text = "Sistem geneli DPI aşma için VPN izni bekleniyor…"
+                diagStatus.text = "Sistem geneli koruma için VPN izni bekleniyor…"
                 @Suppress("DEPRECATION")
                 startActivityForResult(prepIntent, REQ_VPN)
             } else {
@@ -5120,18 +5570,28 @@ class MainActivity : Activity() {
             CrashLogger.log("MainActivity", "activateEngelsizMod: session null!")
             return
         }
-        CrashLogger.log("MainActivity", "activateEngelsizMod çağrıldı (vpnGranted=$vpnGranted)")
+        val killSwitchEnabled = switchKillSwitch.isChecked
+        val trackersEnabled = switchTrackerGuard.isChecked
+        val quicEnabled = switchQuicPassthrough.isChecked
+        CrashLogger.log(
+            "MainActivity",
+            "activateEngelsizMod çağrıldı (vpnGranted=$vpnGranted, killSwitch=$killSwitchEnabled, trackers=$trackersEnabled, quic=$quicEnabled)",
+        )
         val dohList = ArrayList(split(dohEndpoints.text.toString()))
         val dnsList = ArrayList(split(altDns.text.toString()))
         if (vpnGranted) {
             runCatching {
-                val vpnIntent = Intent(this, TheDpiVpnService::class.java)
-                    .putStringArrayListExtra(TheDpiVpnService.EXTRA_DOH, dohList)
-                    .putStringArrayListExtra(TheDpiVpnService.EXTRA_DNS, dnsList)
+                val vpnIntent = Intent(this, FreedomVpnService::class.java)
+                    .putStringArrayListExtra(FreedomVpnService.EXTRA_DOH, dohList)
+                    .putStringArrayListExtra(FreedomVpnService.EXTRA_DNS, dnsList)
+                    .putExtra(FreedomVpnService.EXTRA_KILL_SWITCH, killSwitchEnabled)
+                    .putExtra(FreedomVpnService.EXTRA_BLOCK_TRACKERS, trackersEnabled)
+                    .putExtra(FreedomVpnService.EXTRA_STUN_SHIELD, killSwitchEnabled)
+                    .putExtra(FreedomVpnService.EXTRA_QUIC_PASSTHROUGH, quicEnabled)
                 startForegroundService(vpnIntent)
-                CrashLogger.log("MainActivity", "TheDpiVpnService startForegroundService çağrıldı")
+                CrashLogger.log("MainActivity", "FreedomVpnService startForegroundService çağrıldı")
             }.onFailure {
-                CrashLogger.log("MainActivity", "TheDpiVpnService başlatılamadı!", it)
+                CrashLogger.log("MainActivity", "FreedomVpnService başlatılamadı!", it)
             }
         }
         worker.execute {
@@ -5153,13 +5613,16 @@ class MainActivity : Activity() {
                     tlsFragmented = b?.tlsRecordFragmented?.get() ?: 0,
                     bytesUp = b?.bytesUp?.get() ?: 0L,
                     bytesDown = b?.bytesDown?.get() ?: 0L,
+                    trackersBlocked = b?.trackersBlocked?.get() ?: 0,
+                    leaksBlocked = b?.leaksBlocked?.get() ?: 0,
+                    killSwitch = killSwitchEnabled,
                 )
                 ui {
                     diagOutput.text = text + "\n" + diagOutput.text.toString()
                     powerShieldView.isActive = true
                     updateDashboardMetrics(vpnGranted, next, b)
                     if (vpnGranted) {
-                        diagStatus.text = "Engelsiz Mod etkin: Sistem Geneli VPN (Discord/Roblox TCP+UDP+DoH) + 127.0.0.1:${next.port}"
+                        diagStatus.text = "Freedom Network etkin: Tüm Ağ (DoH3 + ECH/REALITY + UDP) + 127.0.0.1:${next.port}"
                     } else {
                         diagStatus.text = "VPN izni verilmedi; yalnızca yerel proxy etkin (127.0.0.1:${next.port})"
                     }
@@ -5191,10 +5654,14 @@ class MainActivity : Activity() {
     private companion object {
         const val REQ_VPN = 1001
         const val REQ_NOTIF = 1002
+        const val KEY_TAB = "tab"
         const val KEY_TARGETS = "targets"
         const val KEY_ALT = "alt"
         const val KEY_DOH = "doh"
         const val KEY_AUTO = "auto"
         const val KEY_OUTPUT = "output"
+        const val PREF_KILL_SWITCH = "pref_kill_switch"
+        const val PREF_BLOCK_TRACKERS = "pref_block_trackers"
+        const val PREF_QUIC_PASSTHROUGH = "pref_quic_passthrough"
     }
 }

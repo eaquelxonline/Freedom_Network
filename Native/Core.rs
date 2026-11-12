@@ -1,18 +1,22 @@
-//! THE DPI — native network intelligence core.
+//! Freedom Network — native network intelligence, censorship bypass & privacy core.
 //!
 //! One crate, Rust standard library only, zero third-party dependencies.
 //!
 //! Sections (each a module with a single responsibility):
-//! - `wire`     versioned binary codec shared with Kotlin (the only data format crossing JNI)
-//! - `dns`      DNS message builder/parser (RFC 1035, RFC 6891 EDNS0, RFC 9460 HTTPS/SVCB)
-//! - `quic`     QUIC v1 Version Negotiation probe builder/parser (RFC 9000 §6, §15, §17.2.1)
-//! - `sys`      the small, reviewable set of OS FFI calls (setsockopt, IP Helper, registry)
-//! - `probe`    bounded, low-impact measurements (DNS, TCP, UDP/QUIC reachability, path MTU)
-//! - `intel`    explainable problem classification with confidence + observations
-//! - `decide`   deterministic adaptive decision engine (hysteresis, debounce, cooldown, rollback)
-//! - `engine`   engine lifecycle, configuration, scoring and report encoding
-//! - `api`      safe Rust facade (used by JNI and by tests)
-//! - `jni`      the single JNI boundary (no external JNI crate; panics never cross it)
+//! - `ascii`     architecture-specific SIMD Assembly (`x86_64.s` SSE2 / `Arm64.s` NEON)
+//! - `wire`      versioned binary codec shared with Kotlin (the only data format crossing JNI)
+//! - `dns`       DNS message builder/parser (RFC 1035, RFC 6891 EDNS0, RFC 9460 HTTPS/SVCB)
+//! - `quic`      QUIC v1/v2 Version Negotiation & padding helper (RFC 9000)
+//! - `sys`       the small, reviewable set of OS FFI calls (setsockopt, IP Helper, registry)
+//! - `desync`    active full-network DPI bypass (SNI/ECH split, Disorder, FakeTTL/BadSum, UDP mimicry)
+//! - `relay`     personal encrypted relay (`REALITY` + `X25519MLKEM768` + MASQUE RFC 9298/9484)
+//! - `oblivious` 2026–2027 IP-hiding Oblivious HTTP (RFC 9458) & Oblivious DoH (RFC 9230) framing + privacy filter
+//! - `probe`     bounded, low-impact measurements (DNS, TCP, UDP/QUIC reachability, path MTU)
+//! - `intel`     explainable problem classification with confidence + observations
+//! - `decide`    deterministic adaptive decision engine (hysteresis, debounce, cooldown, rollback)
+//! - `engine`    engine lifecycle, configuration, scoring and report encoding
+//! - `api`       safe Rust facade (used by JNI and by tests)
+//! - `jni`       the single JNI boundary (no external JNI crate; panics never cross it)
 //!
 //! No cryptography is implemented here. TLS is measured by the platform layer
 //! (Android platform TLS / JDK JSSE with the Windows certificate store) and only
@@ -40,15 +44,15 @@ pub mod code {
 }
 
 // ---------------------------------------------------------------------------
-// ascii — architecture-specific Assembly (Core.s / Core.aarch64.s) with a std fallback
+// ascii — architecture-specific Assembly (x86_64.s / Arm64.s) with a std fallback
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(include_str!("Core.s"), options(att_syntax));
+core::arch::global_asm!(include_str!("x86_64.s"), options(att_syntax));
 #[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(include_str!("Core.aarch64.s"));
+core::arch::global_asm!(include_str!("Arm64.s"));
 
-/// Architecture-specific SIMD Assembly primitives (Core.s SSE2 / Core.aarch64.s NEON)
+/// Architecture-specific SIMD Assembly primitives (x86_64.s SSE2 / Arm64.s NEON)
 /// with portable standard-library fallbacks:
 /// - `lowercase_in_place` / `lowercased`: DNS/target ASCII normalization
 /// - `csum_fold`: RFC 1071 16-bit one's-complement big-endian checksum accumulator
@@ -57,10 +61,10 @@ core::arch::global_asm!(include_str!("Core.aarch64.s"));
 pub mod ascii {
     #[cfg(target_arch = "x86_64")]
     unsafe extern "sysv64" {
-        fn the_dpi_ascii_lowercase(dst: *mut u8, src: *const u8, len: usize);
-        fn the_dpi_csum_fold(buf: *const u8, len: usize, initial: u64) -> u16;
-        fn the_dpi_csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16;
-        fn the_dpi_scan_pattern(
+        fn freedom_ascii_lowercase(dst: *mut u8, src: *const u8, len: usize);
+        fn freedom_csum_fold(buf: *const u8, len: usize, initial: u64) -> u16;
+        fn freedom_csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16;
+        fn freedom_scan_pattern(
             hay: *const u8,
             hay_len: usize,
             needle: *const u8,
@@ -69,10 +73,10 @@ pub mod ascii {
     }
     #[cfg(target_arch = "aarch64")]
     unsafe extern "C" {
-        fn the_dpi_ascii_lowercase(dst: *mut u8, src: *const u8, len: usize);
-        fn the_dpi_csum_fold(buf: *const u8, len: usize, initial: u64) -> u16;
-        fn the_dpi_csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16;
-        fn the_dpi_scan_pattern(
+        fn freedom_ascii_lowercase(dst: *mut u8, src: *const u8, len: usize);
+        fn freedom_csum_fold(buf: *const u8, len: usize, initial: u64) -> u16;
+        fn freedom_csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16;
+        fn freedom_scan_pattern(
             hay: *const u8,
             hay_len: usize,
             needle: *const u8,
@@ -85,7 +89,7 @@ pub mod ascii {
         if !buf.is_empty() {
             // SAFETY: `dst` and `src` are the same valid, writable buffer of `buf.len()`
             // bytes; the routine only reads and writes those bytes in place.
-            unsafe { the_dpi_ascii_lowercase(buf.as_mut_ptr(), buf.as_ptr(), buf.len()) };
+            unsafe { freedom_ascii_lowercase(buf.as_mut_ptr(), buf.as_ptr(), buf.len()) };
         }
     }
 
@@ -123,7 +127,7 @@ pub mod ascii {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn csum_fold(buf: &[u8], initial: u64) -> u16 {
         // SAFETY: `buf.as_ptr()` is valid for `buf.len()` readable bytes.
-        unsafe { the_dpi_csum_fold(buf.as_ptr(), buf.len(), initial) }
+        unsafe { freedom_csum_fold(buf.as_ptr(), buf.len(), initial) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -144,7 +148,7 @@ pub mod ascii {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn csum_delta(old_check: u16, old_word: u16, new_word: u16) -> u16 {
         // SAFETY: pure register arithmetic with no memory accesses.
-        unsafe { the_dpi_csum_delta(old_check, old_word, new_word) }
+        unsafe { freedom_csum_delta(old_check, old_word, new_word) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -174,7 +178,7 @@ pub mod ascii {
         }
         // SAFETY: both slices are valid and readable for their respective lengths.
         let pos =
-            unsafe { the_dpi_scan_pattern(hay.as_ptr(), hay.len(), needle.as_ptr(), needle.len()) };
+            unsafe { freedom_scan_pattern(hay.as_ptr(), hay.len(), needle.as_ptr(), needle.len()) };
         (pos < hay.len()).then_some(pos)
     }
 
@@ -1767,8 +1771,8 @@ pub mod sys {
         impl Default for WintunAdapterConfig {
             fn default() -> Self {
                 Self {
-                    adapter_name: "TheDPI".to_owned(),
-                    tunnel_type: "TheDPI-L3".to_owned(),
+                    adapter_name: "FreedomNetwork".to_owned(),
+                    tunnel_type: "Freedom-L3".to_owned(),
                     ring_capacity: DEFAULT_RING_CAPACITY,
                     ipv4_addr: Ipv4Addr::new(10, 215, 173, 1),
                     ipv4_prefix: 24,
@@ -2181,10 +2185,10 @@ pub mod desync {
     pub const PROTO_TLS_CLIENT_HELLO: i64 = 1;
     pub const PROTO_HTTP_REQUEST: i64 = 2;
     pub const PROTO_QUIC_INITIAL: i64 = 3;
-    pub const PROTO_DISCORD_VOICE: i64 = 4;
-    pub const PROTO_ROBLOX_RAKNET: i64 = 5;
+    pub const PROTO_UDP_STUN_MEDIA: i64 = 4;
+    pub const PROTO_UDP_REALTIME: i64 = 5;
 
-    /// RakNet `OFFLINE_MESSAGE_DATA_ID` 16-byte magic used in Roblox UDP connection handshakes (`0x01`, `0x05`, `0x07`).
+    /// RakNet-compatible `OFFLINE_MESSAGE_DATA_ID` 16-byte magic used in real-time UDP handshakes (`0x01`, `0x05`, `0x07`).
     pub const RAKNET_OFFLINE_MAGIC: [u8; 16] = [
         0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56,
         0x78,
@@ -2577,7 +2581,7 @@ pub mod desync {
 
     /// Inspects a TCP or UDP payload for TLS ClientHello (SNI 0x0000, ECH 0xfe0d, PQ KeyShare
     /// 0x11ec), HTTP request (`Host:` header via SIMD `scan_pattern`), QUIC v1/v2 Initial,
-    /// Discord Voice IP Discovery / STUN, or Roblox RakNet UDP handshake.
+    /// RFC 5389 STUN / VoIP media discovery, or low-latency real-time UDP handshakes.
     pub fn inspect_l7(payload: &[u8], fallback_split: usize) -> L7Inspection {
         if let Some(tls) = inspect_tls_client_hello(payload, fallback_split) {
             return tls;
@@ -2588,11 +2592,11 @@ pub mod desync {
         if let Some(q) = inspect_quic_initial(payload) {
             return q;
         }
-        if let Some(dv) = inspect_discord_voice(payload) {
-            return dv;
+        if let Some(stun) = inspect_udp_stun_media(payload) {
+            return stun;
         }
-        if let Some(rk) = inspect_roblox_raknet(payload) {
-            return rk;
+        if let Some(rt) = inspect_udp_realtime(payload) {
+            return rt;
         }
         L7Inspection::default()
     }
@@ -2760,8 +2764,8 @@ pub mod desync {
         })
     }
 
-    fn inspect_discord_voice(buf: &[u8]) -> Option<L7Inspection> {
-        // Discord Voice IP Discovery (74-byte `[0x00, 0x01, 0x00, 0x46, ...]` or 70-byte
+    fn inspect_udp_stun_media(buf: &[u8]) -> Option<L7Inspection> {
+        // Generic VoIP/WebRTC IP Discovery (74-byte `[0x00, 0x01, 0x00, 0x46, ...]` or 70-byte
         // `[0x00, 0x01, 0x00, 0x42, ...]`) or RFC 5389 STUN Binding Request with magic `0x2112A442`.
         let is_ip_discovery = (buf.len() == 74 && buf[..4] == [0x00, 0x01, 0x00, 0x46])
             || (buf.len() == 70 && buf[..4] == [0x00, 0x01, 0x00, 0x42]);
@@ -2771,22 +2775,22 @@ pub mod desync {
             return None;
         }
         Some(L7Inspection {
-            protocol: PROTO_DISCORD_VOICE,
-            host: "discord.voice".to_owned(),
+            protocol: PROTO_UDP_STUN_MEDIA,
+            host: "stun.media".to_owned(),
             ..L7Inspection::default()
         })
     }
 
-    fn inspect_roblox_raknet(buf: &[u8]) -> Option<L7Inspection> {
-        // Roblox RakNet connection establishment packets (`0x01` UnconnectedPing, `0x05`
-        // OpenConnectionRequest1, `0x07` OpenConnectionRequest2) carry the 16-byte offline magic.
+    fn inspect_udp_realtime(buf: &[u8]) -> Option<L7Inspection> {
+        // Real-time RakNet-style UDP connection handshakes (`0x01` UnconnectedPing, `0x05`
+        // OpenConnectionRequest1, `0x07` OpenConnectionRequest2) carrying the 16-byte offline magic.
         if buf.len() < 17 || !matches!(buf[0], 0x01 | 0x02 | 0x05 | 0x07) {
             return None;
         }
         ascii::scan_pattern(buf, &RAKNET_OFFLINE_MAGIC)?;
         Some(L7Inspection {
-            protocol: PROTO_ROBLOX_RAKNET,
-            host: "roblox.raknet".to_owned(),
+            protocol: PROTO_UDP_REALTIME,
+            host: "udp.realtime".to_owned(),
             ..L7Inspection::default()
         })
     }
@@ -3184,7 +3188,7 @@ pub mod desync {
         let info = inspect_l7(payload, cfg.split_pos);
         if !matches!(
             info.protocol,
-            PROTO_QUIC_INITIAL | PROTO_DISCORD_VOICE | PROTO_ROBLOX_RAKNET
+            PROTO_QUIC_INITIAL | PROTO_UDP_STUN_MEDIA | PROTO_UDP_REALTIME
         ) || !matches!(
             cfg.mode,
             DesyncMode::QuicScramble | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
@@ -3195,8 +3199,8 @@ pub mod desync {
                 inspection: info,
             };
         }
-        // Prepend a low-TTL decoy UDP datagram before the real QUIC Initial, Discord Voice IP
-        // Discovery, or Roblox RakNet connection request so stateful first-packet UDP DPI filters
+        // Prepend a low-TTL decoy UDP datagram before the real QUIC Initial, STUN/VoIP media
+        // discovery, or real-time UDP connection request so stateful first-packet DPI filters
         // latch onto the benign decoy while it expires before reaching the destination server.
         let fake_payload = if info.protocol == PROTO_QUIC_INITIAL {
             quic::build_probe(
@@ -3205,9 +3209,9 @@ pub mod desync {
                 quic::MIN_INITIAL_DATAGRAM,
             )
         } else {
-            // 24-byte benign RFC 5389 STUN Binding Indication / NTP-like keepalive decoy
+            // 24-byte benign RFC 5389 STUN Binding Indication / keepalive decoy
             vec![
-                0x00, 0x11, 0x00, 0x04, 0x21, 0x12, 0xa4, 0x42, 0x74, 0x68, 0x65, 0x64, 0x70, 0x69,
+                0x00, 0x11, 0x00, 0x04, 0x21, 0x12, 0xa4, 0x42, 0x66, 0x72, 0x64, 0x6d, 0x32, 0x30,
                 0x32, 0x36, 0x80, 0x28, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
             ]
         };
@@ -3236,6 +3240,44 @@ pub mod desync {
             dropped_inbound: false,
             inspection: info,
         }
+    }
+
+    /// Generates AmneziaWG-inspired high-entropy UDP mimicry junk prefaces so stateful and
+    /// heuristic DPI classifiers cannot fingerprint encrypted or real-time UDP tunnels by size or
+    /// initial byte signatures.
+    pub fn build_udp_mimicry_prefaces(
+        count: usize,
+        min_len: usize,
+        max_len: usize,
+        seed: u64,
+    ) -> Vec<Vec<u8>> {
+        let clamped_count = count.min(8);
+        let lo = min_len.clamp(24, 512);
+        let hi = max_len.clamp(lo, 1024);
+        let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+        let mut out = Vec::with_capacity(clamped_count);
+        for _ in 0..clamped_count {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let span = (hi - lo) + 1;
+            let len = lo + (state as usize % span);
+            let mut pkt = Vec::with_capacity(len);
+            for j in 0..len {
+                if j % 8 == 0 {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                }
+                pkt.push(((state >> ((j % 8) * 8)) & 0xff) as u8);
+            }
+            // Ensure high bit / header diversity avoids cleartext QUIC or STUN false signatures
+            if !pkt.is_empty() {
+                pkt[0] = (pkt[0] & 0x3f) | 0x40;
+            }
+            out.push(pkt);
+        }
+        out
     }
 
     fn desync_ipv6(pkt: &[u8], cfg: &DesyncConfig) -> DesyncOutput {
@@ -3419,7 +3461,7 @@ pub mod desync {
             let cfg_c = cfg.clone();
 
             let handle = thread::Builder::new()
-                .name("thedpi-desync-proxy".to_owned())
+                .name("freedom-desync-proxy".to_owned())
                 .spawn(move || {
                     while !stop_c.load(Ordering::Acquire) {
                         match listener.accept() {
@@ -3669,7 +3711,7 @@ pub mod desync {
 /// 4. **Multi-Server Failover**: `RelayClient` automatically fails over from `primary_endpoint`
 ///    to `backup_endpoint` when the primary server is unreachable.
 /// 5. **RFC 9298 (HTTP/UDP) & RFC 9484 (HTTP/IP) MASQUE Framing**: Standardized datagram and
-///    Layer-3 packet capsules for lossless UDP (Roblox/Discord voice) and IP tunneling.
+///    Layer-3 packet capsules for lossless real-time UDP (VoIP/media/gaming) and IP tunneling.
 pub mod relay {
     use crate::desync::{
         REALITY_DEFAULT_DEST, TLS_GROUP_X25519_MLKEM768, VisionFlow, VisionPhase,
@@ -3882,7 +3924,7 @@ pub mod relay {
             let cnt_c = Arc::clone(&counters);
 
             let handle = thread::Builder::new()
-                .name("thedpi-personal-relay".to_owned())
+                .name("freedom-personal-relay".to_owned())
                 .spawn(move || {
                     while !stop_c.load(Ordering::Acquire) {
                         match listener.accept() {
@@ -4000,7 +4042,7 @@ pub mod relay {
         sh.extend_from_slice(&[0x00, 0x00]);
         // Inner TLS 1.3 ApplicationData record (0x17 0x03 0x03) carrying status code
         sh.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x09]);
-        sh.extend_from_slice(b"THEDPI_V");
+        sh.extend_from_slice(b"FREEDOM_");
         sh.push(status as i64 as u8);
         sh
     }
@@ -4186,8 +4228,8 @@ pub mod relay {
             let rtt_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(1);
             profile.latency_us = rtt_us;
 
-            // Parse ServerHello + ApplicationData status ack (`THEDPI_V` + status byte)
-            if let Some(pos) = crate::ascii::scan_pattern(&resp[..rn], b"THEDPI_V")
+            // Parse ServerHello + ApplicationData status ack (`FREEDOM_` + status byte)
+            if let Some(pos) = crate::ascii::scan_pattern(&resp[..rn], b"FREEDOM_")
                 && pos + 8 < rn
             {
                 let code = resp[pos + 8];
@@ -4224,6 +4266,228 @@ pub mod relay {
 
         profile.status = ServerStatus::Unreachable;
         Err(ServerStatus::Unreachable)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// oblivious — 2026–2027 OHTTP (RFC 9458), ODoH (RFC 9230), BHTTP (RFC 9292)
+// ---------------------------------------------------------------------------
+
+/// IP & ISP hiding wire primitives: Oblivious HTTP (`RFC 9458`), Oblivious DoH (`RFC 9230`),
+/// Binary HTTP (`RFC 9292`) framing, client-identifying header stripping, and tracker filtering.
+///
+/// The Oblivious Relay model separates **who is asking** (client IP seen only by the first-hop
+/// OHTTP/ODoH Relay) from **what is asked** (encrypted BHTTP/DNS message seen only by the Target).
+pub mod oblivious {
+    use crate::ascii;
+
+    /// IANA HPKE / OHTTP ciphersuite defaults (DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305).
+    pub const KEM_X25519_HKDF_SHA256: u16 = 0x0020;
+    pub const KDF_HKDF_SHA256: u16 = 0x0001;
+    pub const AEAD_AES_128_GCM: u16 = 0x0001;
+    pub const AEAD_CHACHA20_POLY1305: u16 = 0x0003;
+    pub const X25519_ENC_LEN: usize = 32;
+
+    /// RFC 9230 Oblivious DNS over HTTPS message type.
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OdohType {
+        Query = 0x01,
+        Response = 0x02,
+    }
+
+    /// RFC 9458 OHTTP request header (`key_id || kem_id || kdf_id || aead_id`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OhttpHeader {
+        pub key_id: u8,
+        pub kem_id: u16,
+        pub kdf_id: u16,
+        pub aead_id: u16,
+    }
+
+    impl Default for OhttpHeader {
+        fn default() -> Self {
+            Self {
+                key_id: 1,
+                kem_id: KEM_X25519_HKDF_SHA256,
+                kdf_id: KDF_HKDF_SHA256,
+                aead_id: AEAD_CHACHA20_POLY1305,
+            }
+        }
+    }
+
+    /// Encodes an RFC 9458 OHTTP encapsulated request:
+    /// `key_id (1B) || kem_id (2B BE) || kdf_id (2B BE) || aead_id (2B BE) || enc || ct`.
+    pub fn encode_ohttp_request(
+        hdr: OhttpHeader,
+        enc: &[u8],
+        ciphertext: &[u8],
+    ) -> Option<Vec<u8>> {
+        if enc.is_empty() || ciphertext.is_empty() || 7 + enc.len() + ciphertext.len() > 65_535 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(7 + enc.len() + ciphertext.len());
+        out.push(hdr.key_id);
+        out.extend_from_slice(&hdr.kem_id.to_be_bytes());
+        out.extend_from_slice(&hdr.kdf_id.to_be_bytes());
+        out.extend_from_slice(&hdr.aead_id.to_be_bytes());
+        out.extend_from_slice(enc);
+        out.extend_from_slice(ciphertext);
+        Some(out)
+    }
+
+    /// Parses an RFC 9458 OHTTP encapsulated request using fixed `enc_len` (32B for X25519).
+    pub fn decode_ohttp_request(
+        frame: &[u8],
+        enc_len: usize,
+    ) -> Option<(OhttpHeader, &[u8], &[u8])> {
+        if enc_len == 0 || frame.len() <= 7 + enc_len {
+            return None;
+        }
+        let hdr = OhttpHeader {
+            key_id: frame[0],
+            kem_id: u16::from_be_bytes([frame[1], frame[2]]),
+            kdf_id: u16::from_be_bytes([frame[3], frame[4]]),
+            aead_id: u16::from_be_bytes([frame[5], frame[6]]),
+        };
+        let enc = &frame[7..7 + enc_len];
+        let ct = &frame[7 + enc_len..];
+        Some((hdr, enc, ct))
+    }
+
+    fn push_bhttp_varint(out: &mut Vec<u8>, val: usize) {
+        if val < 64 {
+            out.push(val as u8);
+        } else if val < 16_384 {
+            let v = (val as u16) | 0x4000;
+            out.extend_from_slice(&v.to_be_bytes());
+        } else {
+            let v = (val as u32) | 0x8000_0000;
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    fn push_bhttp_slice(out: &mut Vec<u8>, s: &[u8]) {
+        push_bhttp_varint(out, s.len());
+        out.extend_from_slice(s);
+    }
+
+    /// Encodes a known-length RFC 9292 Binary HTTP request (`Framing Indicator = 0x00`).
+    pub fn encode_bhttp_request(
+        method: &str,
+        scheme: &str,
+        authority: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64 + body.len());
+        out.push(0x00); // Known-length Request
+        push_bhttp_slice(&mut out, method.as_bytes());
+        push_bhttp_slice(&mut out, scheme.as_bytes());
+        push_bhttp_slice(&mut out, authority.as_bytes());
+        push_bhttp_slice(&mut out, path.as_bytes());
+        let mut hdr_sec = Vec::new();
+        for (k, v) in headers {
+            let kl = ascii::lowercased(k);
+            push_bhttp_slice(&mut hdr_sec, kl.as_bytes());
+            push_bhttp_slice(&mut hdr_sec, v.as_bytes());
+        }
+        push_bhttp_slice(&mut out, &hdr_sec);
+        push_bhttp_slice(&mut out, body);
+        out.push(0x00); // Empty trailers
+        out
+    }
+
+    /// Encodes an RFC 9230 Oblivious DoH wire message:
+    /// `Message Type (1B) || Key ID Len (2B BE) || Key ID || Encrypted Message Len (2B BE) || Body`.
+    pub fn encode_odoh_message(
+        msg_type: OdohType,
+        key_id: &[u8],
+        encrypted_body: &[u8],
+    ) -> Option<Vec<u8>> {
+        if key_id.len() > 64 || encrypted_body.is_empty() || encrypted_body.len() > 65_535 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(5 + key_id.len() + encrypted_body.len());
+        out.push(msg_type as u8);
+        out.extend_from_slice(&(key_id.len() as u16).to_be_bytes());
+        out.extend_from_slice(key_id);
+        out.extend_from_slice(&(encrypted_body.len() as u16).to_be_bytes());
+        out.extend_from_slice(encrypted_body);
+        Some(out)
+    }
+
+    /// Decodes an RFC 9230 Oblivious DoH wire message.
+    pub fn decode_odoh_message(frame: &[u8]) -> Option<(OdohType, &[u8], &[u8])> {
+        if frame.len() < 5 {
+            return None;
+        }
+        let msg_type = match frame[0] {
+            0x01 => OdohType::Query,
+            0x02 => OdohType::Response,
+            _ => return None,
+        };
+        let kid_len = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
+        if 3 + kid_len + 2 > frame.len() {
+            return None;
+        }
+        let key_id = &frame[3..3 + kid_len];
+        let body_len = usize::from(u16::from_be_bytes([frame[3 + kid_len], frame[4 + kid_len]]));
+        let body_start = 5 + kid_len;
+        if body_start + body_len > frame.len() || body_len == 0 {
+            return None;
+        }
+        Some((msg_type, key_id, &frame[body_start..body_start + body_len]))
+    }
+
+    /// Strips IP-identifying and fingerprinting HTTP headers before an Oblivious Relay forwards
+    /// a request or encapsulated payload to a target service.
+    pub fn strip_identifying_http_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .filter(|(k, _)| {
+                let kl = ascii::lowercased(k);
+                !matches!(
+                    kl.as_str(),
+                    "x-forwarded-for"
+                        | "forwarded"
+                        | "x-real-ip"
+                        | "true-client-ip"
+                        | "cf-connecting-ip"
+                        | "client-ip"
+                        | "via"
+                        | "x-client-ip"
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Checks whether a queried hostname matches well-known telemetry/ad/tracker sinkhole patterns
+    /// when the user enables Privacy Tracker Guard.
+    pub fn is_tracker_or_ad_domain(host: &str) -> bool {
+        let lower = ascii::lowercased(host.trim_end_matches('.'));
+        const TRACKER_SUFFIXES: [&str; 12] = [
+            "doubleclick.net",
+            "googlesyndication.com",
+            "googleadservices.com",
+            "google-analytics.com",
+            "app-measurement.com",
+            "adsrvr.org",
+            "adnxs.com",
+            "criteo.com",
+            "taboola.com",
+            "outbrain.com",
+            "scorecardresearch.com",
+            "branch.io",
+        ];
+        TRACKER_SUFFIXES.iter().any(|suf| {
+            lower == *suf
+                || (lower.len() > suf.len()
+                    && lower.ends_with(suf)
+                    && lower.as_bytes()[lower.len() - suf.len() - 1] == b'.')
+        })
     }
 }
 
@@ -4566,10 +4830,12 @@ pub mod probe {
 
     pub fn is_poisoned_ipv4(ip: &Ipv4Addr) -> bool {
         let oct = ip.octets();
-        // Turkish ISP / BTK censorship sinkhole (195.175.254.0/24 e.g. 195.175.254.2)
+        // ISP / BTK censorship sinkhole (195.175.254.0/24 e.g. 195.175.254.2)
         (oct[0] == 195 && oct[1] == 175 && oct[2] == 254)
         // 0.0.0.0 sinkhole
         || (oct[0] == 0 && oct[1] == 0 && oct[2] == 0 && oct[3] == 0)
+        // Loopback sinkhole injected for public domains (host exemptions checked in is_poisoned_response)
+        || (oct[0] == 127 && oct[1] == 0 && oct[2] == 0 && oct[3] == 1)
     }
 
     pub fn is_poisoned_ipv6(ip: &Ipv6Addr) -> bool {
@@ -5135,7 +5401,7 @@ pub mod probe {
             let mut spawned = 0;
             for n in 0..workers {
                 let b = std::thread::Builder::new()
-                    .name(format!("thedpi-probe-{n}"))
+                    .name(format!("freedom-probe-{n}"))
                     .stack_size(WORKER_STACK);
                 if b.spawn_scoped(scope, worker).is_ok() {
                     spawned += 1;
@@ -7472,7 +7738,7 @@ pub mod api {
 }
 
 // ---------------------------------------------------------------------------
-// jni — the single Kotlin ↔ Rust boundary (class `thedpi.Native`)
+// jni — the single Kotlin ↔ Rust boundary (class `com.freedom.network.Native`)
 // ---------------------------------------------------------------------------
 
 /// Hand-written minimal JNI binding. Function-table indices are fixed by the JNI
@@ -7651,14 +7917,17 @@ mod exports {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_thedpi_Native_apiVersion(_env: EnvPtr, _class: JClass) -> JInt {
+    pub extern "system" fn Java_com_freedom_network_Native_apiVersion(
+        _env: EnvPtr,
+        _class: JClass,
+    ) -> JInt {
         API_VERSION
     }
 
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_engineVersion(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_engineVersion(
         env: EnvPtr,
         _class: JClass,
     ) -> JString {
@@ -7671,7 +7940,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_create(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_create(
         env: EnvPtr,
         _class: JClass,
         config: JByteArray,
@@ -7689,7 +7958,7 @@ mod exports {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_thedpi_Native_destroy(
+    pub extern "system" fn Java_com_freedom_network_Native_destroy(
         _env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7700,7 +7969,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_detectEnvironment(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_detectEnvironment(
         env: EnvPtr,
         _class: JClass,
     ) -> JByteArray {
@@ -7713,7 +7982,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_setEnvironment(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_setEnvironment(
         env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7731,7 +8000,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_diagnose(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_diagnose(
         env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7751,7 +8020,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_submitTls(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_submitTls(
         env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7769,7 +8038,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_evaluate(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_evaluate(
         env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7783,7 +8052,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_systemConnections(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_systemConnections(
         env: EnvPtr,
         _class: JClass,
     ) -> JByteArray {
@@ -7796,7 +8065,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_dohQuery(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_dohQuery(
         env: EnvPtr,
         _class: JClass,
         data: JByteArray,
@@ -7815,7 +8084,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_submitEncrypted(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_submitEncrypted(
         env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7831,7 +8100,7 @@ mod exports {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_thedpi_Native_networkChanged(
+    pub extern "system" fn Java_com_freedom_network_Native_networkChanged(
         _env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7840,7 +8109,7 @@ mod exports {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_thedpi_Native_markApplied(
+    pub extern "system" fn Java_com_freedom_network_Native_markApplied(
         _env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7852,7 +8121,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_desyncPacket(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_desyncPacket(
         env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7872,7 +8141,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_startProxy(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_startProxy(
         env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7890,7 +8159,7 @@ mod exports {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_thedpi_Native_stopProxy(
+    pub extern "system" fn Java_com_freedom_network_Native_stopProxy(
         _env: EnvPtr,
         _class: JClass,
         handle: JLong,
@@ -7901,7 +8170,7 @@ mod exports {
     /// # Safety
     /// Called by the JVM with a valid `JNIEnv`.
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn Java_thedpi_Native_proxyStats(
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_proxyStats(
         env: EnvPtr,
         _class: JClass,
         handle: JLong,

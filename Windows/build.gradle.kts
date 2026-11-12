@@ -1,11 +1,11 @@
-// THE DPI — Windows 10/11 x64 application module (Kotlin/JVM + JDK Swing + Rust DLL).
+// Freedom Network — Windows 10/11 x64 application module (Kotlin/JVM + JDK Swing + Rust DLL).
 plugins {
     id("org.jetbrains.kotlin.jvm")
     application
 }
 
 version = "1.0.0"
-base.archivesName.set("TheDPI")
+base.archivesName.set("FreedomNetwork")
 
 val nativeDir: Directory = rootProject.layout.projectDirectory.dir("Native")
 val hostLibDir: String = nativeDir.dir("target/release").asFile.absolutePath
@@ -31,13 +31,13 @@ sourceSets {
 }
 
 application {
-    mainClass.set("thedpi.CoreKt")
-    applicationName = "TheDPI"
+    mainClass.set("com.freedom.network.CoreKt")
+    applicationName = "FreedomNetwork"
 }
 
 tasks.jar {
     manifest {
-        attributes("Implementation-Title" to "THE DPI", "Implementation-Version" to project.version, "Main-Class" to "thedpi.CoreKt")
+        attributes("Implementation-Title" to "Freedom Network", "Implementation-Version" to project.version, "Main-Class" to "com.freedom.network.CoreKt")
     }
 }
 
@@ -49,7 +49,7 @@ tasks.named<JavaExec>("run") {
 // Throwaway self-signed certificate for the loopback TLS tests. Generated at build time with the
 // JDK keytool, never committed and never shipped; its password protects nothing.
 val testKeystore = layout.buildDirectory.file("test/keystore.p12")
-val testKeystorePassword = "thedpi-test-only"
+val testKeystorePassword = "freedom-test-only"
 val generateTestKeystore = tasks.register<Exec>("generateTestKeystore") {
     val ks = testKeystore.get().asFile
     val keytool = File(System.getProperty("java.home"), "bin/keytool" + if (isWindowsHost) ".exe" else "").absolutePath
@@ -71,12 +71,12 @@ val coreTest = tasks.register<JavaExec>("coreTest") {
     description = "Runs the JVM/JNI test suite against the host build of the Rust core."
     dependsOn(":nativeBuildHost", generateTestKeystore)
     classpath = sourceSets["test"].runtimeClasspath
-    mainClass.set("thedpi.CoreTestKt")
+    mainClass.set("com.freedom.network.TestsKt")
     jvmArgs(
         "-Djava.library.path=$hostLibDir",
         "-Xcheck:jni",
-        "-Dthedpi.test.keystore=${testKeystore.get().asFile.absolutePath}",
-        "-Dthedpi.test.keystore.password=$testKeystorePassword",
+        "-Dfreedom.test.keystore=${testKeystore.get().asFile.absolutePath}",
+        "-Dfreedom.test.keystore.password=$testKeystorePassword",
     )
 }
 
@@ -90,7 +90,7 @@ tasks.check { dependsOn(coreTest) }
 // ---- Release packaging (Windows host only): MSVC DLL + jpackage app-image with a bundled runtime.
 val nativeBuildWindows = tasks.register<Exec>("nativeBuildWindows") {
     group = "build"
-    description = "Builds the_dpi.dll for x86_64-pc-windows-msvc (Windows host)."
+    description = "Builds freedom.dll for x86_64-pc-windows-msvc (Windows host)."
     enabled = isWindowsHost
     mustRunAfter(":nativeFormatCheck", ":nativeLint", ":nativeTest", ":nativeBuildHost")
     workingDir(nativeDir)
@@ -104,7 +104,7 @@ val packageInput = tasks.register<Copy>("packageInput") {
     dependsOn(tasks.jar, nativeBuildWindows)
     from(tasks.jar)
     from(configurations.runtimeClasspath)
-    from(nativeDir.file("target/x86_64-pc-windows-msvc/release/the_dpi.dll"))
+    from(nativeDir.file("target/x86_64-pc-windows-msvc/release/freedom.dll"))
     into(layout.buildDirectory.dir("package/input"))
 }
 
@@ -122,10 +122,10 @@ val packageWindows = tasks.register<Exec>("packageWindows") {
     doFirst { File(outPath).deleteRecursively() }
     commandLine(
         jpackageBin,
-        "--type", "app-image", "--name", "TheDPI", "--app-version", appVer,
-        "--vendor", "THE DPI", "--description", "Network intelligence and diagnostics",
+        "--type", "app-image", "--name", "FreedomNetwork", "--app-version", appVer,
+        "--vendor", "Freedom Network", "--description", "Universal censorship bypass, privacy and high-speed network engine",
         "--input", inputDir,
-        "--main-jar", "TheDPI-$appVer.jar", "--main-class", "thedpi.CoreKt",
+        "--main-jar", "FreedomNetwork-$appVer.jar", "--main-class", "com.freedom.network.CoreKt",
         "--java-options", "-Djava.library.path=\$APPDIR",
         "--icon", iconFile,
         "--dest", outPath,

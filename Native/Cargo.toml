@@ -1,9 +1,9 @@
 [package]
-name = "the_dpi"
+name = "freedom"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.99"
-description = "THE DPI native network intelligence core (std-only, zero third-party crates)"
+description = "Freedom Network native network intelligence & privacy core (std-only, zero third-party crates)"
 license = "LicenseRef-Proprietary"
 publish = false
 
@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 
 [lib]
-name = "the_dpi"
+name = "freedom"
 path = "Core.rs"
 crate-type = ["cdylib", "rlib"]
 
