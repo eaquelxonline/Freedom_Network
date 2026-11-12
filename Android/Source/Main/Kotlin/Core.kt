@@ -4457,8 +4457,7 @@ class MainActivity : Activity() {
 
         panelDiag.addView(inputLabel("Test hedefleri (her satıra bir tane):"))
         targets = EditText(this).apply {
-            setText(state?.getString(KEY_TARGETS) ?: "discord.com
-roblox.com")
+            setText(state?.getString(KEY_TARGETS) ?: "discord.com\nroblox.com")
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
             textSize = 12f
             setTextColor(Color.WHITE)
@@ -4772,8 +4771,7 @@ roblox.com")
                 val f = java.io.File(path)
                 if (f.exists()) {
                     val lines = f.readLines(Charsets.UTF_8)
-                    lines.takeLast(120).joinToString("
-")
+                    lines.takeLast(120).joinToString("\n")
                 } else {
                     "Henüz günlük kaydı oluşturulmadı."
                 }
@@ -4791,8 +4789,7 @@ roblox.com")
         val crash = CrashLogger.getCrashLogContent()
         if (crash.isNullOrBlank()) {
             Toast.makeText(this, "Kayıtlı çökme raporu bulunamadı (Sistem Kararlı)", Toast.LENGTH_LONG).show()
-            logOutput.text = "SİSTEM KARARLI: Kayıtlı çökme (crash dump) bulunamadı.
-Dosya: ${CrashLogger.getCrashLogPath()}"
+            logOutput.text = "SİSTEM KARARLI: Kayıtlı çökme (crash dump) bulunamadı.\nDosya: ${CrashLogger.getCrashLogPath()}"
         } else {
             logOutput.text = crash
             Toast.makeText(this, "Çökme raporu yüklendi", Toast.LENGTH_SHORT).show()
