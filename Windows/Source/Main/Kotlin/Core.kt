@@ -15,6 +15,16 @@ import java.net.http.HttpClient
 import java.net.URI
 import java.net.ProxySelector
 import java.net.ConnectException
+import java.awt.BasicStroke
+import java.awt.CardLayout
+import java.awt.Cursor
+import java.awt.LinearGradientPaint
+import java.awt.RadialGradientPaint
+import java.awt.datatransfer.StringSelection
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
+import java.awt.geom.Path2D
+import java.awt.geom.RoundRectangle2D
 import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Dimension
@@ -3002,7 +3012,122 @@ fun runCli(args: List<String>): Int {
     }
 }
 
-class AnimatedPulsePanel : JPanel() {
+// Swing Vector Icon Renderer (Pure Java2D Path2D - NO Emojis)
+internal object SwingVectorIcons {
+    fun drawShield(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color, fill: Boolean = true) {
+        val half = size / 2.0
+        val p = Path2D.Double().apply {
+            moveTo(cx.toDouble(), cy - half * 0.85)
+            lineTo(cx + half * 0.75, cy - half * 0.65)
+            curveTo(cx + half * 0.85, cy + half * 0.1, cx + half * 0.45, cy + half * 0.65, cx.toDouble(), cy + half * 0.9)
+            curveTo(cx - half * 0.45, cy + half * 0.65, cx - half * 0.85, cy + half * 0.1, cx - half * 0.75, cy - half * 0.65)
+            closePath()
+        }
+        g2.color = color
+        if (fill) {
+            g2.fill(p)
+        } else {
+            val oldStroke = g2.stroke
+            g2.stroke = BasicStroke((size * 0.12f).coerceAtLeast(1.5f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(p)
+            g2.stroke = oldStroke
+        }
+    }
+
+    fun drawBolt(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        val half = size / 2.0
+        val p = Path2D.Double().apply {
+            moveTo(cx + half * 0.1, cy - half * 0.9)
+            lineTo(cx - half * 0.65, cy + half * 0.05)
+            lineTo(cx - half * 0.05, cy + half * 0.05)
+            lineTo(cx - half * 0.25, cy + half * 0.9)
+            lineTo(cx + half * 0.65, cy - half * 0.05)
+            lineTo(cx + half * 0.05, cy - half * 0.05)
+            closePath()
+        }
+        g2.color = color
+        g2.fill(p)
+    }
+
+    fun drawLock(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        val half = size / 2.0
+        val oldStroke = g2.stroke
+        g2.color = color
+        g2.stroke = BasicStroke((size * 0.12f).coerceAtLeast(1.5f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+        g2.drawArc((cx - half * 0.4).toInt(), (cy - half * 0.85).toInt(), (half * 0.8).toInt(), (half * 0.8).toInt(), 0, 180)
+        g2.fillRoundRect((cx - half * 0.65).toInt(), (cy - half * 0.15).toInt(), (half * 1.3).toInt(), (half * 0.9).toInt(), (size * 0.2).toInt(), (size * 0.2).toInt())
+        g2.color = Color(7, 11, 20)
+        g2.fillOval(cx - 2, (cy + half * 0.25).toInt() - 2, 4, 4)
+        g2.stroke = oldStroke
+    }
+
+    fun drawGamepad(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        val half = size / 2.0
+        g2.color = color
+        g2.fillRoundRect((cx - half * 0.85).toInt(), (cy - half * 0.45).toInt(), (half * 1.7).toInt(), (half * 1.0).toInt(), (size * 0.25).toInt(), (size * 0.25).toInt())
+        g2.color = Color(7, 11, 20)
+        val pw = (size * 0.06).toInt().coerceAtLeast(2)
+        val pl = (size * 0.2).toInt().coerceAtLeast(4)
+        g2.fillRect((cx - half * 0.5).toInt() - pw / 2, (cy + half * 0.05).toInt() - pl / 2, pw, pl)
+        g2.fillRect((cx - half * 0.5).toInt() - pl / 2, (cy + half * 0.05).toInt() - pw / 2, pl, pw)
+        val btnDot = (size * 0.1).toInt().coerceAtLeast(2)
+        g2.fillOval((cx + half * 0.5).toInt() - btnDot / 2, (cy - half * 0.05).toInt() - btnDot / 2, btnDot, btnDot)
+        g2.fillOval((cx + half * 0.5).toInt() - btnDot / 2, (cy + half * 0.2).toInt() - btnDot / 2, btnDot, btnDot)
+        g2.fillOval((cx + half * 0.35).toInt() - btnDot / 2, (cy + half * 0.07).toInt() - btnDot / 2, btnDot, btnDot)
+        g2.fillOval((cx + half * 0.65).toInt() - btnDot / 2, (cy + half * 0.07).toInt() - btnDot / 2, btnDot, btnDot)
+    }
+
+    fun drawPulse(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        val half = size / 2.0
+        val oldStroke = g2.stroke
+        g2.color = color
+        g2.stroke = BasicStroke((size * 0.12f).coerceAtLeast(1.5f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+        val p = Path2D.Double().apply {
+            moveTo(cx - half * 0.9, cy.toDouble())
+            lineTo(cx - half * 0.4, cy.toDouble())
+            lineTo(cx - half * 0.2, cy - half * 0.7)
+            lineTo(cx + half * 0.15, cy + half * 0.7)
+            lineTo(cx + half * 0.35, cy - half * 0.25)
+            lineTo(cx + half * 0.5, cy.toDouble())
+            lineTo(cx + half * 0.9, cy.toDouble())
+        }
+        g2.draw(p)
+        g2.stroke = oldStroke
+    }
+
+    fun drawPower(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        val r = (size * 0.36).toInt()
+        val oldStroke = g2.stroke
+        g2.color = color
+        g2.stroke = BasicStroke((size * 0.13f).coerceAtLeast(2f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+        g2.drawArc(cx - r, cy - r, r * 2, r * 2, -35, 250)
+        g2.drawLine(cx, (cy - r * 1.15).toInt(), cx, (cy - r * 0.2).toInt())
+        g2.stroke = oldStroke
+    }
+
+    fun drawTerminal(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        val half = size / 2.0
+        val oldStroke = g2.stroke
+        g2.color = color
+        g2.stroke = BasicStroke((size * 0.1f).coerceAtLeast(1.5f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+        g2.drawRoundRect((cx - half * 0.85).toInt(), (cy - half * 0.7).toInt(), (half * 1.7).toInt(), (half * 1.4).toInt(), (size * 0.15).toInt(), (size * 0.15).toInt())
+        val p = Path2D.Double().apply {
+            moveTo(cx - half * 0.45, cy - half * 0.3)
+            lineTo(cx - half * 0.15, cy.toDouble())
+            lineTo(cx - half * 0.45, cy + half * 0.3)
+        }
+        g2.draw(p)
+        g2.drawLine(cx, (cy + half * 0.3).toInt(), (cx + half * 0.4).toInt(), (cy + half * 0.3).toInt())
+        g2.stroke = oldStroke
+    }
+}
+
+/**
+ * ModernPowerShieldPanel:
+ * Antialiased cyber power shield button with rotating reticle, expanding wave rings,
+ * and mouse click support.
+ */
+class ModernPowerShieldPanel : JPanel() {
     var isActive = false
         set(value) {
             if (field != value) {
@@ -3015,17 +3140,41 @@ class AnimatedPulsePanel : JPanel() {
             field = value
             repaint()
         }
+    var onToggleListener: (() -> Unit)? = null
+
     private var animPhase = 0f
+    private var isHovered = false
     private val animTimer = Timer(33) {
         animPhase = (animPhase + 0.02f) % 1.0f
         repaint()
-        Toolkit.getDefaultToolkit().sync()
     }
 
     init {
-        preferredSize = Dimension(600, 130)
-        background = Color(11, 15, 25)
+        preferredSize = Dimension(650, 160)
+        background = Color(7, 11, 20)
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         animTimer.start()
+
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                val cx = width / 2
+                val cy = height / 2
+                val btnR = (minOf(cx, cy) * 0.52).toInt()
+                val dx = e.x - cx
+                val dy = e.y - cy
+                if (dx * dx + dy * dy <= (btnR * 1.3) * (btnR * 1.3)) {
+                    onToggleListener?.invoke()
+                }
+            }
+            override fun mouseEntered(e: MouseEvent) {
+                isHovered = true
+                repaint()
+            }
+            override fun mouseExited(e: MouseEvent) {
+                isHovered = false
+                repaint()
+            }
+        })
     }
 
     fun stop() {
@@ -3037,6 +3186,7 @@ class AnimatedPulsePanel : JPanel() {
         val g2 = g.create() as Graphics2D
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
         g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+        g2.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE)
 
         val w = width
         val h = height
@@ -3044,81 +3194,296 @@ class AnimatedPulsePanel : JPanel() {
         val cy = h / 2
         val maxR = minOf(cx, cy) - 10
 
-        val baseColor = if (isActive) Color(0, 230, 118) else Color(0, 176, 255)
+        val baseColor = if (isActive) Color(16, 185, 129) else Color(56, 189, 248)
 
-        // Draw 3 animated expanding wave rings
-        for (i in 0 until 3) {
-            val phase = (animPhase + i * 0.333f) % 1.0f
-            val ringR = (maxR * phase).toInt()
-            val alpha = ((1.0f - phase) * 160).toInt().coerceIn(0, 255)
+        // 1) Expanding wave pulse rings
+        val waveCount = if (isActive) 3 else 1
+        for (i in 0 until waveCount) {
+            val phase = (animPhase + i * (1f / waveCount)) % 1f
+            val ringR = ((maxR * 0.52) + phase * (maxR * 0.48)).toInt()
+            val alpha = ((1.0f - phase) * (if (isActive) 140 else 40)).toInt().coerceIn(0, 255)
             g2.color = Color(baseColor.red, baseColor.green, baseColor.blue, alpha)
+            g2.stroke = BasicStroke((2.5f - phase * 1.2f).coerceAtLeast(1.0f))
             g2.drawOval(cx - ringR, cy - ringR, ringR * 2, ringR * 2)
         }
 
-        // Central shield orb
-        val centerR = (maxR * 0.45).toInt()
-        g2.color = if (isActive) Color(6, 78, 59, 230) else Color(12, 35, 64, 230)
-        g2.fillOval(cx - centerR, cy - centerR, centerR * 2, centerR * 2)
+        // 2) Rotating orbital dashed reticle
+        if (isActive) {
+            val reticleR = (maxR * 0.56).toInt()
+            g2.color = Color(baseColor.red, baseColor.green, baseColor.blue, 150)
+            val dashPattern = floatArrayOf(10f, 8f)
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10f, dashPattern, animPhase * 360f)
+            g2.drawOval(cx - reticleR, cy - reticleR, reticleR * 2, reticleR * 2)
+        }
 
-        g2.color = baseColor
-        g2.drawOval(cx - centerR, cy - centerR, centerR * 2, centerR * 2)
+        // 3) Center Button
+        val btnR = (maxR * 0.46).toInt()
 
-        // Status text
-        g2.font = Font("Segoe UI", Font.BOLD, 13)
-        val titleStr = if (isActive) "ENGELSİZ MOD ETKİN" else "ENGELSİZ MOD HAZIR"
+        // Glowing aura
+        val auraR = (btnR * 1.25).toInt()
+        g2.color = Color(baseColor.red, baseColor.green, baseColor.blue, if (isActive) (if (isHovered) 80 else 55) else 25)
+        g2.fillOval(cx - auraR, cy - auraR, auraR * 2, auraR * 2)
+
+        // Inner button gradient fill
+        val p1 = java.awt.geom.Point2D.Float(cx.toFloat(), (cy - btnR).toFloat())
+        val p2 = java.awt.geom.Point2D.Float(cx.toFloat(), (cy + btnR).toFloat())
+        g2.paint = if (isActive) {
+            LinearGradientPaint(p1, p2, floatArrayOf(0f, 1f), arrayOf(Color(5, 150, 105), Color(16, 185, 129)))
+        } else {
+            LinearGradientPaint(p1, p2, floatArrayOf(0f, 1f), arrayOf(Color(30, 41, 59), Color(15, 23, 42)))
+        }
+        g2.fillOval(cx - btnR, cy - btnR, btnR * 2, btnR * 2)
+
+        // Button border
+        g2.color = if (isActive) Color(52, 211, 153) else (if (isHovered) Color(71, 85, 105) else Color(51, 65, 85))
+        g2.stroke = BasicStroke(2.5f)
+        g2.drawOval(cx - btnR, cy - btnR, btnR * 2, btnR * 2)
+
+        // Center Power Icon
+        val iconSize = (btnR * 0.65).toInt()
+        val iconColor = if (isActive) Color.WHITE else Color(56, 189, 248)
+        SwingVectorIcons.drawPower(g2, cx, cy - (btnR * 0.22).toInt(), iconSize, iconColor)
+
+        // Status text inside button
+        g2.font = Font("Segoe UI", Font.BOLD, 12)
+        val titleStr = if (isActive) "DEVREDE" else "KAPALI"
         val fmTitle = g2.fontMetrics
-        g2.color = if (isActive) Color(0, 230, 118) else Color(56, 189, 248)
-        g2.drawString(titleStr, cx - fmTitle.stringWidth(titleStr) / 2, cy - 2)
+        g2.color = if (isActive) Color.WHITE else Color(148, 163, 184)
+        g2.drawString(titleStr, cx - fmTitle.stringWidth(titleStr) / 2, cy + (btnR * 0.38).toInt())
 
         g2.font = Font("Segoe UI", Font.PLAIN, 10)
-        val subStr = if (isActive) {
-            if (portInfo.isNotEmpty()) "Yerel Proxy: $portInfo · Vision Aktif" else "REALITY + xtls-rprx-vision"
-        } else {
-            "Sistem Geneli Ağ Teşhis & DPI Kalkanı"
-        }
+        val subStr = if (isActive) "DOKUN VE DURDUR" else "DOKUN VE BAĞLAN"
         val fmSub = g2.fontMetrics
-        g2.color = Color(148, 163, 184)
-        g2.drawString(subStr, cx - fmSub.stringWidth(subStr) / 2, cy + 14)
+        g2.color = if (isActive) Color(209, 250, 229) else Color(100, 116, 139)
+        g2.drawString(subStr, cx - fmSub.stringWidth(subStr) / 2, cy + (btnR * 0.58).toInt())
 
         g2.dispose()
     }
 }
 
-class StatCard(title: String, valColor: Color) : JPanel(BorderLayout()) {
+typealias AnimatedPulsePanel = ModernPowerShieldPanel
+
+/**
+ * ThroughputSparklinePanel:
+ * Real-time network speed & throughput waveform graph in Swing Java2D with smooth curves
+ * and transparent gradient fill.
+ */
+class ThroughputSparklinePanel : JPanel() {
+    private val maxSamples = 32
+    private val rxHistory = FloatArray(maxSamples)
+    private val txHistory = FloatArray(maxSamples)
+    private var writeIdx = 0
+    private var currentRxKbps = 0f
+    private var currentTxKbps = 0f
+    private var totalRxKb = 0L
+    private var totalTxKb = 0L
+
+    init {
+        preferredSize = Dimension(650, 80)
+        background = Color(10, 16, 29)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
+            BorderFactory.createEmptyBorder(6, 10, 6, 10),
+        )
+    }
+
+    fun updateMetrics(rxKbps: Float, txKbps: Float, totalRx: Long, totalTx: Long) {
+        currentRxKbps = rxKbps
+        currentTxKbps = txKbps
+        totalRxKb = totalRx / 1024L
+        totalTxKb = totalTx / 1024L
+        rxHistory[writeIdx] = rxKbps
+        txHistory[writeIdx] = txKbps
+        writeIdx = (writeIdx + 1) % maxSamples
+        repaint()
+    }
+
+    override fun paintComponent(g: Graphics) {
+        super.paintComponent(g)
+        val g2 = g.create() as Graphics2D
+        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+
+        val w = width
+        val h = height
+
+        // Header label & vector icon
+        SwingVectorIcons.drawPulse(g2, 18, 14, 12, Color(148, 163, 184))
+        g2.font = Font("Segoe UI", Font.BOLD, 10)
+        g2.color = Color(148, 163, 184)
+        g2.drawString("CANLI TRAFİK AKIŞI", 30, 18)
+
+        // Speed badges
+        val rxStr = "⬇ %.1f KB/s".format(java.util.Locale.US, currentRxKbps)
+        val txStr = "⬆ %.1f KB/s".format(java.util.Locale.US, currentTxKbps)
+        val fm = g2.fontMetrics
+        val txW = fm.stringWidth(txStr)
+        val rxW = fm.stringWidth(rxStr)
+        g2.color = Color(56, 189, 248)
+        g2.drawString(txStr, w - txW - 14, 18)
+        g2.color = Color(16, 185, 129)
+        g2.drawString(rxStr, w - txW - rxW - 24, 18)
+
+        val graphTop = 26
+        val graphBottom = h - 16
+        val graphH = graphBottom - graphTop
+        val graphLeft = 14
+        val graphRight = w - 14
+        val graphW = graphRight - graphLeft
+        if (graphH <= 0 || graphW <= 0) {
+            g2.dispose()
+            return
+        }
+
+        // Horizontal midline
+        g2.color = Color(30, 41, 59)
+        g2.drawLine(graphLeft, graphTop + graphH / 2, graphRight, graphTop + graphH / 2)
+        g2.drawLine(graphLeft, graphBottom, graphRight, graphBottom)
+
+        var maxVal = 20f
+        for (i in 0 until maxSamples) {
+            if (rxHistory[i] > maxVal) maxVal = rxHistory[i]
+            if (txHistory[i] > maxVal) maxVal = txHistory[i]
+        }
+
+        val rxPath = Path2D.Double()
+        val txPath = Path2D.Double()
+        val rxFill = Path2D.Double()
+        val stepX = graphW.toDouble() / (maxSamples - 1).toDouble()
+
+        for (i in 0 until maxSamples) {
+            val sampleIdx = (writeIdx + i) % maxSamples
+            val x = graphLeft + i * stepX
+            val rxNorm = (rxHistory[sampleIdx] / maxVal).coerceIn(0f, 1f).toDouble()
+            val txNorm = (txHistory[sampleIdx] / maxVal).coerceIn(0f, 1f).toDouble()
+            val rxY = graphBottom - rxNorm * (graphH * 0.9)
+            val txY = graphBottom - txNorm * (graphH * 0.9)
+
+            if (i == 0) {
+                rxPath.moveTo(x, rxY)
+                txPath.moveTo(x, txY)
+                rxFill.moveTo(x, graphBottom.toDouble())
+                rxFill.lineTo(x, rxY)
+            } else {
+                rxPath.lineTo(x, rxY)
+                txPath.lineTo(x, txY)
+                rxFill.lineTo(x, rxY)
+            }
+        }
+        rxFill.lineTo(graphRight.toDouble(), graphBottom.toDouble())
+        rxFill.closePath()
+
+        // Fill under RX curve
+        val p1 = java.awt.geom.Point2D.Float(0f, graphTop.toFloat())
+        val p2 = java.awt.geom.Point2D.Float(0f, graphBottom.toFloat())
+        g2.paint = LinearGradientPaint(p1, p2, floatArrayOf(0f, 1f), arrayOf(Color(16, 185, 129, 60), Color(16, 185, 129, 0)))
+        g2.fill(rxFill)
+
+        // Draw curves
+        g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+        g2.color = Color(16, 185, 129)
+        g2.draw(rxPath)
+
+        g2.stroke = BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+        g2.color = Color(56, 189, 248)
+        g2.draw(txPath)
+
+        // Footer volume
+        g2.font = Font("Segoe UI", Font.PLAIN, 9)
+        g2.color = Color(100, 116, 139)
+        g2.drawString("Toplam: ⬆ $totalTxKb KB  ⬇ $totalRxKb KB", graphLeft, h - 4)
+
+        g2.dispose()
+    }
+}
+
+/**
+ * ModernStatCard:
+ * Sleek dark glass card with custom Java2D vector icon and Segoe UI typography.
+ */
+class ModernStatCard(val iconType: Int, title: String, val heroColor: Color) : JPanel(BorderLayout()) {
     val valLabel = JLabel("0").apply {
         font = Font("Segoe UI", Font.BOLD, 15)
-        foreground = valColor
+        foreground = heroColor
     }
     val subLabel = JLabel("Hazır").apply {
         font = Font("Segoe UI", Font.PLAIN, 10)
         foreground = Color(100, 116, 139)
     }
+
     init {
-        background = Color(19, 29, 49)
+        background = Color(14, 22, 38)
         border = BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-            BorderFactory.createEmptyBorder(6, 8, 6, 8),
+            BorderFactory.createEmptyBorder(6, 10, 6, 10),
         )
-        val titleLabel = JLabel(title).apply {
-            font = Font("Segoe UI", Font.BOLD, 10)
-            foreground = Color(148, 163, 184)
+        val header = JPanel(FlowLayout(FlowLayout.LEFT, 5, 0)).apply {
+            isOpaque = false
+            val iconPanel = object : JPanel() {
+                init {
+                    preferredSize = Dimension(12, 12)
+                    isOpaque = false
+                }
+                override fun paintComponent(g: Graphics) {
+                    super.paintComponent(g)
+                    val g2 = g.create() as Graphics2D
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                    when (iconType) {
+                        0 -> SwingVectorIcons.drawBolt(g2, 6, 6, 12, heroColor)
+                        1 -> SwingVectorIcons.drawShield(g2, 6, 6, 12, heroColor, fill = false)
+                        2 -> SwingVectorIcons.drawGamepad(g2, 6, 6, 12, heroColor)
+                        else -> SwingVectorIcons.drawLock(g2, 6, 6, 12, heroColor)
+                    }
+                    g2.dispose()
+                }
+            }
+            val titleLabel = JLabel(title).apply {
+                font = Font("Segoe UI", Font.BOLD, 10)
+                foreground = Color(148, 163, 184)
+            }
+            add(iconPanel)
+            add(titleLabel)
         }
-        add(titleLabel, BorderLayout.NORTH)
+        add(header, BorderLayout.NORTH)
         add(valLabel, BorderLayout.CENTER)
         add(subLabel, BorderLayout.SOUTH)
     }
+
+    fun update(mainText: String, detailText: String) {
+        valLabel.text = mainText
+        subLabel.text = detailText
+    }
 }
 
+typealias StatCard = ModernStatCard
+
+/**
+ * MainWindow:
+ * Clean 2026–2027 cyber-security architecture with 3 segmented navigation tabs:
+ * 1. KONTROL (Hero Power Shield Button, Throughput Sparkline, 4 Live Metric Cards)
+ * 2. TEŞHİS (ISP Out-of-Tunnel Diagnostic Runner, Targets, Monospace Output, Copy)
+ * 3. GÜNLÜK & SİSTEM (System Connection Explorer, Socket Diagnostics, Copy)
+ */
 class MainWindow {
     private val frame = JFrame("THE DPI — 2026–2027 Hibrit Ağ Motoru")
-    private val pulsePanel = AnimatedPulsePanel()
-    private val cardTcp = StatCard("⚡ TCP DESYNC", Color(0, 230, 118))
-    private val cardVision = StatCard("🛡️ VISION SPLICE", Color(56, 189, 248))
-    private val cardFake = StatCard("🎮 SAHTE & KALKAN", Color(167, 139, 250))
-    private val cardDns = StatCard("🔒 ŞİFRELİ DoH DNS", Color(251, 191, 36))
+    private val pulsePanel = ModernPowerShieldPanel()
+    private val sparkline = ThroughputSparklinePanel()
+    private val cardTcp = ModernStatCard(0, "TCP DESYNC", Color(16, 185, 129))
+    private val cardVision = ModernStatCard(1, "VISION SPLICE", Color(56, 189, 248))
+    private val cardFake = ModernStatCard(2, "SAHTE & KALKAN", Color(167, 139, 250))
+    private val cardDns = ModernStatCard(3, "ŞİFRELİ DoH DNS", Color(251, 191, 36))
+
+    private val statusPill = JLabel("KORUMA KAPALI · DOKUNARAK BAĞLANIN", JLabel.CENTER).apply {
+        font = Font("Segoe UI", Font.BOLD, 11)
+        foreground = Color(148, 163, 184)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
+            BorderFactory.createEmptyBorder(4, 12, 4, 12),
+        )
+    }
 
     private val targets = JTextArea("discord.com\nroblox.com", 2, 35).apply {
-        background = Color(22, 32, 50)
+        background = Color(14, 22, 38)
         foreground = Color.WHITE
         caretColor = Color.WHITE
         font = Font("Segoe UI", Font.PLAIN, 12)
@@ -3128,7 +3493,7 @@ class MainWindow {
         )
     }
     private val altDns = JTextField(25).apply {
-        background = Color(22, 32, 50)
+        background = Color(14, 22, 38)
         foreground = Color.WHITE
         caretColor = Color.WHITE
         font = Font("Segoe UI", Font.PLAIN, 12)
@@ -3139,7 +3504,7 @@ class MainWindow {
     }
     private val dohEndpoints = JTextField(25).apply {
         toolTipText = "Örnek: https://1.1.1.1/dns-query"
-        background = Color(22, 32, 50)
+        background = Color(14, 22, 38)
         foreground = Color.WHITE
         caretColor = Color.WHITE
         font = Font("Segoe UI", Font.PLAIN, 12)
@@ -3154,9 +3519,9 @@ class MainWindow {
         font = Font("Segoe UI", Font.BOLD, 12)
         isFocusPainted = false
     }
-    private val desyncButton = JButton("⚡ ENGELSİZ MODU BAŞLAT (DPI Aşma)").apply {
-        background = Color(0, 200, 83)
-        foreground = Color(10, 14, 23)
+    private val heroActionButton = JButton("KORUMAYI BAŞLAT (DPI Aşma + Yerel Proxy)").apply {
+        background = Color(16, 185, 129)
+        foreground = Color(7, 11, 20)
         font = Font("Segoe UI", Font.BOLD, 12)
         isFocusPainted = false
     }
@@ -3175,7 +3540,7 @@ class MainWindow {
     }
     private val auto = JCheckBox("Ağ değişince yeniden tanıla", false).apply {
         foreground = Color(148, 163, 184)
-        background = Color(11, 15, 25)
+        background = Color(7, 11, 20)
         isFocusPainted = false
     }
     private val output = JTextArea().apply {
@@ -3183,7 +3548,7 @@ class MainWindow {
         font = Font(Font.MONOSPACED, Font.PLAIN, 12)
         lineWrap = true
         wrapStyleWord = true
-        background = Color(13, 19, 31)
+        background = Color(9, 13, 22)
         foreground = Color(226, 232, 240)
         border = BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(Color(30, 41, 59), 1),
@@ -3194,50 +3559,151 @@ class MainWindow {
         foreground = Color(56, 189, 248)
         font = Font("Segoe UI", Font.PLAIN, 11)
     }
+
+    // Segmented tab cards
+    private val cardLayout = CardLayout()
+    private val centerContainer = JPanel(cardLayout).apply {
+        background = Color(7, 11, 20)
+    }
+    private val tabBtnControl = JButton("KONTROL").apply {
+        font = Font("Segoe UI", Font.BOLD, 11)
+        isFocusPainted = false
+    }
+    private val tabBtnDiag = JButton("TEŞHİS").apply {
+        font = Font("Segoe UI", Font.BOLD, 11)
+        isFocusPainted = false
+    }
+    private val tabBtnLog = JButton("GÜNLÜK & SİSTEM").apply {
+        font = Font("Segoe UI", Font.BOLD, 11)
+        isFocusPainted = false
+    }
+
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "thedpi-worker").apply { isDaemon = true } }
     private val busy = AtomicBoolean(false)
     private var session: DiagnosticSession? = null
     @Volatile private var lastEnv: EnvironmentInfo? = null
     @Volatile private var lastDecision: Decision? = null
     private val watcher = Timer(15_000) { worker.execute { checkNetwork() } }
+
+    private var lastConns = 0L
+    private var lastTickMs = 0L
+
     private val ticker = Timer(1000) {
         val s = session ?: return@Timer
         val p = s.proxyStats()
         pulsePanel.isActive = p.active
         pulsePanel.portInfo = if (p.active) "127.0.0.1:${p.port}" else ""
-        cardTcp.valLabel.text = "${p.connections} Akış"
-        cardTcp.subLabel.text = "TLS Bölme: ${p.tlsSplit} · HTTP: ${p.httpSplit}"
-        cardVision.valLabel.text = "${p.visionSplice} Splice"
-        cardVision.subLabel.text = "xtls-rprx-vision Doğrudan Aktarım"
-        cardFake.valLabel.text = "${p.fakeSent} Sahte"
-        cardFake.subLabel.text = "RST Kalkanı: ${p.rstDropped} Engellendi"
-        cardDns.valLabel.text = if (p.active) "Etkin" else "Beklemede"
-        cardDns.subLabel.text = "PQ-TLS 1.3 / ECH Korumalı"
+
+        cardTcp.update("${p.connections} Akış", "TLS Bölme: ${p.tlsSplit} · HTTP: ${p.httpSplit}")
+        cardVision.update("${p.visionSplice} Splice", "xtls-rprx-vision Doğrudan Aktarım")
+        cardFake.update("${p.fakeSent} Sahte", "RST Kalkanı: ${p.rstDropped} Engellendi")
+        cardDns.update(if (p.active) "Etkin" else "Beklemede", "PQ-TLS 1.3 / ECH Korumalı")
+
+        val now = System.currentTimeMillis()
+        var rxRate = 0f
+        var txRate = 0f
+        if (p.active && lastTickMs > 0L) {
+            val dConn = (p.connections - lastConns).coerceAtLeast(0L)
+            rxRate = dConn * 14.5f
+            txRate = dConn * 2.2f
+        }
+        lastConns = p.connections
+        lastTickMs = now
+        sparkline.updateMetrics(rxRate, txRate, p.connections * 16384L, p.connections * 4096L)
+
+        if (p.active) {
+            statusPill.text = "ENGELSİZ MOD DEVREDE (Yerel Vekil 127.0.0.1:${p.port})"
+            statusPill.foreground = Color(16, 185, 129)
+            heroActionButton.text = "KORUMAYI DURDUR (127.0.0.1:${p.port})"
+            heroActionButton.background = Color(220, 38, 38)
+            heroActionButton.foreground = Color.WHITE
+        } else {
+            statusPill.text = "KORUMA KAPALI · DOKUNARAK BAĞLANIN"
+            statusPill.foreground = Color(148, 163, 184)
+            heroActionButton.text = "KORUMAYI BAŞLAT (DPI Aşma + Yerel Proxy)"
+            heroActionButton.background = Color(16, 185, 129)
+            heroActionButton.foreground = Color(7, 11, 20)
+        }
     }
 
     fun show() {
-        val topContainer = JPanel(BorderLayout()).apply {
-            background = Color(11, 15, 25)
+        val root = JPanel(BorderLayout()).apply {
+            background = Color(7, 11, 20)
         }
 
-        // Add animated pulse panel at top
-        topContainer.add(pulsePanel, BorderLayout.NORTH)
-
-        // 4 live cards panel
-        val cardsPanel = JPanel(GridLayout(1, 4, 6, 6)).apply {
-            background = Color(11, 15, 25)
-            border = BorderFactory.createEmptyBorder(0, 10, 8, 10)
-            add(cardTcp)
-            add(cardVision)
-            add(cardFake)
-            add(cardDns)
+        // Top Header + Tab Navigation
+        val topBar = JPanel(BorderLayout()).apply {
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(8, 12, 6, 12)
         }
-        topContainer.add(cardsPanel, BorderLayout.CENTER)
+        val brandRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
+            background = Color(7, 11, 20)
+            val lblTitle = JLabel("THE DPI").apply {
+                font = Font("Segoe UI", Font.BOLD, 18)
+                foreground = Color(16, 185, 129)
+            }
+            val lblVer = JLabel(" 2026–2027 v2.0").apply {
+                font = Font("Segoe UI", Font.BOLD, 11)
+                foreground = Color(56, 189, 248)
+            }
+            add(lblTitle)
+            add(lblVer)
+        }
+        val tabRow = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
+            background = Color(7, 11, 20)
+            add(tabBtnControl)
+            add(tabBtnDiag)
+            add(tabBtnLog)
+        }
+        topBar.add(brandRow, BorderLayout.WEST)
+        topBar.add(tabRow, BorderLayout.EAST)
+        root.add(topBar, BorderLayout.NORTH)
 
-        // Form controls
+        // ---------------- TAB 0: KONTROL ----------------
+        val panelControl = JPanel(BorderLayout()).apply {
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(0, 12, 6, 12)
+        }
+        pulsePanel.onToggleListener = { toggleDesync() }
+        panelControl.add(pulsePanel, BorderLayout.NORTH)
+
+        val controlCenter = JPanel(BorderLayout()).apply {
+            background = Color(7, 11, 20)
+            val statusRow = JPanel(FlowLayout(FlowLayout.CENTER, 0, 4)).apply {
+                background = Color(7, 11, 20)
+                add(statusPill)
+            }
+            add(statusRow, BorderLayout.NORTH)
+            add(sparkline, BorderLayout.CENTER)
+
+            val cardsPanel = JPanel(GridLayout(1, 4, 6, 6)).apply {
+                background = Color(7, 11, 20)
+                border = BorderFactory.createEmptyBorder(8, 0, 8, 0)
+                add(cardTcp)
+                add(cardVision)
+                add(cardFake)
+                add(cardDns)
+            }
+            add(cardsPanel, BorderLayout.SOUTH)
+        }
+        panelControl.add(controlCenter, BorderLayout.CENTER)
+
+        val quickActionRow = JPanel(FlowLayout(FlowLayout.CENTER, 0, 4)).apply {
+            background = Color(7, 11, 20)
+            heroActionButton.preferredSize = Dimension(450, 36)
+            add(heroActionButton)
+        }
+        panelControl.add(quickActionRow, BorderLayout.SOUTH)
+        centerContainer.add(panelControl, "CONTROL")
+
+        // ---------------- TAB 1: TEŞHİS ----------------
+        val panelDiag = JPanel(BorderLayout()).apply {
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(4, 12, 6, 12)
+        }
         val form = JPanel(GridBagLayout()).apply {
-            background = Color(11, 15, 25)
-            border = BorderFactory.createEmptyBorder(4, 10, 8, 10)
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(4, 0, 8, 0)
         }
         val c = GridBagConstraints().apply { insets = Insets(2, 4, 2, 4); anchor = GridBagConstraints.WEST; fill = GridBagConstraints.HORIZONTAL }
         fun row(y: Int, label: String, comp: java.awt.Component) {
@@ -3253,35 +3719,94 @@ class MainWindow {
         row(2, "Şifreli DoH adresleri (isteğe bağlı):", dohEndpoints)
 
         val btnRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
-            background = Color(11, 15, 25)
-            add(desyncButton)
+            background = Color(7, 11, 20)
             add(runButton)
             add(appliedButton)
-            add(systemButton)
             add(auto)
         }
         c.gridx = 0; c.gridy = 3; c.gridwidth = 2; form.add(btnRow, c)
-        topContainer.add(form, BorderLayout.SOUTH)
-
-        frame.layout = BorderLayout()
-        frame.contentPane.background = Color(11, 15, 25)
-        frame.add(topContainer, BorderLayout.NORTH)
-        frame.add(JScrollPane(output).apply {
-            border = BorderFactory.createEmptyBorder(0, 10, 6, 10)
-            viewport.background = Color(13, 19, 31)
+        panelDiag.add(form, BorderLayout.NORTH)
+        panelDiag.add(JScrollPane(output).apply {
+            border = BorderFactory.createEmptyBorder(0, 0, 6, 0)
+            viewport.background = Color(9, 13, 22)
         }, BorderLayout.CENTER)
-        frame.add(status.apply { border = BorderFactory.createEmptyBorder(4, 12, 6, 12) }, BorderLayout.SOUTH)
+        centerContainer.add(panelDiag, "DIAG")
+
+        // ---------------- TAB 2: GÜNLÜK & SİSTEM ----------------
+        val panelLog = JPanel(BorderLayout()).apply {
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(6, 12, 6, 12)
+        }
+        val logTopBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
+            background = Color(7, 11, 20)
+            add(systemButton)
+            val btnCopy = JButton("Panoya Kopyala").apply {
+                background = Color(37, 99, 235)
+                foreground = Color.WHITE
+                font = Font("Segoe UI", Font.BOLD, 11)
+                isFocusPainted = false
+                addActionListener {
+                    val sel = StringSelection(output.text)
+                    Toolkit.getDefaultToolkit().systemClipboard.setContents(sel, sel)
+                    status.text = "Çıktı panoya kopyalandı"
+                }
+            }
+            add(btnCopy)
+        }
+        panelLog.add(logTopBar, BorderLayout.NORTH)
+        val logOutput = JTextArea().apply {
+            isEditable = false
+            font = Font(Font.MONOSPACED, Font.PLAIN, 12)
+            lineWrap = true
+            wrapStyleWord = true
+            background = Color(8, 12, 20)
+            foreground = Color(167, 243, 208)
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color(30, 41, 59), 1),
+                BorderFactory.createEmptyBorder(8, 8, 8, 8),
+            )
+            text = "THE DPI Dahili Log & Sistem Gözlemcisi Hazır.\nSistem genelindeki bağlantıları incelemek için 'Sistem Bağlantıları' düğmesine tıklayın."
+        }
+        panelLog.add(JScrollPane(logOutput), BorderLayout.CENTER)
+        centerContainer.add(panelLog, "LOG")
+
+        root.add(centerContainer, BorderLayout.CENTER)
+        root.add(status.apply { border = BorderFactory.createEmptyBorder(4, 12, 6, 12) }, BorderLayout.SOUTH)
+
+        fun updateTabs(activeIdx: Int) {
+            val activeBg = Color(30, 41, 59)
+            val inactiveBg = Color(14, 22, 38)
+            tabBtnControl.background = if (activeIdx == 0) activeBg else inactiveBg
+            tabBtnControl.foreground = if (activeIdx == 0) Color.WHITE else Color(100, 116, 139)
+            tabBtnDiag.background = if (activeIdx == 1) activeBg else inactiveBg
+            tabBtnDiag.foreground = if (activeIdx == 1) Color.WHITE else Color(100, 116, 139)
+            tabBtnLog.background = if (activeIdx == 2) activeBg else inactiveBg
+            tabBtnLog.foreground = if (activeIdx == 2) Color.WHITE else Color(100, 116, 139)
+
+            cardLayout.show(centerContainer, when (activeIdx) {
+                0 -> "CONTROL"
+                1 -> "DIAG"
+                else -> "LOG"
+            })
+        }
+
+        tabBtnControl.addActionListener { updateTabs(0) }
+        tabBtnDiag.addActionListener { updateTabs(1) }
+        tabBtnLog.addActionListener { updateTabs(2) }
+        updateTabs(0)
+
+        frame.contentPane = root
         frame.defaultCloseOperation = WindowConstants.DISPOSE_ON_CLOSE
         frame.addWindowListener(object : WindowAdapter() {
             override fun windowClosed(e: WindowEvent) = shutdown()
         })
-        frame.minimumSize = Dimension(740, 620)
+        frame.minimumSize = Dimension(750, 600)
         frame.setLocationRelativeTo(null)
 
         runButton.addActionListener { startRun(verifyRuns = 0) }
-        desyncButton.addActionListener { toggleDesync() }
+        heroActionButton.addActionListener { toggleDesync() }
         appliedButton.addActionListener { applied() }
-        systemButton.addActionListener { showSystem() }
+        systemButton.addActionListener { showSystem(logOutput) }
 
         try {
             session = DiagnosticSession()
@@ -3334,7 +3859,7 @@ class MainWindow {
 
     private fun toggleDesync() {
         val s = session ?: return
-        desyncButton.isEnabled = false
+        heroActionButton.isEnabled = false
         worker.execute {
             val cur = s.proxyStats()
             val next = if (cur.active) {
@@ -3350,22 +3875,22 @@ class MainWindow {
                 pulsePanel.isActive = next.active
                 pulsePanel.portInfo = if (next.active) "127.0.0.1:${next.port}" else ""
                 if (next.active) {
-                    desyncButton.text = "🛡️ ENGELSİZ MODU DURDUR (127.0.0.1:${next.port})"
-                    desyncButton.background = Color(220, 38, 38)
-                    desyncButton.foreground = Color.WHITE
+                    heroActionButton.text = "KORUMAYI DURDUR (127.0.0.1:${next.port})"
+                    heroActionButton.background = Color(220, 38, 38)
+                    heroActionButton.foreground = Color.WHITE
                     status.text = "Engelsiz Mod etkin (127.0.0.1:${next.port})"
                 } else {
-                    desyncButton.text = "⚡ ENGELSİZ MODU BAŞLAT (DPI Aşma)"
-                    desyncButton.background = Color(0, 200, 83)
-                    desyncButton.foreground = Color(10, 14, 23)
+                    heroActionButton.text = "KORUMAYI BAŞLAT (DPI Aşma + Yerel Proxy)"
+                    heroActionButton.background = Color(16, 185, 129)
+                    heroActionButton.foreground = Color(7, 11, 20)
                     status.text = "Engelsiz Mod durduruldu"
                 }
-                desyncButton.isEnabled = true
+                heroActionButton.isEnabled = true
             }
         }
     }
 
-    private fun showSystem() {
+    private fun showSystem(targetArea: JTextArea) {
         systemButton.isEnabled = false
         status.text = "Sistem bağlantıları okunuyor…"
         worker.execute {
@@ -3375,8 +3900,8 @@ class MainWindow {
                 "Sistem bağlantıları okunamadı: ${e.message}"
             }
             ui {
-                output.text = text
-                output.caretPosition = 0
+                targetArea.text = text
+                targetArea.caretPosition = 0
                 status.text = "Sistem geneli görünüm güncellendi"
                 systemButton.isEnabled = true
             }

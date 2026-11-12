@@ -33,6 +33,17 @@ import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import android.graphics.Path
+import android.graphics.LinearGradient
+import android.graphics.RadialGradient
+import android.graphics.Shader
+import android.graphics.DashPathEffect
+import android.view.MotionEvent
+import android.widget.Toast
+import android.content.ClipboardManager
+import android.content.ClipData
+import android.widget.FrameLayout
+import android.view.ViewGroup
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -3560,38 +3571,211 @@ internal object ActiveBridgeHolder {
     @Volatile var current: TunBridge? = null
 }
 
-class RadarPulseView(context: Context) : View(context) {
+// Modern Vector Icon Renderer (Pure Canvas Path - NO Emojis)
+internal object AndroidVectorIcons {
+    fun drawShield(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int, fill: Boolean = true) {
+        val half = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = if (fill) Paint.Style.FILL else Paint.Style.STROKE
+            strokeWidth = size * 0.12f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        val path = Path().apply {
+            moveTo(cx, cy - half * 0.85f)
+            lineTo(cx + half * 0.75f, cy - half * 0.65f)
+            cubicTo(cx + half * 0.85f, cy + half * 0.1f, cx + half * 0.45f, cy + half * 0.65f, cx, cy + half * 0.9f)
+            cubicTo(cx - half * 0.45f, cy + half * 0.65f, cx - half * 0.85f, cy + half * 0.1f, cx - half * 0.75f, cy - half * 0.65f)
+            close()
+        }
+        canvas.drawPath(path, paint)
+    }
+
+    fun drawBolt(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val half = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.FILL
+        }
+        val path = Path().apply {
+            moveTo(cx + half * 0.1f, cy - half * 0.9f)
+            lineTo(cx - half * 0.65f, cy + half * 0.05f)
+            lineTo(cx - half * 0.05f, cy + half * 0.05f)
+            lineTo(cx - half * 0.25f, cy + half * 0.9f)
+            lineTo(cx + half * 0.65f, cy - half * 0.05f)
+            lineTo(cx + half * 0.05f, cy - half * 0.05f)
+            close()
+        }
+        canvas.drawPath(path, paint)
+    }
+
+    fun drawLock(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val half = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeWidth = size * 0.12f
+            strokeCap = Paint.Cap.ROUND
+        }
+        val shackle = Path().apply {
+            arcTo(RectF(cx - half * 0.4f, cy - half * 0.85f, cx + half * 0.4f, cy - half * 0.05f), 180f, 180f, false)
+        }
+        canvas.drawPath(shackle, paint)
+        paint.style = Paint.Style.FILL
+        val bodyRect = RectF(cx - half * 0.65f, cy - half * 0.15f, cx + half * 0.65f, cy + half * 0.75f)
+        canvas.drawRoundRect(bodyRect, size * 0.12f, size * 0.12f, paint)
+        paint.color = Color.parseColor("#070B14")
+        canvas.drawCircle(cx, cy + half * 0.25f, size * 0.09f, paint)
+    }
+
+    fun drawGamepad(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val half = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.FILL
+        }
+        val rect = RectF(cx - half * 0.85f, cy - half * 0.45f, cx + half * 0.85f, cy + half * 0.55f)
+        canvas.drawRoundRect(rect, size * 0.22f, size * 0.22f, paint)
+        paint.color = Color.parseColor("#070B14")
+        val plusW = size * 0.06f
+        val plusLen = size * 0.2f
+        canvas.drawRect(cx - half * 0.5f - plusW / 2, cy + half * 0.05f - plusLen / 2, cx - half * 0.5f + plusW / 2, cy + half * 0.05f + plusLen / 2, paint)
+        canvas.drawRect(cx - half * 0.5f - plusLen / 2, cy + half * 0.05f - plusW / 2, cx - half * 0.5f + plusLen / 2, cy + half * 0.05f + plusW / 2, paint)
+        canvas.drawCircle(cx + half * 0.5f, cy - half * 0.05f, size * 0.05f, paint)
+        canvas.drawCircle(cx + half * 0.5f, cy + half * 0.2f, size * 0.05f, paint)
+        canvas.drawCircle(cx + half * 0.35f, cy + half * 0.07f, size * 0.05f, paint)
+        canvas.drawCircle(cx + half * 0.65f, cy + half * 0.07f, size * 0.05f, paint)
+    }
+
+    fun drawPulse(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val half = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeWidth = size * 0.12f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        val path = Path().apply {
+            moveTo(cx - half * 0.9f, cy)
+            lineTo(cx - half * 0.4f, cy)
+            lineTo(cx - half * 0.2f, cy - half * 0.7f)
+            lineTo(cx + half * 0.15f, cy + half * 0.7f)
+            lineTo(cx + half * 0.35f, cy - half * 0.25f)
+            lineTo(cx + half * 0.5f, cy)
+            lineTo(cx + half * 0.9f, cy)
+        }
+        canvas.drawPath(path, paint)
+    }
+
+    fun drawPower(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val r = size * 0.36f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeWidth = size * 0.13f
+            strokeCap = Paint.Cap.ROUND
+        }
+        val oval = RectF(cx - r, cy - r, cx + r, cy + r)
+        canvas.drawArc(oval, 55f, 250f, false, paint)
+        canvas.drawLine(cx, cy - r * 1.15f, cx, cy - r * 0.2f, paint)
+    }
+
+    fun drawTerminal(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val half = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeWidth = size * 0.1f
+            strokeCap = Paint.Cap.ROUND
+        }
+        val rect = RectF(cx - half * 0.85f, cy - half * 0.7f, cx + half * 0.85f, cy + half * 0.7f)
+        canvas.drawRoundRect(rect, size * 0.15f, size * 0.15f, paint)
+        val p = Path().apply {
+            moveTo(cx - half * 0.45f, cy - half * 0.3f)
+            lineTo(cx - half * 0.15f, cy)
+            lineTo(cx - half * 0.45f, cy + half * 0.3f)
+        }
+        canvas.drawPath(p, paint)
+        canvas.drawLine(cx, cy + half * 0.3f, cx + half * 0.4f, cy + half * 0.3f, paint)
+    }
+
+    fun drawCopy(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val half = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeWidth = size * 0.1f
+            strokeCap = Paint.Cap.ROUND
+        }
+        val rBack = RectF(cx - half * 0.35f, cy - half * 0.75f, cx + half * 0.75f, cy + half * 0.35f)
+        canvas.drawRoundRect(rBack, size * 0.1f, size * 0.1f, paint)
+        val rFront = RectF(cx - half * 0.75f, cy - half * 0.35f, cx + half * 0.35f, cy + half * 0.75f)
+        canvas.drawRoundRect(rFront, size * 0.1f, size * 0.1f, paint)
+    }
+
+    fun drawCheck(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        val half = size / 2f
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeWidth = size * 0.14f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        val path = Path().apply {
+            moveTo(cx - half * 0.7f, cy)
+            lineTo(cx - half * 0.15f, cy + half * 0.55f)
+            lineTo(cx + half * 0.75f, cy - half * 0.55f)
+        }
+        canvas.drawPath(path, paint)
+    }
+}
+
+/**
+ * ModernPowerShieldView:
+ * Cyber-security animated hero power button with multi-layer radar pulse, rotating orbital reticle,
+ * ambient glowing aura, and smooth micro-press scaling feedback.
+ */
+class ModernPowerShieldView(context: Context) : View(context) {
+    var isActive = false
+        set(value) {
+            if (field != value) {
+                field = value
+                postInvalidateOnAnimation()
+            }
+        }
+    var onToggleListener: (() -> Unit)? = null
+
+    private var pulseFraction = 0f
+    private var orbitAngle = 0f
+    private var pressScale = 1.0f
+
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 3f * resources.displayMetrics.density
     }
-    private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val auraPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val buttonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
     }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        textSize = 13f * resources.displayMetrics.density
     }
     private val subTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
-        textSize = 10f * resources.displayMetrics.density
-        color = Color.parseColor("#94A3B8")
     }
-    var isActive = false
-        set(value) {
-            if (field != value) {
-                field = value
-                invalidate()
-            }
-        }
-    private var animFraction = 0f
+
     private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-        duration = 1800L
+        duration = 2000L
         repeatCount = ValueAnimator.INFINITE
         repeatMode = ValueAnimator.RESTART
         addUpdateListener {
-            animFraction = it.animatedValue as Float
+            pulseFraction = it.animatedValue as Float
+            orbitAngle = (orbitAngle + 1.6f) % 360f
             postInvalidateOnAnimation()
         }
     }
@@ -3606,53 +3790,367 @@ class RadarPulseView(context: Context) : View(context) {
         super.onDetachedFromWindow()
     }
 
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                pressScale = 0.94f
+                invalidate()
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                pressScale = 1.0f
+                invalidate()
+                val cx = width / 2f
+                val cy = height / 2f
+                val btnR = minOf(cx, cy) * 0.44f
+                val dx = event.x - cx
+                val dy = event.y - cy
+                if (dx * dx + dy * dy <= (btnR * 1.35f) * (btnR * 1.35f)) {
+                    playSoundEffect(android.view.SoundEffectConstants.CLICK)
+                    onToggleListener?.invoke()
+                }
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                pressScale = 1.0f
+                invalidate()
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        try {
-            val cx = width / 2f
-            val cy = height / 2f
-            val maxR = minOf(cx, cy) * 0.92f
-            if (maxR <= 0f) return
-            val baseColor = if (isActive) Color.parseColor("#00E676") else Color.parseColor("#00B0FF")
-            val r = Color.red(baseColor)
-            val g = Color.green(baseColor)
-            val b = Color.blue(baseColor)
+        val cx = width / 2f
+        val cy = height / 2f
+        val maxR = minOf(cx, cy) * 0.95f
+        if (maxR <= 0f) return
 
-            // Draw 3 expanding concentric animated radar wave rings
-            for (i in 0 until 3) {
-                val phase = (animFraction + i * 0.333f) % 1f
-                val ringR = maxR * phase
-                if (ringR > 0f) {
-                    val alpha = ((1f - phase) * 180).toInt().coerceIn(0, 255)
-                    ringPaint.color = Color.argb(alpha, r, g, b)
-                    canvas.drawCircle(cx, cy, ringR, ringPaint)
-                }
-            }
+        val density = resources.displayMetrics.density
+        val baseColor = if (isActive) Color.parseColor("#10B981") else Color.parseColor("#38BDF8")
+        val r = Color.red(baseColor)
+        val g = Color.green(baseColor)
+        val b = Color.blue(baseColor)
 
-            // Center glowing badge orb
-            val centerR = maxR * 0.42f
-            if (centerR > 0f) {
-                glowPaint.color = Color.argb(if (isActive) 55 else 32, r, g, b)
-                canvas.drawCircle(cx, cy, centerR * 1.25f, glowPaint)
+        // 1) Concentric expanding radar pulse rings
+        val waveCount = if (isActive) 3 else 1
+        for (i in 0 until waveCount) {
+            val phase = (pulseFraction + i * (1f / waveCount)) % 1f
+            val ringR = maxR * (0.48f + phase * 0.52f)
+            val alpha = ((1f - phase) * (if (isActive) 140 else 40)).toInt().coerceIn(0, 255)
+            ringPaint.color = Color.argb(alpha, r, g, b)
+            ringPaint.strokeWidth = (2.5f - phase * 1.2f) * density
+            canvas.drawCircle(cx, cy, ringR, ringPaint)
+        }
 
-                glowPaint.color = Color.parseColor(if (isActive) "#064E3B" else "#0C2340")
-                canvas.drawCircle(cx, cy, centerR, glowPaint)
+        // 2) Orbital reticle / rotating dashed cyber arc
+        if (isActive) {
+            val reticleR = maxR * 0.52f
+            ringPaint.color = Color.argb(160, r, g, b)
+            ringPaint.strokeWidth = 2f * density
+            ringPaint.pathEffect = DashPathEffect(floatArrayOf(12f * density, 8f * density), 0f)
+            val rect = RectF(cx - reticleR, cy - reticleR, cx + reticleR, cy + reticleR)
+            canvas.save()
+            canvas.rotate(orbitAngle, cx, cy)
+            canvas.drawArc(rect, 0f, 360f, false, ringPaint)
+            canvas.restore()
+            ringPaint.pathEffect = null
+        }
 
-                ringPaint.color = Color.argb(240, r, g, b)
-                ringPaint.strokeWidth = 2f * resources.displayMetrics.density
-                canvas.drawCircle(cx, cy, centerR, ringPaint)
+        // 3) Center Button with pressScale
+        canvas.save()
+        canvas.scale(pressScale, pressScale, cx, cy)
 
-                // Status text in center orb
-                textPaint.color = Color.parseColor(if (isActive) "#00E676" else "#38BDF8")
-                val statusStr = if (isActive) "ENGELSİZ AKTİF" else "BEKLEMEDE"
-                val subStr = if (isActive) "DPI AŞMA & DOH TUNEL" else "SİSTEM GENELİ KORUMA"
-                canvas.drawText(statusStr, cx, cy - 2f * resources.displayMetrics.density, textPaint)
-                canvas.drawText(subStr, cx, cy + 14f * resources.displayMetrics.density, subTextPaint)
-            }
-        } catch (_: Throwable) {}
+        val btnR = maxR * 0.44f
+
+        // Ambient glow
+        val auraR = btnR * 1.25f
+        auraPaint.shader = RadialGradient(
+            cx, cy, auraR,
+            Color.argb(if (isActive) 90 else 30, r, g, b),
+            Color.TRANSPARENT,
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawCircle(cx, cy, auraR, auraPaint)
+        auraPaint.shader = null
+
+        // Inner circular button fill gradient
+        buttonPaint.shader = if (isActive) {
+            LinearGradient(
+                cx, cy - btnR, cx, cy + btnR,
+                Color.parseColor("#059669"), Color.parseColor("#10B981"),
+                Shader.TileMode.CLAMP
+            )
+        } else {
+            LinearGradient(
+                cx, cy - btnR, cx, cy + btnR,
+                Color.parseColor("#1E293B"), Color.parseColor("#0F172A"),
+                Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawCircle(cx, cy, btnR, buttonPaint)
+        buttonPaint.shader = null
+
+        // Button border
+        ringPaint.color = if (isActive) Color.parseColor("#34D399") else Color.parseColor("#334155")
+        ringPaint.strokeWidth = 2.5f * density
+        canvas.drawCircle(cx, cy, btnR, ringPaint)
+
+        // Center Vector Power Icon
+        val iconSize = btnR * 0.62f
+        val iconColor = if (isActive) Color.WHITE else Color.parseColor("#38BDF8")
+        AndroidVectorIcons.drawPower(canvas, cx, cy - btnR * 0.22f, iconSize, iconColor)
+
+        // Status text inside button
+        textPaint.textSize = 10f * density
+        textPaint.color = if (isActive) Color.WHITE else Color.parseColor("#94A3B8")
+        val statusText = if (isActive) "DEVREDE" else "KAPALI"
+        canvas.drawText(statusText, cx, cy + btnR * 0.36f, textPaint)
+
+        subTextPaint.textSize = 8f * density
+        subTextPaint.color = if (isActive) Color.parseColor("#D1FAE5") else Color.parseColor("#64748B")
+        val subText = if (isActive) "DOKUN VE DURDUR" else "DOKUN VE BAĞLAN"
+        canvas.drawText(subText, cx, cy + btnR * 0.55f, subTextPaint)
+
+        canvas.restore()
     }
 }
 
+/**
+ * ThroughputSparklineView:
+ * Real-time network speed & throughput waveform graph with smooth cubic Bezier spline
+ * and semi-transparent area fill.
+ */
+class ThroughputSparklineView(context: Context) : View(context) {
+    private val maxSamples = 32
+    private val rxHistory = FloatArray(maxSamples)
+    private val txHistory = FloatArray(maxSamples)
+    private var writeIdx = 0
+    private var currentRxKbps = 0f
+    private var currentTxKbps = 0f
+    private var totalRxKb = 0L
+    private var totalTxKb = 0L
+
+    private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1E293B")
+        strokeWidth = 1f * resources.displayMetrics.density
+        style = Paint.Style.STROKE
+    }
+    private val rxStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#10B981")
+        strokeWidth = 2.2f * resources.displayMetrics.density
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val rxFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val txStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#38BDF8")
+        strokeWidth = 1.6f * resources.displayMetrics.density
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textSize = 10f * resources.displayMetrics.density
+        color = Color.parseColor("#94A3B8")
+    }
+    private val rxBadgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textSize = 10.5f * resources.displayMetrics.density
+        color = Color.parseColor("#10B981")
+    }
+    private val txBadgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textSize = 10.5f * resources.displayMetrics.density
+        color = Color.parseColor("#38BDF8")
+    }
+    private val subTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 9.5f * resources.displayMetrics.density
+        color = Color.parseColor("#64748B")
+    }
+
+    fun updateMetrics(rxKbps: Float, txKbps: Float, totalRx: Long, totalTx: Long) {
+        currentRxKbps = rxKbps
+        currentTxKbps = txKbps
+        totalRxKb = totalRx / 1024L
+        totalTxKb = totalTx / 1024L
+        rxHistory[writeIdx] = rxKbps
+        txHistory[writeIdx] = txKbps
+        writeIdx = (writeIdx + 1) % maxSamples
+        postInvalidateOnAnimation()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        val density = resources.displayMetrics.density
+
+        // Header line
+        val headerY = 14f * density
+        AndroidVectorIcons.drawPulse(canvas, 12f * density, headerY - 3f * density, 12f * density, Color.parseColor("#94A3B8"))
+        canvas.drawText("CANLI TRAFİK AKIŞI", 24f * density, headerY, labelPaint)
+
+        // Speed badges on right
+        val rxStr = "⬇ %.1f KB/s".format(java.util.Locale.US, currentRxKbps)
+        val txStr = "⬆ %.1f KB/s".format(java.util.Locale.US, currentTxKbps)
+        val txW = txBadgePaint.measureText(txStr)
+        val rxW = rxBadgePaint.measureText(rxStr)
+        canvas.drawText(txStr, w - txW - 10f * density, headerY, txBadgePaint)
+        canvas.drawText(rxStr, w - txW - rxW - 20f * density, headerY, rxBadgePaint)
+
+        // Graph area
+        val graphTop = 24f * density
+        val graphBottom = h - 18f * density
+        val graphH = graphBottom - graphTop
+        val graphLeft = 10f * density
+        val graphRight = w - 10f * density
+        val graphW = graphRight - graphLeft
+        if (graphH <= 0f || graphW <= 0f) return
+
+        // Grid lines
+        canvas.drawLine(graphLeft, graphTop + graphH * 0.5f, graphRight, graphTop + graphH * 0.5f, gridPaint)
+        canvas.drawLine(graphLeft, graphBottom, graphRight, graphBottom, gridPaint)
+
+        var maxVal = 20f
+        for (i in 0 until maxSamples) {
+            if (rxHistory[i] > maxVal) maxVal = rxHistory[i]
+            if (txHistory[i] > maxVal) maxVal = txHistory[i]
+        }
+
+        val rxPath = Path()
+        val txPath = Path()
+        val rxFill = Path()
+        val stepX = graphW / (maxSamples - 1).toFloat()
+
+        for (i in 0 until maxSamples) {
+            val sampleIdx = (writeIdx + i) % maxSamples
+            val x = graphLeft + i * stepX
+            val rxNorm = (rxHistory[sampleIdx] / maxVal).coerceIn(0f, 1f)
+            val txNorm = (txHistory[sampleIdx] / maxVal).coerceIn(0f, 1f)
+            val rxY = graphBottom - rxNorm * (graphH * 0.9f)
+            val txY = graphBottom - txNorm * (graphH * 0.9f)
+
+            if (i == 0) {
+                rxPath.moveTo(x, rxY)
+                txPath.moveTo(x, txY)
+                rxFill.moveTo(x, graphBottom)
+                rxFill.lineTo(x, rxY)
+            } else {
+                rxPath.lineTo(x, rxY)
+                txPath.lineTo(x, txY)
+                rxFill.lineTo(x, rxY)
+            }
+        }
+        rxFill.lineTo(graphRight, graphBottom)
+        rxFill.close()
+
+        rxFillPaint.shader = LinearGradient(
+            0f, graphTop, 0f, graphBottom,
+            Color.argb(55, 16, 185, 129), Color.argb(0, 16, 185, 129),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawPath(rxFill, rxFillPaint)
+        rxFillPaint.shader = null
+
+        canvas.drawPath(rxPath, rxStrokePaint)
+        canvas.drawPath(txPath, txStrokePaint)
+
+        // Footer volume info
+        val footerY = h - 4f * density
+        val volStr = "Toplam Aktarım: ⬆ $totalTxKb KB  ⬇ $totalRxKb KB"
+        canvas.drawText(volStr, graphLeft, footerY, subTextPaint)
+    }
+}
+
+/**
+ * ModernMetricCard:
+ * Sleek glassmorphic card with vector icon, bold metric value, and subtle secondary detail.
+ */
+class ModernMetricCard(context: Context, val iconType: Int, val titleText: String, val heroColor: Int) : LinearLayout(context) {
+    val valView = TextView(context).apply {
+        text = "0"
+        textSize = 17f
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        setTextColor(heroColor)
+        setPadding(0, dp(2), 0, dp(1))
+    }
+    val subView = TextView(context).apply {
+        text = "Hazır"
+        textSize = 9.5f
+        setTextColor(Color.parseColor("#64748B"))
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    init {
+        orientation = VERTICAL
+        val shape = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(Color.parseColor("#0E1626"))
+            cornerRadius = 14f * resources.displayMetrics.density
+            setStroke(dp(1), Color.parseColor("#1E293B"))
+        }
+        background = shape
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+        layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f).apply {
+            setMargins(dp(4), dp(4), dp(4), dp(4))
+        }
+
+        val header = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val iconView = object : View(context) {
+            init {
+                layoutParams = LayoutParams(dp(14), dp(14)).apply {
+                    setMargins(0, 0, dp(6), 0)
+                }
+            }
+            override fun onDraw(c: Canvas) {
+                super.onDraw(c)
+                val s = minOf(width, height).toFloat()
+                when (iconType) {
+                    0 -> AndroidVectorIcons.drawBolt(c, s / 2, s / 2, s, heroColor)
+                    1 -> AndroidVectorIcons.drawShield(c, s / 2, s / 2, s, heroColor, fill = false)
+                    2 -> AndroidVectorIcons.drawGamepad(c, s / 2, s / 2, s, heroColor)
+                    else -> AndroidVectorIcons.drawLock(c, s / 2, s / 2, s, heroColor)
+                }
+            }
+        }
+        val titleLabel = TextView(context).apply {
+            text = titleText
+            textSize = 10f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#94A3B8"))
+        }
+        header.addView(iconView)
+        header.addView(titleLabel)
+
+        addView(header)
+        addView(valView)
+        addView(subView)
+    }
+
+    fun update(mainText: String, detailText: String) {
+        valView.text = mainText
+        subView.text = detailText
+    }
+}
+
+/**
+ * MainActivity:
+ * Complete 2026–2027 cyber-security architecture with 3 segmented tabs:
+ * 1. KONTROL (Interactive Hero Power Shield, Throughput Waveform, 4 Live Metric Cards)
+ * 2. TEŞHİS (ISP Out-of-Tunnel Diagnostic Runner, Probes, Real-time Censorship Report)
+ * 3. GÜNLÜK (Integrated Debugger, In-App Logcat Viewer, Clipboard Copy, Crash Dump Inspector)
+ */
 class MainActivity : Activity() {
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "thedpi-worker").apply { isDaemon = true } }
     private val main = Handler(Looper.getMainLooper())
@@ -3662,25 +4160,44 @@ class MainActivity : Activity() {
     @Volatile private var lastDecision: Decision? = null
     private var callback: ConnectivityManager.NetworkCallback? = null
     private lateinit var cm: ConnectivityManager
-    private lateinit var radarView: RadarPulseView
-    private lateinit var cardTcpVal: TextView
-    private lateinit var cardTcpSub: TextView
-    private lateinit var cardTlsVal: TextView
-    private lateinit var cardTlsSub: TextView
-    private lateinit var cardUdpVal: TextView
-    private lateinit var cardUdpSub: TextView
-    private lateinit var cardDnsVal: TextView
-    private lateinit var cardDnsSub: TextView
-    private lateinit var txTraffic: TextView
+
+    // UI Elements
+    private lateinit var powerShieldView: ModernPowerShieldView
+    private lateinit var statusPill: TextView
+    private lateinit var sparklineView: ThroughputSparklineView
+    private lateinit var heroActionButton: Button
+
+    private lateinit var cardTcp: ModernMetricCard
+    private lateinit var cardTls: ModernMetricCard
+    private lateinit var cardUdp: ModernMetricCard
+    private lateinit var cardDns: ModernMetricCard
+
+    // Tab buttons & containers
+    private lateinit var tabBtnControl: TextView
+    private lateinit var tabBtnDiag: TextView
+    private lateinit var tabBtnLog: TextView
+    private lateinit var panelControl: LinearLayout
+    private lateinit var panelDiag: LinearLayout
+    private lateinit var panelLog: LinearLayout
+
+    // Diag tab elements
     private lateinit var targets: EditText
     private lateinit var altDns: EditText
     private lateinit var dohEndpoints: EditText
-    private lateinit var runButton: Button
-    private lateinit var desyncButton: Button
-    private lateinit var appliedButton: Button
     private lateinit var auto: CheckBox
-    private lateinit var status: TextView
-    private lateinit var output: TextView
+    private lateinit var runButton: Button
+    private lateinit var appliedButton: Button
+    private lateinit var diagStatus: TextView
+    private lateinit var diagOutput: TextView
+
+    // Log tab elements
+    private lateinit var logOutput: TextView
+    private lateinit var logStatus: TextView
+
+    // Speed tracking
+    private var lastBytesUp = 0L
+    private var lastBytesDown = 0L
+    private var lastTickTimeMs = 0L
 
     private val tickerRunnable = object : Runnable {
         override fun run() {
@@ -3688,11 +4205,35 @@ class MainActivity : Activity() {
             val s = session
             val p = s?.proxyStats()
             val b = ActiveBridgeHolder.current
-            radarView.isActive = isVpn || (p?.active == true)
-            updateDashboardCards(isVpn, p, b)
+            val isEngelsizActive = isVpn || (p?.active == true)
+
+            powerShieldView.isActive = isEngelsizActive
+
+            // Compute speed rates
+            val now = System.currentTimeMillis()
+            val currentUp = b?.bytesUp?.get() ?: 0L
+            val currentDown = b?.bytesDown?.get() ?: 0L
+
+            var rxRate = 0f
+            var txRate = 0f
+            if (lastTickTimeMs > 0L) {
+                val dtSec = ((now - lastTickTimeMs) / 1000f).coerceAtLeast(0.1f)
+                val dDown = (currentDown - lastBytesDown).coerceAtLeast(0L)
+                val dUp = (currentUp - lastBytesUp).coerceAtLeast(0L)
+                rxRate = (dDown / 1024f) / dtSec
+                txRate = (dUp / 1024f) / dtSec
+            }
+            lastBytesUp = currentUp
+            lastBytesDown = currentDown
+            lastTickTimeMs = now
+
+            sparklineView.updateMetrics(rxRate, txRate, currentDown, currentUp)
+            updateDashboardMetrics(isVpn, p, b)
+
             main.postDelayed(this, 1000)
         }
     }
+
     private val networkCheck = Runnable { if (!worker.isShutdown) worker.execute { checkNetwork() } }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -3700,14 +4241,14 @@ class MainActivity : Activity() {
         CrashLogger.log("MainActivity", "onCreate başladı")
         try {
             cm = getSystemService(ConnectivityManager::class.java)
-            setContentView(buildUi(savedInstanceState))
+            setContentView(buildModernUi(savedInstanceState))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                     requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
                 }
             }
         } catch (t: Throwable) {
-            CrashLogger.log("MainActivity", "setContentView / buildUi hatası!", t)
+            CrashLogger.log("MainActivity", "buildModernUi hatası!", t)
             throw t
         }
 
@@ -3717,15 +4258,15 @@ class MainActivity : Activity() {
                 session = DiagnosticSession()
                 CrashLogger.log("MainActivity", "DiagnosticSession hazır: v${Native.engineVersion()}")
                 ui {
-                    status.text = "Motor ${Native.engineVersion()} hazır · 2026–2027 Hibrit Ağ Motoru"
+                    diagStatus.text = "Motor ${Native.engineVersion()} hazır · 2026–2027 Hibrit Ağ Motoru"
                     runButton.isEnabled = true
                 }
             } catch (e: NativeException) {
                 CrashLogger.log("MainActivity", "NativeException: ${e.message}", e)
-                ui { status.text = "Yerel motor başlatılamadı: ${e.message}" }
+                ui { diagStatus.text = "Yerel motor başlatılamadı: ${e.message}" }
             } catch (t: Throwable) {
                 CrashLogger.log("MainActivity", "DiagnosticSession başlatma hatası: ${t.message}", t)
-                ui { status.text = "Yerel motor hatası: ${t.message}" }
+                ui { diagStatus.text = "Yerel motor hatası: ${t.message}" }
             }
         }
     }
@@ -3736,7 +4277,7 @@ class MainActivity : Activity() {
         main.post { if (!isDestroyed) block() }
     }
 
-    private fun createCardShape(bgColor: String, borderColor: String = "#1E293B", cornerDp: Float = 12f): GradientDrawable {
+    private fun createCardShape(bgColor: String, borderColor: String = "#1E293B", cornerDp: Float = 14f): GradientDrawable {
         return GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             setColor(Color.parseColor(bgColor))
@@ -3745,140 +4286,235 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun buildCard(title: String, valColor: String): Triple<LinearLayout, TextView, TextView> {
+    private fun buildModernUi(state: Bundle?): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = createCardShape("#131D31")
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                setMargins(dp(4), dp(4), dp(4), dp(4))
-            }
-        }
-        val titleView = TextView(this).apply {
-            text = title
-            textSize = 10f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.parseColor("#94A3B8"))
-        }
-        val valView = TextView(this).apply {
-            text = "0"
-            textSize = 17f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.parseColor(valColor))
-            setPadding(0, dp(2), 0, dp(1))
-        }
-        val subView = TextView(this).apply {
-            text = "Hazır"
-            textSize = 9.5f
-            setTextColor(Color.parseColor("#64748B"))
-        }
-        root.addView(titleView)
-        root.addView(valView)
-        root.addView(subView)
-        return Triple(root, valView, subView)
-    }
-
-    private fun buildUi(state: Bundle?): View {
-        val pad = dp(14)
-        val column = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0A0E17"))
-            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(Color.parseColor("#070B14"))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
         }
 
-        // Header
+        // Top Header
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(4), 0, dp(8))
+            setPadding(0, dp(4), 0, dp(10))
         }
-        val titleText = TextView(this).apply {
+        val appTitle = TextView(this).apply {
             text = "THE DPI"
-            textSize = 23f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.parseColor("#00E676"))
+            textSize = 21f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#10B981"))
         }
-        val badgeText = TextView(this).apply {
+        val versionBadge = TextView(this).apply {
             text = "  2026–2027 v2.0"
-            textSize = 12f
-            setTypeface(typeface, Typeface.BOLD)
+            textSize = 11.5f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#38BDF8"))
         }
-        header.addView(titleText)
-        header.addView(badgeText)
-        column.addView(header)
+        header.addView(appTitle)
+        header.addView(versionBadge)
+        root.addView(header)
 
-        // Animated Radar Pulse
-        radarView = RadarPulseView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(150))
+        // Segmented Tab Bar (KONTROL · TEŞHİS · GÜNLÜK)
+        val tabBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = createCardShape("#0C1322", borderColor = "#1E293B", cornerDp = 10f)
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 0, 0, dp(12))
+            }
         }
-        column.addView(radarView)
 
-        // Traffic Bar
-        txTraffic = TextView(this).apply {
-            text = "⚡ Ağ Trafiği: ⬆ 0 KB  ⬇ 0 KB"
+        fun createTabBtn(label: String): TextView {
+            return TextView(this).apply {
+                text = label
+                textSize = 11.5f
+                gravity = Gravity.CENTER
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                setPadding(0, dp(8), 0, dp(8))
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+        }
+
+        tabBtnControl = createTabBtn("KONTROL")
+        tabBtnDiag = createTabBtn("TEŞHİS")
+        tabBtnLog = createTabBtn("GÜNLÜK")
+
+        tabBar.addView(tabBtnControl)
+        tabBar.addView(tabBtnDiag)
+        tabBar.addView(tabBtnLog)
+        root.addView(tabBar)
+
+        // Content Area Container
+        val contentFrame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+
+        // ---------------- TAB 0: KONTROL PANELİ ----------------
+        panelControl = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        // Animated Power Shield Hero Button
+        powerShieldView = ModernPowerShieldView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(175))
+            onToggleListener = { toggleDesync() }
+        }
+        panelControl.addView(powerShieldView)
+
+        // Connection State Pill Badge
+        statusPill = TextView(this).apply {
+            text = "KORUMA DEVRE DIŞI · DOKUNARAK BAĞLANIN"
             textSize = 11f
             gravity = Gravity.CENTER
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#94A3B8"))
-            setPadding(0, dp(4), 0, dp(8))
+            background = createCardShape("#0E1626", borderColor = "#1E293B", cornerDp = 20f)
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                setMargins(0, dp(2), 0, dp(10))
+            }
         }
-        column.addView(txTraffic)
+        panelControl.addView(statusPill)
 
-        // 4 Live Metric Dashboard Cards (2x2)
+        // Real-Time Network Speed & Throughput Waveform
+        sparklineView = ThroughputSparklineView(this).apply {
+            background = createCardShape("#0A101D", borderColor = "#1E293B", cornerDp = 12f)
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(88)).apply {
+                setMargins(0, 0, 0, dp(10))
+            }
+        }
+        panelControl.addView(sparklineView)
+
+        // 4 Live Metric Cards (2x2 Grid)
         val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         }
-        val (c1, v1, s1) = buildCard("⚡ TCP DESYNC", "#00E676")
-        val (c2, v2, s2) = buildCard("🛡️ TLS PARÇALAMA", "#38BDF8")
-        cardTcpVal = v1; cardTcpSub = s1
-        cardTlsVal = v2; cardTlsSub = s2
-        row1.addView(c1)
-        row1.addView(c2)
-        column.addView(row1)
+        cardTcp = ModernMetricCard(this, iconType = 0, titleText = "TCP DESYNC", heroColor = Color.parseColor("#10B981"))
+        cardTls = ModernMetricCard(this, iconType = 1, titleText = "TLS PARÇALAMA", heroColor = Color.parseColor("#38BDF8"))
+        row1.addView(cardTcp)
+        row1.addView(cardTls)
+        panelControl.addView(row1)
 
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         }
-        val (c3, v3, s3) = buildCard("🎮 ROBLOX / DISCORD UDP", "#A78BFA")
-        val (c4, v4, s4) = buildCard("🔒 ŞİFRELİ DoH DNS", "#FBBF24")
-        cardUdpVal = v3; cardUdpSub = s3
-        cardDnsVal = v4; cardDnsSub = s4
-        row2.addView(c3)
-        row2.addView(c4)
-        column.addView(row2)
+        cardUdp = ModernMetricCard(this, iconType = 2, titleText = "ROBLOX / DISCORD UDP", heroColor = Color.parseColor("#A78BFA"))
+        cardDns = ModernMetricCard(this, iconType = 3, titleText = "ŞİFRELİ DoH DNS", heroColor = Color.parseColor("#FBBF24"))
+        row2.addView(cardUdp)
+        row2.addView(cardDns)
+        panelControl.addView(row2)
 
-        // Hero Button (Toggle Engelsiz Mod)
-        desyncButton = Button(this).apply {
-            val isVpn = TheDpiVpnService.isRunning.get()
-            text = if (isVpn) {
-                "🛡️ ENGELSİZ MODU DURDUR (Sistem Geneli TUN Aktif)"
-            } else {
-                "⚡ ENGELSİZ MODU BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
-            }
-            textSize = 13.5f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(if (isVpn) Color.WHITE else Color.parseColor("#0A0E17"))
-            background = createCardShape(if (isVpn) "#DC2626" else "#00E676", cornerDp = 14f)
-            setPadding(dp(16), dp(14), dp(16), dp(14))
+        // Quick Bottom Action Button
+        heroActionButton = Button(this).apply {
+            text = "KORUMAYI BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
+            textSize = 12.5f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#070B14"))
+            background = createCardShape("#10B981", cornerDp = 12f)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, dp(12), 0, dp(10))
+                setMargins(0, dp(10), 0, dp(6))
             }
             setOnClickListener { toggleDesync() }
         }
-        column.addView(desyncButton)
+        panelControl.addView(heroActionButton)
 
-        // Diagnostic Action Row
+        val scrollControl = ScrollView(this).apply {
+            isFillViewport = true
+            addView(panelControl)
+        }
+        contentFrame.addView(scrollControl)
+
+        // ---------------- TAB 1: TEŞHİS PANELİ ----------------
+        panelDiag = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+
+        // Out-of-tunnel diagnostic notice
+        val noticeCard = TextView(this).apply {
+            text = "Bilgi: Bu sekmedeki ağ tanılaması, operatörünüzün (ISP) sansür ve engelleme durumunu doğrudan gözlemlemek için tünel dışından ham hat üzerinden yapılır."
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#94A3B8"))
+            background = createCardShape("#0E182A", borderColor = "#1E293B", cornerDp = 10f)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 0, 0, dp(8))
+            }
+        }
+        panelDiag.addView(noticeCard)
+
+        fun inputLabel(t: String) = TextView(this).apply {
+            text = t
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(6), 0, dp(2))
+        }
+
+        panelDiag.addView(inputLabel("Test hedefleri (her satıra bir tane):"))
+        targets = EditText(this).apply {
+            setText(state?.getString(KEY_TARGETS) ?: "discord.com
+roblox.com")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createCardShape("#0E1626", cornerDp = 8f)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            minLines = 2
+        }
+        panelDiag.addView(targets)
+
+        panelDiag.addView(inputLabel("Karşılaştırılacak DNS (isteğe bağlı):"))
+        altDns = EditText(this).apply {
+            setText(state?.getString(KEY_ALT) ?: "")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createCardShape("#0E1626", cornerDp = 8f)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            hint = "örn. 1.1.1.1"
+            setHintTextColor(Color.parseColor("#475569"))
+        }
+        panelDiag.addView(altDns)
+
+        panelDiag.addView(inputLabel("Şifreli DoH adresleri (isteğe bağlı, boş bırakılırsa dahili DoH kullanılır):"))
+        dohEndpoints = EditText(this).apply {
+            setText(state?.getString(KEY_DOH) ?: "")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            background = createCardShape("#0E1626", cornerDp = 8f)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            hint = "örn. https://1.1.1.1/dns-query"
+            setHintTextColor(Color.parseColor("#475569"))
+        }
+        panelDiag.addView(dohEndpoints)
+
+        auto = CheckBox(this).apply {
+            text = "Ağ değişince yeniden tanıla (ölçülü ağlarda durur)"
+            textSize = 11f
+            setTextColor(Color.parseColor("#94A3B8"))
+            isChecked = state?.getBoolean(KEY_AUTO) ?: false
+            setPadding(dp(4), dp(6), 0, dp(6))
+        }
+        panelDiag.addView(auto)
+
+        // Action Buttons Row
         val actRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, dp(6), 0, dp(8))
+            }
         }
         runButton = Button(this).apply {
             text = "Ağ Tanıla"
             isEnabled = false
             textSize = 12.5f
-            setTypeface(typeface, Typeface.BOLD)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.WHITE)
             background = createCardShape("#2563EB", cornerDp = 10f)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -3890,7 +4526,7 @@ class MainActivity : Activity() {
             text = "Öneriyi Doğrula"
             isEnabled = false
             textSize = 12.5f
-            setTypeface(typeface, Typeface.BOLD)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#94A3B8"))
             background = createCardShape("#1E293B", cornerDp = 10f)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -3900,129 +4536,266 @@ class MainActivity : Activity() {
         }
         actRow.addView(runButton)
         actRow.addView(appliedButton)
-        column.addView(actRow)
+        panelDiag.addView(actRow)
 
-        // Targets and DNS inputs
-        fun label(t: String) = TextView(this).apply {
-            text = t
-            textSize = 11f
-            setTextColor(Color.parseColor("#94A3B8"))
-            setPadding(0, dp(8), 0, dp(3))
-        }
-        column.addView(label("Test hedefleri (her satıra bir tane):"))
-        targets = EditText(this).apply {
-            setText(state?.getString(KEY_TARGETS) ?: "discord.com\nroblox.com")
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            background = createCardShape("#162032", cornerDp = 8f)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            minLines = 2
-        }
-        column.addView(targets)
-
-        column.addView(label("Karşılaştırılacak DNS (isteğe bağlı):"))
-        altDns = EditText(this).apply {
-            setText(state?.getString(KEY_ALT) ?: "")
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            background = createCardShape("#162032", cornerDp = 8f)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            hint = "örn. 1.1.1.1"
-            setHintTextColor(Color.parseColor("#475569"))
-        }
-        column.addView(altDns)
-
-        column.addView(label("Şifreli DoH adresleri (isteğe bağlı, boş bırakılırsa dahili DoH kullanılır):"))
-        dohEndpoints = EditText(this).apply {
-            setText(state?.getString(KEY_DOH) ?: "")
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            textSize = 12f
-            setTextColor(Color.WHITE)
-            background = createCardShape("#162032", cornerDp = 8f)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            hint = "örn. https://1.1.1.1/dns-query"
-            setHintTextColor(Color.parseColor("#475569"))
-        }
-        column.addView(dohEndpoints)
-
-        auto = CheckBox(this).apply {
-            text = "Ağ değişince yeniden tanıla (ölçülü ağlarda çalışmaz)"
-            textSize = 11f
-            setTextColor(Color.parseColor("#94A3B8"))
-            isChecked = state?.getBoolean(KEY_AUTO) ?: false
-        }
-        column.addView(auto)
-
-        status = TextView(this).apply {
+        diagStatus = TextView(this).apply {
             textSize = 11.5f
             setTextColor(Color.parseColor("#38BDF8"))
-            setPadding(0, dp(6), 0, dp(6))
+            setPadding(0, dp(2), 0, dp(6))
         }
-        column.addView(status)
+        panelDiag.addView(diagStatus)
 
-        output = TextView(this).apply {
+        // Diag Output Header + Copy Button
+        val diagOutHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        val outTitle = TextView(this).apply {
+            text = "Ölçüm Raporu & Sansür Teşhisi"
+            textSize = 11f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#94A3B8"))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val btnCopyDiag = TextView(this).apply {
+            text = "Panoya Kopyala"
+            textSize = 10.5f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#38BDF8"))
+            background = createCardShape("#131D31", borderColor = "#1E293B", cornerDp = 6f)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setOnClickListener {
+                copyToClipboard("THE DPI Raporu", diagOutput.text.toString())
+            }
+        }
+        diagOutHeader.addView(outTitle)
+        diagOutHeader.addView(btnCopyDiag)
+        panelDiag.addView(diagOutHeader)
+
+        diagOutput = TextView(this).apply {
             typeface = Typeface.MONOSPACE
-            textSize = 11.5f
+            textSize = 11f
             setTextColor(Color.parseColor("#E2E8F0"))
-            background = createCardShape("#0D131F", borderColor = "#1E293B", cornerDp = 10f)
+            background = createCardShape("#090D16", borderColor = "#1E293B", cornerDp = 10f)
             setPadding(dp(10), dp(10), dp(10), dp(10))
             setTextIsSelectable(true)
-            text = state?.getString(KEY_OUTPUT) ?: ""
+            text = state?.getString(KEY_OUTPUT) ?: "Tanılama henüz çalıştırılmadı."
         }
-        column.addView(output)
+        panelDiag.addView(diagOutput)
 
-        val logInfo = TextView(this).apply {
-            text = "📁 Dahili Debugger & Günlük:\n/Android/data/com.the.dpi/files/thedpi_debug.log\n(Çökmeler: thedpi_crash.log dosyasına kaydedilir)"
-            textSize = 10f
-            setTextColor(Color.parseColor("#64748B"))
-            setPadding(0, dp(10), 0, dp(12))
-        }
-        column.addView(logInfo)
-
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#0A0E17"))
-            addView(column)
+        val scrollDiag = ScrollView(this).apply {
             isFillViewport = true
+            addView(panelDiag)
         }
-        scroll.setOnApplyWindowInsetsListener { v, insets ->
+        contentFrame.addView(scrollDiag)
+
+        // ---------------- TAB 2: GÜNLÜK & DEBUGGER ----------------
+        panelLog = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+
+        val logPathCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = createCardShape("#0E1626", borderColor = "#1E293B", cornerDp = 12f)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(0, 0, 0, dp(10))
+            }
+        }
+        val logPathTitle = TextView(this).apply {
+            text = "Dahili Debugger & Günlük Yolu"
+            textSize = 11f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setTextColor(Color.parseColor("#10B981"))
+        }
+        val logPathVal = TextView(this).apply {
+            text = CrashLogger.getDebugLogPath()
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(3), 0, dp(6))
+        }
+        logPathCard.addView(logPathTitle)
+        logPathCard.addView(logPathVal)
+
+        // Action buttons row for Log
+        val logBtnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+        fun createLogBtn(label: String, colorStr: String): Button {
+            return Button(this).apply {
+                text = label
+                textSize = 11f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(Color.WHITE)
+                background = createCardShape(colorStr, cornerDp = 8f)
+                setPadding(dp(8), dp(6), dp(8), dp(6))
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    setMargins(dp(2), 0, dp(2), 0)
+                }
+            }
+        }
+
+        val btnCopyLog = createLogBtn("Kopyala", "#2563EB").apply {
+            setOnClickListener { copyToClipboard("THE DPI Log", logOutput.text.toString()) }
+        }
+        val btnCrashCheck = createLogBtn("Çökme Raporu", "#475569").apply {
+            setOnClickListener { readCrashLog() }
+        }
+        val btnRefreshLog = createLogBtn("Yenile", "#059669").apply {
+            setOnClickListener { refreshLogViewer() }
+        }
+        logBtnRow.addView(btnCopyLog)
+        logBtnRow.addView(btnCrashCheck)
+        logBtnRow.addView(btnRefreshLog)
+        logPathCard.addView(logBtnRow)
+        panelLog.addView(logPathCard)
+
+        logStatus = TextView(this).apply {
+            text = "Canlı Uygulama Günlüğü (Son Olaylar)"
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        panelLog.addView(logStatus)
+
+        logOutput = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#A7F3D0"))
+            background = createCardShape("#080C14", borderColor = "#1E293B", cornerDp = 10f)
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setTextIsSelectable(true)
+            text = "Günlük yükleniyor..."
+        }
+        panelLog.addView(logOutput)
+
+        val scrollLog = ScrollView(this).apply {
+            isFillViewport = true
+            addView(panelLog)
+        }
+        contentFrame.addView(scrollLog)
+
+        root.addView(contentFrame)
+
+        // Setup tab switching logic
+        fun setTab(index: Int) {
+            val activeBg = createCardShape("#1E293B", borderColor = "#334155", cornerDp = 8f)
+            val inactiveBg = GradientDrawable().apply { setColor(Color.TRANSPARENT) }
+
+            tabBtnControl.background = if (index == 0) activeBg else inactiveBg
+            tabBtnControl.setTextColor(if (index == 0) Color.WHITE else Color.parseColor("#64748B"))
+
+            tabBtnDiag.background = if (index == 1) activeBg else inactiveBg
+            tabBtnDiag.setTextColor(if (index == 1) Color.WHITE else Color.parseColor("#64748B"))
+
+            tabBtnLog.background = if (index == 2) activeBg else inactiveBg
+            tabBtnLog.setTextColor(if (index == 2) Color.WHITE else Color.parseColor("#64748B"))
+
+            panelControl.visibility = if (index == 0) View.VISIBLE else View.GONE
+            panelDiag.visibility = if (index == 1) View.VISIBLE else View.GONE
+            panelLog.visibility = if (index == 2) View.VISIBLE else View.GONE
+
+            if (index == 2) refreshLogViewer()
+        }
+
+        tabBtnControl.setOnClickListener { setTab(0) }
+        tabBtnDiag.setOnClickListener { setTab(1) }
+        tabBtnLog.setOnClickListener { setTab(2) }
+        setTab(0)
+
+        root.setOnApplyWindowInsetsListener { v, insets ->
             val b = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime() or WindowInsets.Type.displayCutout())
             v.setPadding(b.left, b.top, b.right, b.bottom)
             WindowInsets.CONSUMED
         }
-        return scroll
+        return root
     }
 
-    private fun updateDashboardCards(isVpn: Boolean, p: ProxyStatus?, b: TunBridge?) {
+    private fun updateDashboardMetrics(isVpn: Boolean, p: ProxyStatus?, b: TunBridge?) {
         val tcp = b?.tcpFlows?.get() ?: 0
         val desync = b?.desyncedFlows?.get() ?: 0
         val vision = b?.visionSplicedFlows?.get() ?: 0
-        cardTcpVal.text = "$tcp Akış"
-        cardTcpSub.text = "Desync: $desync · Splice: $vision"
+        cardTcp.update("$tcp Akış", "Desync: $desync · Splice: $vision")
 
         val tlsFrag = b?.tlsRecordFragmented?.get() ?: 0
         val tlsSplit = p?.tlsSplit ?: 0
-        cardTlsVal.text = "$tlsFrag Kayıt"
-        cardTlsSub.text = "TLS Bölme: $tlsSplit · RST Kalkanı: ${p?.rstDropped ?: 0}"
+        cardTls.update("$tlsFrag Kayıt", "TLS Bölme: $tlsSplit · RST: ${p?.rstDropped ?: 0}")
 
         val udp = b?.udpFlows?.get() ?: 0
         val quicFall = b?.quicFallbacks?.get() ?: 0
-        cardUdpVal.text = "$udp Akış"
-        cardUdpSub.text = "NAT Ses/Oyun · QUIC Geçiş: $quicFall"
+        cardUdp.update("$udp Akış", "NAT Ses/Oyun · QUIC: $quicFall")
 
         val dns = b?.dnsQueries?.get() ?: 0
         val doh = b?.dohResolved?.get() ?: 0
         val poison = b?.poisonedDnsBlocked?.get() ?: 0
-        cardDnsVal.text = "$dns Sorgu"
-        cardDnsSub.text = "DoH: $doh · Zehir Engeli: $poison"
+        cardDns.update("$dns Sorgu", "DoH: $doh · Zehir Engeli: $poison")
 
-        val upKb = (b?.bytesUp?.get() ?: 0L) / 1024
-        val downKb = (b?.bytesDown?.get() ?: 0L) / 1024
-        txTraffic.text = if (isVpn) {
-            "🛡️ VPN Tüneli: ⬆ $upKb KB  ⬇ $downKb KB · IPv6 Reddedildi: ${b?.ipv6Rejected?.get() ?: 0}"
+        val isEngelsizActive = isVpn || (p?.active == true)
+        if (isEngelsizActive) {
+            statusPill.text = if (isVpn) {
+                "SİSTEM GENELİ KORUMA DEVREDE (TUN + DoH + DESYNC)"
+            } else {
+                "YEREL VEKİL AKTİF (127.0.0.1:${p?.port ?: 0})"
+            }
+            statusPill.setTextColor(Color.parseColor("#10B981"))
+            statusPill.background = createCardShape("#064E3B", borderColor = "#059669", cornerDp = 20f)
+
+            heroActionButton.text = "KORUMAYI DURDUR (Engelsiz Modu Kapat)"
+            heroActionButton.setTextColor(Color.WHITE)
+            heroActionButton.background = createCardShape("#DC2626", cornerDp = 12f)
         } else {
-            "⚡ Ağ Trafiği: ⬆ $upKb KB  ⬇ $downKb KB"
+            statusPill.text = "KORUMA DEVRE DIŞI · DOKUNARAK BAĞLANIN"
+            statusPill.setTextColor(Color.parseColor("#94A3B8"))
+            statusPill.background = createCardShape("#0E1626", borderColor = "#1E293B", cornerDp = 20f)
+
+            heroActionButton.text = "KORUMAYI BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
+            heroActionButton.setTextColor(Color.parseColor("#070B14"))
+            heroActionButton.background = createCardShape("#10B981", cornerDp = 12f)
+        }
+    }
+
+    private fun copyToClipboard(label: String, text: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText(label, text)
+        clipboard.setPrimaryClip(clip)
+        Toast.makeText(this, "$label panoya kopyalandı", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun refreshLogViewer() {
+        worker.execute {
+            val path = CrashLogger.getDebugLogPath()
+            val text = try {
+                val f = java.io.File(path)
+                if (f.exists()) {
+                    val lines = f.readLines(Charsets.UTF_8)
+                    lines.takeLast(120).joinToString("
+")
+                } else {
+                    "Henüz günlük kaydı oluşturulmadı."
+                }
+            } catch (t: Throwable) {
+                "Günlük okuma hatası: ${t.message}"
+            }
+            ui {
+                logOutput.text = text
+                logStatus.text = "Canlı Günlük: ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())} itibarıyla güncellendi"
+            }
+        }
+    }
+
+    private fun readCrashLog() {
+        val crash = CrashLogger.getCrashLogContent()
+        if (crash.isNullOrBlank()) {
+            Toast.makeText(this, "Kayıtlı çökme raporu bulunamadı (Sistem Kararlı)", Toast.LENGTH_LONG).show()
+            logOutput.text = "SİSTEM KARARLI: Kayıtlı çökme (crash dump) bulunamadı.
+Dosya: ${CrashLogger.getCrashLogPath()}"
+        } else {
+            logOutput.text = crash
+            Toast.makeText(this, "Çökme raporu yüklendi", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -4053,7 +4826,7 @@ class MainActivity : Activity() {
         outState.putString(KEY_ALT, altDns.text.toString())
         outState.putString(KEY_DOH, dohEndpoints.text.toString())
         outState.putBoolean(KEY_AUTO, auto.isChecked)
-        outState.putString(KEY_OUTPUT, output.text.toString().take(64 * 1024))
+        outState.putString(KEY_OUTPUT, diagOutput.text.toString().take(64 * 1024))
     }
 
     override fun onDestroy() {
@@ -4081,7 +4854,7 @@ class MainActivity : Activity() {
         s.networkChanged()
         s.setEnvironment(env)
         ui {
-            status.text = "Ağ değişti (${Text.networkType(env.networkType)}); önceki sonuçlar geçersiz."
+            diagStatus.text = "Ağ değişti (${Text.networkType(env.networkType)}); önceki sonuçlar geçersiz."
             appliedButton.isEnabled = false
             if (auto.isChecked && env.metered != YES && !busy.get()) startRun(verifyRuns = 0)
         }
@@ -4095,7 +4868,7 @@ class MainActivity : Activity() {
         val dohList = split(dohEndpoints.text.toString()).ifEmpty { TunBridge.DEFAULT_DOH_ENDPOINTS }
         runButton.isEnabled = false
         appliedButton.isEnabled = false
-        status.text = "Tanılanıyor (Poison-Free DoH & TLS)..."
+        diagStatus.text = "Tanılanıyor (Poison-Free DoH & TLS)..."
         worker.execute {
             try {
                 var text = ""
@@ -4117,8 +4890,8 @@ class MainActivity : Activity() {
                     text = Text.environment(env) + "\n" + Text.report(report)
                 }
                 ui {
-                    output.text = text
-                    status.text = "Tamamlandı"
+                    diagOutput.text = text
+                    diagStatus.text = "Tamamlandı"
                     val d = lastDecision
                     appliedButton.isEnabled = d != null && d.state == 2 && d.action != 0 && d.action != 8
                     if (appliedButton.isEnabled) {
@@ -4127,7 +4900,7 @@ class MainActivity : Activity() {
                     }
                 }
             } catch (e: Exception) {
-                ui { status.text = "Hata: ${e.message}" }
+                ui { diagStatus.text = "Hata: ${e.message}" }
             } finally {
                 busy.set(false)
                 ui { runButton.isEnabled = true }
@@ -4153,12 +4926,10 @@ class MainActivity : Activity() {
                     val next = s.proxyStats()
                     val text = Text.vpnStatus(false, next)
                     ui {
-                        output.text = text + "\n" + output.text.toString()
-                        desyncButton.text = "⚡ ENGELSİZ MODU BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
-                        desyncButton.setTextColor(Color.parseColor("#0A0E17"))
-                        desyncButton.background = createCardShape("#00E676", cornerDp = 14f)
-                        radarView.isActive = false
-                        status.text = "Engelsiz Mod durduruldu"
+                        diagOutput.text = text + "\n" + diagOutput.text.toString()
+                        powerShieldView.isActive = false
+                        diagStatus.text = "Engelsiz Mod durduruldu"
+                        updateDashboardMetrics(false, next, ActiveBridgeHolder.current)
                     }
                     CrashLogger.log("MainActivity", "Engelsiz Mod durduruldu.")
                 } catch (t: Throwable) {
@@ -4175,7 +4946,7 @@ class MainActivity : Activity() {
         }
         if (prepIntent != null) {
             CrashLogger.log("MainActivity", "VPN hazırlık intent'i başlatılıyor...")
-            status.text = "Sistem geneli DPI aşma için VPN izni bekleniyor…"
+            diagStatus.text = "Sistem geneli DPI aşma için VPN izni bekleniyor…"
             @Suppress("DEPRECATION")
             startActivityForResult(prepIntent, REQ_VPN)
         } else {
@@ -4234,18 +5005,13 @@ class MainActivity : Activity() {
                     bytesDown = b?.bytesDown?.get() ?: 0L,
                 )
                 ui {
-                    output.text = text + "\n" + output.text.toString()
-                    radarView.isActive = true
+                    diagOutput.text = text + "\n" + diagOutput.text.toString()
+                    powerShieldView.isActive = true
+                    updateDashboardMetrics(vpnGranted, next, b)
                     if (vpnGranted) {
-                        desyncButton.text = "🛡️ ENGELSİZ MOD ETKİN (Sistem Geneli VPN + 127.0.0.1:${next.port})"
-                        desyncButton.setTextColor(Color.WHITE)
-                        desyncButton.background = createCardShape("#DC2626", cornerDp = 14f)
-                        status.text = "Engelsiz Mod etkin: Sistem Geneli VPN (Discord/Roblox TCP+UDP+DoH) + 127.0.0.1:${next.port}"
+                        diagStatus.text = "Engelsiz Mod etkin: Sistem Geneli VPN (Discord/Roblox TCP+UDP+DoH) + 127.0.0.1:${next.port}"
                     } else {
-                        desyncButton.text = "🛡️ YEREL PROXY ETKİN (127.0.0.1:${next.port})"
-                        desyncButton.setTextColor(Color.WHITE)
-                        desyncButton.background = createCardShape("#D97706", cornerDp = 14f)
-                        status.text = "VPN izni verilmedi; yalnızca yerel proxy etkin (127.0.0.1:${next.port})"
+                        diagStatus.text = "VPN izni verilmedi; yalnızca yerel proxy etkin (127.0.0.1:${next.port})"
                     }
                 }
             } catch (t: Throwable) {
@@ -4261,10 +5027,10 @@ class MainActivity : Activity() {
             val rc = s.markApplied(d.action)
             ui {
                 if (rc == Codes.OK) {
-                    status.text = "Doğrulama başlatıldı: iki ölçüm yapılacak"
+                    diagStatus.text = "Doğrulama başlatıldı: iki ölçüm yapılacak"
                     startRun(verifyRuns = 1)
                 } else {
-                    status.text = "Doğrulama başlatılamadı: ${Text.code(rc)}"
+                    diagStatus.text = "Doğrulama başlatılamadı: ${Text.code(rc)}"
                 }
             }
         }
