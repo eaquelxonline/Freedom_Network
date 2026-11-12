@@ -127,6 +127,8 @@ freedom_scan_pattern:
     dup     v1.16b, w5                 // broadcast needle[0] across 16 bytes
     mov     x6, #0                     // pos = 0
 21:
+    cmp     x6, x4
+    bhi     29f
     sub     x7, x4, x6
     cmp     x7, #15
     blo     25f

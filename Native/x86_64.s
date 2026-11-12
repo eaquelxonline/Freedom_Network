@@ -171,6 +171,8 @@ freedom_scan_pattern:
     pshufd  $0, %xmm4, %xmm4            // broadcast needle[0] across 16 bytes
     xor     %r9, %r9                    // pos = 0
 .Lscan_vec_loop:
+    cmp     %r8, %r9
+    ja      .Lscan_not_found
     mov     %r8, %r10
     sub     %r9, %r10
     cmp     $15, %r10
