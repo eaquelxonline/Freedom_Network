@@ -776,6 +776,86 @@ fun main() {
         }
     }
 
+    // ------------------------------------------------------------------ 25. DNS Poisoning Detection, ICMP synthesis & Stream First-Flight Evasion
+    test("DNS poison detection, ICMP unreachable synthesis, and stream planFirstPayload") {
+        val q = Doh.query("discord.com")!!
+
+        // 1) ISP Poison detection: Türk Telekom 195.175.254.2 / loopback / clean IP
+        val poisonedTt = dnsAnswer(q, byteArrayOf(195.toByte(), 175.toByte(), 254.toByte(), 2))
+        expect(IpPackets.containsPoisonedDns(poisonedTt)) { "must detect Türk Telekom 195.175.254.2 as poisoned" }
+
+        val poisonedLoopback = dnsAnswer(q, byteArrayOf(127, 0, 0, 1))
+        expect(IpPackets.containsPoisonedDns(poisonedLoopback)) { "must detect 127.0.0.1 as poisoned" }
+
+        val cleanAnswer = dnsAnswer(q, byteArrayOf(162.toByte(), 159.toByte(), 135.toByte(), 232.toByte()))
+        expect(!IpPackets.containsPoisonedDns(cleanAnswer)) { "clean Discord IP must not be flagged" }
+
+        val minTtl = IpPackets.dnsMinTtl(cleanAnswer)
+        eq(minTtl, 300L, "parsed DNS answer min TTL")
+
+        // 2) ICMPv6 unreachable synthesis (RFC 4443 Type 1 Code 3) for immediate IPv4 fallback
+        val mockIpv6 = ByteArray(40).apply {
+            this[0] = 0x60 // IPv6 version 6
+            this[6] = 6 // TCP
+            this[7] = 64 // Hop limit
+            // src: 2001:db8::1, dst: 2001:db8::2
+            this[8] = 0x20; this[9] = 0x01; this[10] = 0x0d; this[11] = 0xb8.toByte(); this[23] = 1
+            this[24] = 0x20; this[25] = 0x01; this[26] = 0x0d; this[27] = 0xb8.toByte(); this[39] = 2
+        }
+        val icmpv6 = IpPackets.buildIcmpv6Unreachable(mockIpv6)
+        expect(icmpv6 != null) { "ICMPv6 packet must be synthesized" }
+        eq(((icmpv6!![0].toInt() ushr 4) and 0x0F), 6, "ICMPv6 version")
+        eq(icmpv6[6].toInt() and 0xFF, 58, "IPv6 Next Header = ICMPv6 (58)")
+        eq(icmpv6[40].toInt() and 0xFF, 1, "ICMPv6 Type 1 (Destination Unreachable)")
+        eq(icmpv6[41].toInt() and 0xFF, 3, "ICMPv6 Code 3 (Address Unreachable)")
+
+        // 3) ICMPv4 unreachable synthesis for QUIC -> TCP fallback
+        val clientIp = IpPackets.parseIpLiteral("10.215.173.1")!!
+        val quicIp = IpPackets.parseIpLiteral("162.159.135.232")!!
+        val quicPkt = IpPackets.buildIpv4Udp(clientIp, quicIp, 50000, 443, byteArrayOf(1, 2, 3, 4))
+        val icmpv4 = IpPackets.buildIcmpv4Unreachable(quicPkt)
+        expect(icmpv4 != null) { "ICMPv4 packet must be synthesized" }
+        eq(icmpv4!![9].toInt() and 0xFF, 1, "IPv4 Proto = ICMP (1)")
+        eq(icmpv4[20].toInt() and 0xFF, 3, "ICMPv4 Type 3 (Destination Unreachable)")
+        eq(icmpv4[21].toInt() and 0xFF, 3, "ICMPv4 Code 3 (Port Unreachable)")
+
+        // 4) SNI locator and planFirstPayload
+        val hostBytes = "roblox.com".toByteArray(Charsets.US_ASCII)
+        val sniExtLen = 5 + hostBytes.size
+        val extsLen = 4 + sniExtLen
+        val bodyLen = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extsLen
+        val recLen = 4 + bodyLen
+        val ch = java.nio.ByteBuffer.allocate(5 + recLen).apply {
+            put(0x16.toByte()); put(0x03.toByte()); put(0x01.toByte())
+            putShort(recLen.toShort())
+            put(0x01.toByte())
+            put(0x00.toByte()); putShort(bodyLen.toShort())
+            put(0x03.toByte()); put(0x03.toByte())
+            put(ByteArray(32))
+            put(0x00.toByte())
+            putShort(2); put(0x13.toByte()); put(0x01.toByte())
+            put(0x01.toByte()); put(0x00.toByte())
+            putShort(extsLen.toShort())
+            putShort(0x0000); putShort(sniExtLen.toShort())
+            putShort((3 + hostBytes.size).toShort())
+            put(0x00.toByte()); putShort(hostBytes.size.toShort())
+            put(hostBytes)
+        }.array()
+
+        val sniPos = IpPackets.findClientHelloSni(ch)
+        expect(sniPos != null) { "must locate SNI offset in ClientHello" }
+        eq(String(ch, sniPos!!.first, sniPos.second, Charsets.US_ASCII), "roblox.com", "extracted SNI string")
+
+        val planned = IpPackets.planFirstPayload(ch, listOf(ch))
+        expect(planned.size >= 2) { "planFirstPayload must fragment ClientHello" }
+        for (f in planned) {
+            eq(f[0].toInt() and 0xFF, 0x16, "each planned fragment is a valid TLS 0x16 record")
+            expect(!String(f, Charsets.ISO_8859_1).contains("roblox.com")) {
+                "no single planned fragment contains full roblox.com SNI"
+            }
+        }
+    }
+
     println()
     println("RESULT: $passed passed, ${failures.size} failed")
     if (failures.isNotEmpty()) {

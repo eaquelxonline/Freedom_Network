@@ -16,11 +16,18 @@ import java.net.URI
 import java.net.ProxySelector
 import java.net.ConnectException
 import java.awt.BorderLayout
+import java.awt.Color
 import java.awt.Dimension
+import java.awt.FlowLayout
 import java.awt.Font
+import java.awt.Graphics
+import java.awt.Graphics2D
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
+import java.awt.GridLayout
 import java.awt.Insets
+import java.awt.RenderingHints
+import java.awt.Toolkit
 import java.awt.event.WindowAdapter
 import java.awt.event.WindowEvent
 import java.io.ByteArrayOutputStream
@@ -1286,6 +1293,11 @@ object Text {
         dohResolved: Int = 0,
         desyncedFlows: Int = 0,
         visionSplicedFlows: Int = 0,
+        poisonedBlocked: Int = 0,
+        quicFallbacks: Int = 0,
+        tlsFragmented: Int = 0,
+        bytesUp: Long = 0,
+        bytesDown: Long = 0,
     ): String = buildString {
         if (!vpnActive && !p.active) {
             appendLine("ENGELSİZ MOD (SİSTEM GENELİ VPN + DPI AŞMA): Kapalı")
@@ -1301,7 +1313,10 @@ object Text {
             appendLine("  Yerel Proxy: 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         }
         appendLine("  Strateji   : ${desyncMode(p.mode)}")
-        appendLine("  TUN Köprüsü: TCP akışı $tcpFlows (Desync $desyncedFlows, Vision Splice $visionSplicedFlows) · UDP/Oyun-Ses akışı $udpFlows · DNS $dnsQueries (Şifreli DoH $dohResolved)")
+        appendLine("  TUN Köprüsü: TCP $tcpFlows (Desync $desyncedFlows, TLS Kayıt Parçalama $tlsFragmented, Vision Splice $visionSplicedFlows) · UDP/Oyun-Ses $udpFlows (QUIC Geçişi $quicFallbacks) · DNS $dnsQueries (Şifreli DoH $dohResolved, Zehirlenme Engellendi $poisonedBlocked)")
+        if (bytesUp > 0 || bytesDown > 0) {
+            appendLine("  Veri Akışı : Yükleme ${bytesUp / 1024} KB · İndirme ${bytesDown / 1024} KB")
+        }
         appendLine("  Motor İstat: bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped} · Vision doğrudan aktarım ${p.visionSplice}")
     }
 }
@@ -1316,6 +1331,7 @@ object IpPackets {
     const val PROTO_ICMP = 1
     const val PROTO_TCP = 6
     const val PROTO_UDP = 17
+    const val PROTO_ICMPV6 = 58
 
     const val TCP_FIN = 0x01
     const val TCP_SYN = 0x02
@@ -1482,6 +1498,264 @@ object IpPackets {
             sum = (sum and 0xFFFFL) + (sum ushr 16)
         }
         return (sum.inv() and 0xFFFFL).toInt()
+    }
+
+    /** Skips a (possibly compressed) DNS name starting at [pos]; returns the offset after it or -1. */
+    private fun skipDnsName(msg: ByteArray, start: Int): Int {
+        var pos = start
+        var guard = 0
+        while (pos < msg.size && guard++ < 128) {
+            val len = msg[pos].toInt() and 0xFF
+            when {
+                len == 0 -> return pos + 1
+                (len and 0xC0) == 0xC0 -> return if (pos + 2 <= msg.size) pos + 2 else -1
+                (len and 0xC0) != 0 -> return -1
+                else -> pos += 1 + len
+            }
+        }
+        return -1
+    }
+
+    /**
+     * Extracts A (4-byte) and AAAA (16-byte) RDATA from the answer section of a DNS response.
+     * Returns null when the message is malformed.
+     */
+    fun dnsAnswerAddresses(msg: ByteArray): List<ByteArray>? {
+        if (msg.size < 12) return null
+        val qd = u16(msg, 4)
+        val an = u16(msg, 6)
+        var pos = 12
+        repeat(qd) {
+            pos = skipDnsName(msg, pos)
+            if (pos < 0 || pos + 4 > msg.size) return null
+            pos += 4
+        }
+        val out = ArrayList<ByteArray>()
+        repeat(an) {
+            pos = skipDnsName(msg, pos)
+            if (pos < 0 || pos + 10 > msg.size) return null
+            val type = u16(msg, pos)
+            val rdLen = u16(msg, pos + 8)
+            pos += 10
+            if (pos + rdLen > msg.size) return null
+            if ((type == 1 && rdLen == 4) || (type == 28 && rdLen == 16)) {
+                out.add(msg.copyOfRange(pos, pos + rdLen))
+            }
+            pos += rdLen
+        }
+        return out
+    }
+
+    /**
+     * True when a DNS response points to a known ISP block/warning page or a sinkhole:
+     * Türk Telekom / BTK `195.175.254.0/24` and `2a01:358:4014:a00::/64`, `0.0.0.0`,
+     * `127.0.0.0/8`, or the IPv6 unspecified/loopback addresses.
+     */
+    fun containsPoisonedDns(payload: ByteArray): Boolean {
+        val addrs = dnsAnswerAddresses(payload) ?: return false
+        for (a in addrs) {
+            val b0 = a[0].toInt() and 0xFF
+            if (a.size == 4) {
+                val b1 = a[1].toInt() and 0xFF
+                val b2 = a[2].toInt() and 0xFF
+                if (b0 == 195 && b1 == 175 && b2 == 254) return true
+                if (b0 == 127) return true
+                if (a.all { it.toInt() == 0 }) return true
+            } else {
+                if (a.copyOfRange(0, 15).all { it.toInt() == 0 }) return true // :: and ::1
+                val tt = byteArrayOf(0x2a, 0x01, 0x03, 0x58, 0x40, 0x14, 0x0a, 0x00)
+                if (a.copyOfRange(0, 8).contentEquals(tt)) return true
+            }
+        }
+        return false
+    }
+
+    /** Smallest TTL found in the answer section (seconds), or null. */
+    fun dnsMinTtl(msg: ByteArray): Long? {
+        if (msg.size < 12) return null
+        val qd = u16(msg, 4)
+        val an = u16(msg, 6)
+        var pos = 12
+        repeat(qd) {
+            pos = skipDnsName(msg, pos)
+            if (pos < 0 || pos + 4 > msg.size) return null
+            pos += 4
+        }
+        var min: Long? = null
+        repeat(an) {
+            pos = skipDnsName(msg, pos)
+            if (pos < 0 || pos + 10 > msg.size) return min
+            val ttl = u32(msg, pos + 4)
+            val rdLen = u16(msg, pos + 8)
+            min = if (min == null) ttl else minOf(min!!, ttl)
+            pos += 10 + rdLen
+        }
+        return min
+    }
+
+    /**
+     * Synthesizes an ICMPv4 Destination Unreachable (Type 3, Code 3 port unreachable) for an
+     * outgoing IPv4 packet, so e.g. QUIC (UDP 443) clients fall back to TCP immediately.
+     */
+    fun buildIcmpv4Unreachable(origPacket: ByteArray, code: Int = 3): ByteArray? {
+        val ip = parseIpv4(origPacket) ?: return null
+        val quoteLen = minOf(origPacket.size, ip.ihl + 8)
+        val icmpLen = 8 + quoteLen
+        val out = ByteArray(20 + icmpLen)
+        out[0] = 0x45
+        putU16(out, 2, out.size)
+        out[8] = 64
+        out[9] = PROTO_ICMP.toByte()
+        putU32(out, 12, ip.dstIp.toLong() and 0xFFFFFFFFL)
+        putU32(out, 16, ip.srcIp.toLong() and 0xFFFFFFFFL)
+        putU16(out, 10, checksum(out, 0, 20))
+        out[20] = 3
+        out[21] = code.toByte()
+        System.arraycopy(origPacket, 0, out, 28, quoteLen)
+        putU16(out, 22, checksum(out, 20, icmpLen))
+        return out
+    }
+
+    /** RFC 1071 Internet checksum over [len] bytes at [off]. */
+    fun checksum(buf: ByteArray, off: Int, len: Int): Int {
+        var sum = 0L
+        var i = 0
+        while (i + 1 < len) {
+            sum += u16(buf, off + i).toLong()
+            i += 2
+        }
+        if (i < len) sum += ((buf[off + i].toInt() and 0xFF) shl 8).toLong()
+        while ((sum ushr 16) != 0L) sum = (sum and 0xFFFFL) + (sum ushr 16)
+        return (sum.inv() and 0xFFFFL).toInt()
+    }
+
+    /**
+     * Locates the SNI host name inside a single TLS ClientHello record. Returns
+     * `(offset, length)` of the host bytes within [p], or null.
+     */
+    fun findClientHelloSni(p: ByteArray): Pair<Int, Int>? {
+        if (p.size < 48 || (p[0].toInt() and 0xFF) != 0x16 || (p[5].toInt() and 0xFF) != 0x01) return null
+        var pos = 5 + 4 + 2 + 32
+        if (pos >= p.size) return null
+        pos += 1 + (p[pos].toInt() and 0xFF) // session id
+        if (pos + 2 > p.size) return null
+        pos += 2 + u16(p, pos) // cipher suites
+        if (pos + 1 > p.size) return null
+        pos += 1 + (p[pos].toInt() and 0xFF) // compression methods
+        if (pos + 2 > p.size) return null
+        val extEnd = minOf(p.size, pos + 2 + u16(p, pos))
+        pos += 2
+        while (pos + 4 <= extEnd) {
+            val type = u16(p, pos)
+            val len = u16(p, pos + 2)
+            if (type == 0 && pos + 9 <= extEnd) {
+                val nameLen = u16(p, pos + 7)
+                val nameOff = pos + 9
+                return if (nameOff + nameLen <= p.size && nameLen > 0) nameOff to nameLen else null
+            }
+            pos += 4 + len
+        }
+        return null
+    }
+
+    /** Splits [payload] at the given (sorted, deduplicated, in-range) byte offsets. */
+    fun splitAt(payload: ByteArray, offsets: Collection<Int>): List<ByteArray> {
+        val cuts = offsets.filter { it in 1 until payload.size }.distinct().sorted()
+        if (cuts.isEmpty()) return listOf(payload)
+        val out = ArrayList<ByteArray>(cuts.size + 1)
+        var prev = 0
+        for (c in cuts + payload.size) {
+            out.add(payload.copyOfRange(prev, c))
+            prev = c
+        }
+        return out
+    }
+
+    /**
+     * Full stream-level DPI evasion plan for the first client payload of a TCP flow:
+     * TCP chunk boundaries from the native engine (if any) plus a guaranteed cut in the middle
+     * of the SNI host (TLS) or `Host:` value (HTTP), followed by TLS record-layer
+     * fragmentation so even TCP-reassembling middleboxes never see the SNI in one record.
+     */
+    fun planFirstPayload(payload: ByteArray, nativeChunks: List<ByteArray>): List<ByteArray> {
+        val cuts = ArrayList<Int>()
+        var acc = 0
+        for (i in 0 until nativeChunks.size - 1) {
+            acc += nativeChunks[i].size
+            cuts.add(acc)
+        }
+        val sni = findClientHelloSni(payload)
+        if (sni != null) {
+            cuts.add(sni.first + maxOf(1, sni.second / 2))
+            cuts.add(sni.first - 2)
+        } else {
+            val text = String(payload, 0, minOf(payload.size, 2048), Charsets.ISO_8859_1)
+            val h = text.indexOf("\r\nHost:", ignoreCase = true)
+            if (h >= 0) {
+                cuts.add(h + 2)
+                val valStart = h + 7
+                val valEnd = text.indexOf("\r\n", valStart).let { if (it < 0) text.length else it }
+                cuts.add(valStart + maxOf(1, (valEnd - valStart) / 2))
+            } else if (payload.size > 2) {
+                cuts.add(2)
+            }
+        }
+        val chunks = splitAt(payload, cuts)
+        return if (sni != null) fragmentTlsClientHelloRecords(payload, chunks) else chunks
+    }
+
+    /** RFC 4443 / RFC 8200 IPv6 pseudo-header transport checksum. */
+    fun transportChecksumV6(
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        nextHeader: Int,
+        buf: ByteArray,
+        off: Int = 0,
+        len: Int = buf.size - off,
+    ): Int {
+        var sum = 0L
+        for (i in 0 until 16 step 2) {
+            sum += u16(srcIp, i).toLong()
+            sum += u16(dstIp, i).toLong()
+        }
+        sum += ((len ushr 16) and 0xFFFF).toLong()
+        sum += (len and 0xFFFF).toLong()
+        sum += (nextHeader and 0xFF).toLong()
+        var i = 0
+        while (i + 1 < len) {
+            sum += u16(buf, off + i).toLong()
+            i += 2
+        }
+        if (i < len) {
+            sum += ((buf[off + i].toInt() and 0xFF) shl 8).toLong()
+        }
+        while ((sum ushr 16) != 0L) {
+            sum = (sum and 0xFFFFL) + (sum ushr 16)
+        }
+        return (sum.inv() and 0xFFFFL).toInt()
+    }
+
+    /** Synthesizes an ICMPv6 Destination Unreachable (Type 1, Code 3, RFC 4443) for incoming IPv6 packets so dual-stack apps instantly select IPv4. */
+    fun buildIcmpv6Unreachable(origPacket: ByteArray): ByteArray? {
+        if (origPacket.size < 40 || ((origPacket[0].toInt() ushr 4) and 0x0F) != 6) return null
+        val origSrc = origPacket.copyOfRange(8, 24)
+        val origDst = origPacket.copyOfRange(24, 40)
+        val invokeLen = minOf(origPacket.size, 1200)
+        val icmpBodyLen = 8 + invokeLen
+        val totalLen = 40 + icmpBodyLen
+        val out = ByteArray(totalLen)
+        out[0] = 0x60
+        putU16(out, 4, icmpBodyLen)
+        out[6] = PROTO_ICMPV6.toByte()
+        out[7] = 64
+        System.arraycopy(origDst, 0, out, 8, 16)
+        System.arraycopy(origSrc, 0, out, 24, 16)
+        out[40] = 1 // Type 1: Destination Unreachable
+        out[41] = 3 // Code 3: Address Unreachable
+        System.arraycopy(origPacket, 0, out, 48, invokeLen)
+        val csum = transportChecksumV6(origDst, origSrc, PROTO_ICMPV6, out, 40, icmpBodyLen)
+        putU16(out, 42, if (csum == 0) 0xFFFF else csum)
+        return out
     }
 
     /** Synthesizes a valid IPv4 + UDP packet with computed IPv4 and UDP checksums. */
@@ -1690,6 +1964,178 @@ object IpPackets {
 }
 
 /**
+ * RFC 8484 DoH client that needs **no DNS of its own**: endpoints are IP literals
+ * (`https://1.1.1.1/dns-query`) or well-known resolver names mapped to their anycast IPs, so
+ * the ISP resolver (which answers `discord.com` with the `195.175.254.2` block page) is never
+ * consulted and a VPN TUN cannot recurse into itself. Every socket is passed to
+ * [protectSocket] (Android `VpnService.protect`). IP-literal hosts send no SNI; the server
+ * certificate is validated by the platform trust store and the host/IP SAN is verified
+ * through endpoint identification plus an optional platform [verifier]. HTTP/1.1
+ * keep-alive connections are pooled per endpoint.
+ */
+class DirectDohClient(
+    private val protectSocket: (Socket) -> Boolean = { true },
+    private val sslFactory: SSLSocketFactory = SSLSocketFactory.getDefault() as SSLSocketFactory,
+    private val verifier: ((String, SSLSession) -> Boolean)? = null,
+) : DohClient, AutoCloseable {
+    private class Conn(val key: String, val sock: SSLSocket, val input: java.io.BufferedInputStream, val out: OutputStream)
+
+    private val idle = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<Conn>>()
+
+    override fun post(url: String, body: ByteArray, timeoutMs: Int): DohResponse {
+        val start = System.nanoTime()
+        fun rtt() = (System.nanoTime() - start) / 1000
+        val uri = runCatching { java.net.URI(url) }.getOrNull() ?: return DohResponse(6, 0, EncProtocol.DOH, null)
+        val host = uri.host?.trim('[', ']') ?: return DohResponse(6, 0, EncProtocol.DOH, null)
+        val port = if (uri.port > 0) uri.port else 443
+        val path = (uri.rawPath ?: "/dns-query").ifEmpty { "/dns-query" }
+        val key = "$host:$port"
+        for (attempt in 0 until 2) {
+            val pooled = if (attempt == 0) idle[key]?.poll() else null
+            val conn = pooled ?: try {
+                open(host, port, timeoutMs)
+            } catch (_: SocketTimeoutException) {
+                return DohResponse(2, rtt(), EncProtocol.DOH, null)
+            } catch (_: ConnectException) {
+                return DohResponse(4, rtt(), EncProtocol.DOH, null)
+            } catch (_: SSLHandshakeException) {
+                return DohResponse(5, rtt(), EncProtocol.DOH, null)
+            } catch (_: IOException) {
+                return DohResponse(5, rtt(), EncProtocol.DOH, null)
+            }
+            try {
+                conn.sock.soTimeout = timeoutMs
+                val hostHeader = if (host.contains(':')) "[$host]" else host
+                val head = "POST $path HTTP/1.1\r\nHost: $hostHeader\r\nUser-Agent: TheDPI\r\n" +
+                    "Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n" +
+                    "Content-Length: ${body.size}\r\nConnection: keep-alive\r\n\r\n"
+                conn.out.write(head.toByteArray(Charsets.US_ASCII))
+                conn.out.write(body)
+                conn.out.flush()
+                val (status, headers, respBody) = readResponse(conn.input)
+                val keep = !headers["connection"].orEmpty().equals("close", ignoreCase = true)
+                if (keep) idle.getOrPut(key) { java.util.concurrent.ConcurrentLinkedQueue() }.offer(conn) else closeConn(conn)
+                val type = headers["content-type"].orEmpty()
+                return if (status == 200 && type.startsWith("application/dns-message") && respBody.size >= 12) {
+                    DohResponse(1, rtt(), EncProtocol.DOH, respBody)
+                } else {
+                    DohResponse(6, rtt(), EncProtocol.DOH, null)
+                }
+            } catch (e: IOException) {
+                closeConn(conn)
+                if (pooled == null) {
+                    return DohResponse(if (e is SocketTimeoutException) 2 else 5, rtt(), EncProtocol.DOH, null)
+                }
+                // stale keep-alive connection: retry once on a fresh one
+            }
+        }
+        return DohResponse(5, rtt(), EncProtocol.DOH, null)
+    }
+
+    private fun open(host: String, port: Int, timeoutMs: Int): Conn {
+        val ip = IpPackets.parseIpLiteral(host)?.let { InetAddress.getByAddress(IpPackets.ipToBytes(it)) }
+            ?: BOOTSTRAP[host.lowercase()]?.let { InetAddress.getByAddress(IpPackets.ipToBytes(IpPackets.parseIpLiteral(it)!!)) }
+            ?: InetAddress.getByName(host)
+        val raw = Socket()
+        try {
+            protectSocket(raw)
+            raw.tcpNoDelay = true
+            raw.connect(InetSocketAddress(ip, port), timeoutMs)
+            raw.soTimeout = timeoutMs
+            val ssl = sslFactory.createSocket(raw, host, port, true) as SSLSocket
+            val params = ssl.sslParameters
+            params.endpointIdentificationAlgorithm = "HTTPS"
+            ssl.sslParameters = params
+            ssl.startHandshake()
+            val v = verifier
+            if (v != null && !v(host, ssl.session)) {
+                runCatching { ssl.close() }
+                throw SSLPeerUnverifiedException("DoH host verification failed: $host")
+            }
+            return Conn("$host:$port", ssl, java.io.BufferedInputStream(ssl.inputStream), java.io.BufferedOutputStream(ssl.outputStream))
+        } catch (e: IOException) {
+            runCatching { raw.close() }
+            throw e
+        }
+    }
+
+    private fun readLine(input: java.io.InputStream): String {
+        val sb = StringBuilder()
+        while (sb.length < 8192) {
+            val c = input.read()
+            if (c < 0) throw IOException("EOF")
+            if (c == '\n'.code) break
+            if (c != '\r'.code) sb.append(c.toChar())
+        }
+        return sb.toString()
+    }
+
+    private fun readExact(input: java.io.InputStream, n: Int): ByteArray {
+        val out = ByteArray(n)
+        var r = 0
+        while (r < n) {
+            val k = input.read(out, r, n - r)
+            if (k < 0) throw IOException("EOF")
+            r += k
+        }
+        return out
+    }
+
+    private fun readResponse(input: java.io.InputStream): Triple<Int, Map<String, String>, ByteArray> {
+        val statusLine = readLine(input)
+        val status = statusLine.split(' ').getOrNull(1)?.toIntOrNull() ?: throw IOException("bad status")
+        val headers = HashMap<String, String>()
+        while (true) {
+            val line = readLine(input)
+            if (line.isEmpty()) break
+            val i = line.indexOf(':')
+            if (i > 0) headers[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim()
+        }
+        val body = if (headers["transfer-encoding"].orEmpty().contains("chunked", ignoreCase = true)) {
+            val acc = ByteArrayOutputStream()
+            while (true) {
+                val size = readLine(input).substringBefore(';').trim().toIntOrNull(16) ?: throw IOException("bad chunk")
+                if (size == 0) {
+                    while (readLine(input).isNotEmpty()) { /* trailers */ }
+                    break
+                }
+                if (acc.size() + size > Wire.MAX_BYTES) throw IOException("too large")
+                acc.write(readExact(input, size))
+                readLine(input)
+            }
+            acc.toByteArray()
+        } else {
+            val len = headers["content-length"]?.toIntOrNull() ?: throw IOException("no length")
+            if (len < 0 || len > Wire.MAX_BYTES) throw IOException("bad length")
+            readExact(input, len)
+        }
+        return Triple(status, headers, body)
+    }
+
+    private fun closeConn(c: Conn) {
+        runCatching { c.sock.close() }
+    }
+
+    override fun close() {
+        for (q in idle.values) while (true) closeConn(q.poll() ?: break)
+        idle.clear()
+    }
+
+    companion object {
+        /** Anycast addresses of public resolvers, used instead of a DNS lookup for their names. */
+        val BOOTSTRAP = mapOf(
+            "cloudflare-dns.com" to "1.1.1.1",
+            "one.one.one.one" to "1.1.1.1",
+            "security.cloudflare-dns.com" to "1.1.1.2",
+            "dns.google" to "8.8.8.8",
+            "dns.google.com" to "8.8.8.8",
+            "dns.quad9.net" to "9.9.9.9",
+            "dns.adguard-dns.com" to "94.140.14.14",
+        )
+    }
+}
+
+/**
  * User-mode TUN -> Protected Socket Bridge (`tun2socks` + DoH DNS + UDP NAT + Active DPI Desync).
  *
  * Bridges raw IPv4 packets from the Android `VpnService` TUN descriptor (`0.0.0.0/0`) to real
@@ -1721,6 +2167,7 @@ class TunBridge(
         splitPos = 2,
         dropRst = true,
     ),
+    private val blockQuic: Boolean = true,
 ) : AutoCloseable {
     private data class FlowKey(val srcIp: Int, val srcPort: Int, val dstIp: Int, val dstPort: Int)
 
@@ -1733,6 +2180,8 @@ class TunBridge(
     private val tcpTable = ConcurrentHashMap<FlowKey, TcpFlow>()
     private val udpTable = ConcurrentHashMap<FlowKey, UdpFlow>()
     private val virtualDnsIp: Int = IpPackets.parseIpLiteral(VPN_DNS_IP) ?: 0x0AD7AD02
+    private val dnsCache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
+    @Volatile private var preferredDoh = 0
 
     val tcpFlows = AtomicInteger(0)
     val udpFlows = AtomicInteger(0)
@@ -1741,6 +2190,13 @@ class TunBridge(
     val desyncedFlows = AtomicInteger(0)
     val visionSplicedFlows = AtomicInteger(0)
     val roamingRebinds = AtomicInteger(0)
+    val poisonedDnsBlocked = AtomicInteger(0)
+    val quicFallbacks = AtomicInteger(0)
+    val tlsRecordFragmented = AtomicInteger(0)
+    val dnsCacheHits = AtomicInteger(0)
+    val ipv6Rejected = AtomicInteger(0)
+    val bytesUp = java.util.concurrent.atomic.AtomicLong(0)
+    val bytesDown = java.util.concurrent.atomic.AtomicLong(0)
 
     /**
      * Handles seamless Wi-Fi <-> Mobile Data (LTE/5G) roaming by refreshing ephemeral UDP NAT
@@ -1785,6 +2241,8 @@ class TunBridge(
             }
             if (n <= 0) {
                 if (n < 0) break
+                // Non-blocking TUN descriptor returned EAGAIN: yield instead of spinning.
+                try { Thread.sleep(2) } catch (_: InterruptedException) { break }
                 continue
             }
             var off = 0
@@ -1802,12 +2260,23 @@ class TunBridge(
     }
 
     private fun dispatchPacket(raw: ByteArray) {
+        if (raw.isNotEmpty() && ((raw[0].toInt() ushr 4) and 0x0F) == 6) {
+            // IPv6 is not bridged: answer immediately so dual-stack apps switch to IPv4 at once.
+            ipv6Rejected.incrementAndGet()
+            IpPackets.buildIcmpv6Unreachable(raw)?.let { writeTun(it) }
+            return
+        }
         val ip = IpPackets.parseIpv4(raw) ?: return
         when (ip.proto) {
             IpPackets.PROTO_UDP -> {
                 val udp = IpPackets.parseUdp(raw, ip) ?: return
                 if (udp.dstPort == 53) {
                     handleDnsUdp(udp)
+                } else if (blockQuic && udp.dstPort == 443) {
+                    // QUIC Initial carries the SNI in a form the stream splitter cannot protect;
+                    // refuse it so Chrome/Discord/Roblox fall back to fragmented TLS over TCP.
+                    quicFallbacks.incrementAndGet()
+                    IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
                 } else {
                     handleUdp(raw, udp)
                 }
@@ -1836,35 +2305,57 @@ class TunBridge(
         }
     }
 
-    private fun resolveDnsQuery(query: ByteArray, requestedServerIp: Int): ByteArray? {
-        // 1) Try Encrypted DNS (DoH3 / DoH) first (RFC 8484 wire format with 2-byte ID set to 0)
+    private fun withId(msg: ByteArray, query: ByteArray): ByteArray {
+        val fixed = msg.copyOf()
+        fixed[0] = query[0]
+        fixed[1] = query[1]
+        return fixed
+    }
+
+    private fun resolveDnsQuery(query: ByteArray, @Suppress("UNUSED_PARAMETER") requestedServerIp: Int): ByteArray? {
+        if (query.size < 12) return null
+        // 0) TTL-bounded cache keyed by the query without its ID
+        val cacheKey = query.copyOfRange(2, query.size).joinToString("") { "%02x".format(it) }
+        val now = System.currentTimeMillis()
+        dnsCache[cacheKey]?.let { (expiry, msg) ->
+            if (expiry > now) {
+                dnsCacheHits.incrementAndGet()
+                return withId(msg, query)
+            }
+            dnsCache.remove(cacheKey)
+        }
+        fun remember(msg: ByteArray): ByteArray {
+            val ttl = (IpPackets.dnsMinTtl(msg) ?: 30L).coerceIn(10L, 600L)
+            if (dnsCache.size > 2048) dnsCache.clear()
+            dnsCache[cacheKey] = (now + ttl * 1000L) to msg
+            return withId(msg, query)
+        }
+        // 1) Encrypted DNS (RFC 8484, ID 0) — the ISP resolver is never consulted.
         val client = dohClient
-        if (client != null && dohEndpoints.isNotEmpty() && query.size >= 12) {
+        val endpoints = dohEndpoints.filter(Doh::validEndpoint)
+        if (client != null && endpoints.isNotEmpty()) {
             val dohWire = query.copyOf()
             dohWire[0] = 0
             dohWire[1] = 0
-            for (ep in dohEndpoints) {
-                if (!Doh.validEndpoint(ep)) continue
-                val resp = runCatching { client.post(ep, dohWire, 2500) }.getOrNull() ?: continue
+            val first = preferredDoh.coerceIn(0, endpoints.size - 1)
+            for (k in endpoints.indices) {
+                val idx = (first + k) % endpoints.size
+                val resp = runCatching { client.post(endpoints[idx], dohWire, 2500) }.getOrNull() ?: continue
                 val body = resp.body
                 if (resp.transport == 1 && body != null && body.size >= 12) {
-                    val fixed = body.copyOf()
-                    fixed[0] = query[0]
-                    fixed[1] = query[1]
+                    if (IpPackets.containsPoisonedDns(body)) {
+                        poisonedDnsBlocked.incrementAndGet()
+                        continue
+                    }
+                    preferredDoh = idx
                     dohResolved.incrementAndGet()
-                    return fixed
+                    return remember(body)
                 }
             }
         }
-        // 2) Fallback: protected UDP DNS socket bypassing VPN TUN
-        val candidates = ArrayList<String>()
-        if (requestedServerIp != virtualDnsIp) {
-            candidates.add(IpPackets.ipToString(requestedServerIp))
-        }
-        for (s in upstreamDnsServers) {
-            if (s.isNotBlank() && s !in candidates) candidates.add(s)
-        }
-        for (srv in candidates) {
+        // 2) Fallback: protected UDP to public resolvers only; injected/poisoned replies are skipped.
+        for (srv in upstreamDnsServers) {
+            if (srv.isBlank()) continue
             val host = srv.substringBefore(':')
             val port = srv.substringAfter(':', "53").toIntOrNull() ?: 53
             val sock = try {
@@ -1874,14 +2365,23 @@ class TunBridge(
             }
             try {
                 protectDatagram(sock)
-                sock.soTimeout = 2000
                 val target = InetSocketAddress(InetAddress.getByName(host), port)
                 sock.send(DatagramPacket(query, query.size, target))
+                val deadline = System.currentTimeMillis() + 2000
                 val buf = ByteArray(4096)
-                val p = DatagramPacket(buf, buf.size)
-                sock.receive(p)
-                if (p.length >= 12) {
-                    return buf.copyOf(p.length)
+                while (true) {
+                    val left = deadline - System.currentTimeMillis()
+                    if (left <= 0) break
+                    sock.soTimeout = left.toInt()
+                    val p = DatagramPacket(buf, buf.size)
+                    sock.receive(p)
+                    if (p.length < 12 || buf[0] != query[0] || buf[1] != query[1]) continue
+                    val msg = buf.copyOf(p.length)
+                    if (IpPackets.containsPoisonedDns(msg)) {
+                        poisonedDnsBlocked.incrementAndGet()
+                        continue
+                    }
+                    return remember(msg)
                 }
             } catch (_: Exception) {
             } finally {
@@ -1927,6 +2427,7 @@ class TunBridge(
                     try {
                         s.receive(dp)
                         if (dp.length > 0) {
+                            bytesDown.addAndGet(dp.length.toLong())
                             val pkt = IpPackets.buildIpv4Udp(
                                 srcIp = key.dstIp,
                                 dstIp = key.srcIp,
@@ -1951,6 +2452,7 @@ class TunBridge(
             val dst = targetAddress ?: return
             ioPool.execute {
                 try {
+                    bytesUp.addAndGet(payload.size.toLong())
                     // Apply QUIC Initial scramble via Native.desyncPacket when applicable
                     val res = if (key.dstPort == 443) {
                         runCatching { session.desyncPacket(rawIpPacket, desyncConfig) }.getOrNull()
@@ -2012,6 +2514,7 @@ class TunBridge(
     private inner class TcpFlow(val key: FlowKey, var clientNextSeq: Long) {
         val lock = Any()
         var serverSeq: Long = 0x5000_0000L
+        var helloBuf: ByteArrayOutputStream? = null
         var connected = false
         var finFromClient = false
         var firstPayloadDone = false
@@ -2111,14 +2614,42 @@ class TunBridge(
             val sock = upstreamSocket ?: return
             try {
                 val out = sock.getOutputStream()
+                bytesUp.addAndGet(payload.size.toLong())
                 if (!firstPayloadDone) {
+                    // Reassemble a TLS ClientHello that spans several TCP segments (post-quantum
+                    // key shares push it past one MSS) so the SNI can be protected as a whole.
+                    val acc = helloBuf
+                    val data: ByteArray
+                    if (acc != null) {
+                        acc.write(payload)
+                        data = acc.toByteArray()
+                    } else {
+                        data = payload
+                    }
+                    val isTls = data.size >= 5 && (data[0].toInt() and 0xFF) == 0x16 && (data[1].toInt() and 0xFF) == 0x03
+                    if (isTls) {
+                        val need = 5 + IpPackets.u16(data, 3)
+                        if (data.size < need && need <= 16384 + 5) {
+                            if (acc == null) helloBuf = ByteArrayOutputStream().apply { write(data) }
+                            return
+                        }
+                    }
+                    helloBuf = null
                     firstPayloadDone = true
-                    val res = runCatching { session.desyncPacket(rawIpPacket, desyncConfig) }.getOrNull()
-                    val chunks = IpPackets.extractOrderedStreamChunks(rawIpPacket, payload, res)
+                    val packet = if (data === payload) rawIpPacket else IpPackets.buildIpv4Tcp(
+                        srcIp = key.srcIp, dstIp = key.dstIp, srcPort = key.srcPort, dstPort = key.dstPort,
+                        seq = 1L, ack = 1L, flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = data,
+                    )
+                    val res = runCatching { session.desyncPacket(packet, desyncConfig) }.getOrNull()
+                    val nativeChunks = IpPackets.extractOrderedStreamChunks(packet, data, res)
+                    val chunks = IpPackets.planFirstPayload(data, nativeChunks)
                     if (chunks.size > 1) {
                         desyncedFlows.incrementAndGet()
                     }
-                    if (desyncConfig.mode == DesyncMode.REALITY_VISION && payload.size >= 5 && (payload[0].toInt() and 0xFF) == 0x16) {
+                    if (isTls && chunks.size > 1 && chunks.all { it.size >= 5 && (it[0].toInt() and 0xFF) == 0x16 }) {
+                        tlsRecordFragmented.incrementAndGet()
+                    }
+                    if (desyncConfig.mode == DesyncMode.REALITY_VISION && isTls) {
                         visionSpliced = true
                         visionSplicedFlows.incrementAndGet()
                     }
@@ -2144,13 +2675,15 @@ class TunBridge(
             try {
                 protectSocket(sock)
                 sock.tcpNoDelay = true
-                sock.soTimeout = 30_000
+                runCatching { sock.keepAlive = true }
                 val dstInet = if (key.dstIp == virtualDnsIp) {
                     InetAddress.getByName(upstreamDnsServers.firstOrNull()?.substringBefore(':') ?: "1.1.1.1")
                 } else {
                     InetAddress.getByAddress(IpPackets.ipToBytes(key.dstIp))
                 }
                 sock.connect(InetSocketAddress(dstInet, key.dstPort), 5000)
+                // Long-lived idle streams (Discord gateway heartbeat ≈ 41 s) must not time out.
+                sock.soTimeout = 0
                 synchronized(lock) {
                     if (closed.get()) {
                         runCatching { sock.close() }
@@ -2172,6 +2705,7 @@ class TunBridge(
                 val buf = ByteArray(1360)
                 while (running.get() && !closed.get()) {
                     val n = input.read(buf)
+                    if (n > 0) bytesDown.addAndGet(n.toLong())
                     if (n < 0) {
                         val finSeq: Long
                         val ackNum: Long
@@ -2253,6 +2787,7 @@ class TunBridge(
             for (u in udpTable.values) u.close()
             tcpTable.clear()
             udpTable.clear()
+            dnsCache.clear()
             ioPool.shutdownNow()
         }
     }
@@ -2261,6 +2796,9 @@ class TunBridge(
         const val VPN_CLIENT_IP = "10.215.173.1"
         const val VPN_DNS_IP = "10.215.173.2"
         val DEFAULT_DOH_ENDPOINTS = listOf(
+            "https://1.1.1.1/dns-query",
+            "https://8.8.8.8/dns-query",
+            "https://9.9.9.9/dns-query",
             "https://cloudflare-dns.com/dns-query",
             "https://dns.google/dns-query",
             "https://dns.quad9.net/dns-query",
@@ -2454,63 +2992,280 @@ fun runCli(args: List<String>): Int {
     }
 }
 
-class MainWindow {
-    private val frame = JFrame("THE DPI")
-    private val targets = JTextArea("example.com", 3, 40)
-    private val altDns = JTextField(30)
-    private val dohEndpoints = JTextField(30).apply {
-        toolTipText = "Örnek: https://dns.example/dns-query — yalnızca https:// adresleri; DoH3 (HTTP/3) desteklenirse kullanılır"
+class AnimatedPulsePanel : JPanel() {
+    var isActive = false
+        set(value) {
+            if (field != value) {
+                field = value
+                repaint()
+            }
+        }
+    var portInfo: String = ""
+        set(value) {
+            field = value
+            repaint()
+        }
+    private var animPhase = 0f
+    private val animTimer = Timer(33) {
+        animPhase = (animPhase + 0.02f) % 1.0f
+        repaint()
+        Toolkit.getDefaultToolkit().sync()
     }
-    private val runButton = JButton("Tanıla")
-    private val desyncButton = JButton("Engelsiz Modu Başlat (DPI Aşma)")
-    private val systemButton = JButton("Sistem geneli bağlantılar")
-    private val appliedButton = JButton("Öneriyi uyguladım — doğrula").apply { isEnabled = false }
-    private val auto = JCheckBox("Ağ değişince yeniden tanıla", false)
+
+    init {
+        preferredSize = Dimension(600, 130)
+        background = Color(11, 15, 25)
+        animTimer.start()
+    }
+
+    fun stop() {
+        animTimer.stop()
+    }
+
+    override fun paintComponent(g: Graphics) {
+        super.paintComponent(g)
+        val g2 = g.create() as Graphics2D
+        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+
+        val w = width
+        val h = height
+        val cx = w / 2
+        val cy = h / 2
+        val maxR = minOf(cx, cy) - 10
+
+        val baseColor = if (isActive) Color(0, 230, 118) else Color(0, 176, 255)
+
+        // Draw 3 animated expanding wave rings
+        for (i in 0 until 3) {
+            val phase = (animPhase + i * 0.333f) % 1.0f
+            val ringR = (maxR * phase).toInt()
+            val alpha = ((1.0f - phase) * 160).toInt().coerceIn(0, 255)
+            g2.color = Color(baseColor.red, baseColor.green, baseColor.blue, alpha)
+            g2.drawOval(cx - ringR, cy - ringR, ringR * 2, ringR * 2)
+        }
+
+        // Central shield orb
+        val centerR = (maxR * 0.45).toInt()
+        g2.color = if (isActive) Color(6, 78, 59, 230) else Color(12, 35, 64, 230)
+        g2.fillOval(cx - centerR, cy - centerR, centerR * 2, centerR * 2)
+
+        g2.color = baseColor
+        g2.drawOval(cx - centerR, cy - centerR, centerR * 2, centerR * 2)
+
+        // Status text
+        g2.font = Font("Segoe UI", Font.BOLD, 13)
+        val titleStr = if (isActive) "ENGELSİZ MOD ETKİN" else "ENGELSİZ MOD HAZIR"
+        val fmTitle = g2.fontMetrics
+        g2.color = if (isActive) Color(0, 230, 118) else Color(56, 189, 248)
+        g2.drawString(titleStr, cx - fmTitle.stringWidth(titleStr) / 2, cy - 2)
+
+        g2.font = Font("Segoe UI", Font.PLAIN, 10)
+        val subStr = if (isActive) {
+            if (portInfo.isNotEmpty()) "Yerel Proxy: $portInfo · Vision Aktif" else "REALITY + xtls-rprx-vision"
+        } else {
+            "Sistem Geneli Ağ Teşhis & DPI Kalkanı"
+        }
+        val fmSub = g2.fontMetrics
+        g2.color = Color(148, 163, 184)
+        g2.drawString(subStr, cx - fmSub.stringWidth(subStr) / 2, cy + 14)
+
+        g2.dispose()
+    }
+}
+
+class StatCard(title: String, valColor: Color) : JPanel(BorderLayout()) {
+    val valLabel = JLabel("0").apply {
+        font = Font("Segoe UI", Font.BOLD, 15)
+        foreground = valColor
+    }
+    val subLabel = JLabel("Hazır").apply {
+        font = Font("Segoe UI", Font.PLAIN, 10)
+        foreground = Color(100, 116, 139)
+    }
+    init {
+        background = Color(19, 29, 49)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
+            BorderFactory.createEmptyBorder(6, 8, 6, 8),
+        )
+        val titleLabel = JLabel(title).apply {
+            font = Font("Segoe UI", Font.BOLD, 10)
+            foreground = Color(148, 163, 184)
+        }
+        add(titleLabel, BorderLayout.NORTH)
+        add(valLabel, BorderLayout.CENTER)
+        add(subLabel, BorderLayout.SOUTH)
+    }
+}
+
+class MainWindow {
+    private val frame = JFrame("THE DPI — 2026–2027 Hibrit Ağ Motoru")
+    private val pulsePanel = AnimatedPulsePanel()
+    private val cardTcp = StatCard("⚡ TCP DESYNC", Color(0, 230, 118))
+    private val cardVision = StatCard("🛡️ VISION SPLICE", Color(56, 189, 248))
+    private val cardFake = StatCard("🎮 SAHTE & KALKAN", Color(167, 139, 250))
+    private val cardDns = StatCard("🔒 ŞİFRELİ DoH DNS", Color(251, 191, 36))
+
+    private val targets = JTextArea("discord.com\nroblox.com", 2, 35).apply {
+        background = Color(22, 32, 50)
+        foreground = Color.WHITE
+        caretColor = Color.WHITE
+        font = Font("Segoe UI", Font.PLAIN, 12)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
+            BorderFactory.createEmptyBorder(4, 6, 4, 6),
+        )
+    }
+    private val altDns = JTextField(25).apply {
+        background = Color(22, 32, 50)
+        foreground = Color.WHITE
+        caretColor = Color.WHITE
+        font = Font("Segoe UI", Font.PLAIN, 12)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
+            BorderFactory.createEmptyBorder(4, 6, 4, 6),
+        )
+    }
+    private val dohEndpoints = JTextField(25).apply {
+        toolTipText = "Örnek: https://1.1.1.1/dns-query"
+        background = Color(22, 32, 50)
+        foreground = Color.WHITE
+        caretColor = Color.WHITE
+        font = Font("Segoe UI", Font.PLAIN, 12)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
+            BorderFactory.createEmptyBorder(4, 6, 4, 6),
+        )
+    }
+    private val runButton = JButton("Ağ Tanıla").apply {
+        background = Color(37, 99, 235)
+        foreground = Color.WHITE
+        font = Font("Segoe UI", Font.BOLD, 12)
+        isFocusPainted = false
+    }
+    private val desyncButton = JButton("⚡ ENGELSİZ MODU BAŞLAT (DPI Aşma)").apply {
+        background = Color(0, 200, 83)
+        foreground = Color(10, 14, 23)
+        font = Font("Segoe UI", Font.BOLD, 12)
+        isFocusPainted = false
+    }
+    private val systemButton = JButton("Sistem Bağlantıları").apply {
+        background = Color(30, 41, 59)
+        foreground = Color(148, 163, 184)
+        font = Font("Segoe UI", Font.PLAIN, 11)
+        isFocusPainted = false
+    }
+    private val appliedButton = JButton("Öneriyi Doğrula").apply {
+        isEnabled = false
+        background = Color(30, 41, 59)
+        foreground = Color(148, 163, 184)
+        font = Font("Segoe UI", Font.PLAIN, 11)
+        isFocusPainted = false
+    }
+    private val auto = JCheckBox("Ağ değişince yeniden tanıla", false).apply {
+        foreground = Color(148, 163, 184)
+        background = Color(11, 15, 25)
+        isFocusPainted = false
+    }
     private val output = JTextArea().apply {
         isEditable = false
         font = Font(Font.MONOSPACED, Font.PLAIN, 12)
         lineWrap = true
         wrapStyleWord = true
+        background = Color(13, 19, 31)
+        foreground = Color(226, 232, 240)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
+            BorderFactory.createEmptyBorder(8, 8, 8, 8),
+        )
     }
-    private val status = JLabel(" ")
+    private val status = JLabel(" ").apply {
+        foreground = Color(56, 189, 248)
+        font = Font("Segoe UI", Font.PLAIN, 11)
+    }
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "thedpi-worker").apply { isDaemon = true } }
     private val busy = AtomicBoolean(false)
     private var session: DiagnosticSession? = null
     @Volatile private var lastEnv: EnvironmentInfo? = null
     @Volatile private var lastDecision: Decision? = null
     private val watcher = Timer(15_000) { worker.execute { checkNetwork() } }
+    private val ticker = Timer(1000) {
+        val s = session ?: return@Timer
+        val p = s.proxyStats()
+        pulsePanel.isActive = p.active
+        pulsePanel.portInfo = if (p.active) "127.0.0.1:${p.port}" else ""
+        cardTcp.valLabel.text = "${p.connections} Akış"
+        cardTcp.subLabel.text = "TLS Bölme: ${p.tlsSplit} · HTTP: ${p.httpSplit}"
+        cardVision.valLabel.text = "${p.visionSplice} Splice"
+        cardVision.subLabel.text = "xtls-rprx-vision Doğrudan Aktarım"
+        cardFake.valLabel.text = "${p.fakeSent} Sahte"
+        cardFake.subLabel.text = "RST Kalkanı: ${p.rstDropped} Engellendi"
+        cardDns.valLabel.text = if (p.active) "Etkin" else "Beklemede"
+        cardDns.subLabel.text = "PQ-TLS 1.3 / ECH Korumalı"
+    }
 
     fun show() {
-        val form = JPanel(GridBagLayout())
-        form.border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
-        val c = GridBagConstraints().apply { insets = Insets(3, 3, 3, 3); anchor = GridBagConstraints.WEST; fill = GridBagConstraints.HORIZONTAL }
+        val topContainer = JPanel(BorderLayout()).apply {
+            background = Color(11, 15, 25)
+        }
+
+        // Add animated pulse panel at top
+        topContainer.add(pulsePanel, BorderLayout.NORTH)
+
+        // 4 live cards panel
+        val cardsPanel = JPanel(GridLayout(1, 4, 6, 6)).apply {
+            background = Color(11, 15, 25)
+            border = BorderFactory.createEmptyBorder(0, 10, 8, 10)
+            add(cardTcp)
+            add(cardVision)
+            add(cardFake)
+            add(cardDns)
+        }
+        topContainer.add(cardsPanel, BorderLayout.CENTER)
+
+        // Form controls
+        val form = JPanel(GridBagLayout()).apply {
+            background = Color(11, 15, 25)
+            border = BorderFactory.createEmptyBorder(4, 10, 8, 10)
+        }
+        val c = GridBagConstraints().apply { insets = Insets(2, 4, 2, 4); anchor = GridBagConstraints.WEST; fill = GridBagConstraints.HORIZONTAL }
         fun row(y: Int, label: String, comp: java.awt.Component) {
-            c.gridx = 0; c.gridy = y; c.weightx = 0.0; form.add(JLabel(label), c)
+            val lbl = JLabel(label).apply {
+                foreground = Color(148, 163, 184)
+                font = Font("Segoe UI", Font.PLAIN, 11)
+            }
+            c.gridx = 0; c.gridy = y; c.weightx = 0.0; form.add(lbl, c)
             c.gridx = 1; c.weightx = 1.0; form.add(comp, c)
         }
-        val disclosure = JLabel(
-            "<html>Tanılama yalnızca yazdığınız test hedeflerine ve sistem DNS sunucularınıza düşük hacimli " +
-                "bağlantılar kurar. Veriler cihazda kalır, kaydedilmez; sistem ayarları değiştirilmez.</html>",
-        )
-        c.gridx = 0; c.gridy = 0; c.gridwidth = 2; form.add(disclosure, c); c.gridwidth = 1
-        row(1, "Test hedefleri:", JScrollPane(targets))
-        row(2, "Karşılaştırılacak DNS (isteğe bağlı):", altDns)
-        row(3, "Şifreli DNS — DoH3/DoH adresleri (isteğe bağlı):", dohEndpoints)
-        val buttons = JPanel().apply { add(runButton); add(desyncButton); add(systemButton); add(appliedButton); add(auto) }
-        c.gridx = 0; c.gridy = 4; c.gridwidth = 2; form.add(buttons, c)
+        row(0, "Test hedefleri:", JScrollPane(targets))
+        row(1, "Karşılaştırılacak DNS (isteğe bağlı):", altDns)
+        row(2, "Şifreli DoH adresleri (isteğe bağlı):", dohEndpoints)
+
+        val btnRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
+            background = Color(11, 15, 25)
+            add(desyncButton)
+            add(runButton)
+            add(appliedButton)
+            add(systemButton)
+            add(auto)
+        }
+        c.gridx = 0; c.gridy = 3; c.gridwidth = 2; form.add(btnRow, c)
+        topContainer.add(form, BorderLayout.SOUTH)
 
         frame.layout = BorderLayout()
-        frame.add(form, BorderLayout.NORTH)
-        frame.add(JScrollPane(output), BorderLayout.CENTER)
-        frame.add(status.apply { border = BorderFactory.createEmptyBorder(4, 8, 4, 8) }, BorderLayout.SOUTH)
+        frame.contentPane.background = Color(11, 15, 25)
+        frame.add(topContainer, BorderLayout.NORTH)
+        frame.add(JScrollPane(output).apply {
+            border = BorderFactory.createEmptyBorder(0, 10, 6, 10)
+            viewport.background = Color(13, 19, 31)
+        }, BorderLayout.CENTER)
+        frame.add(status.apply { border = BorderFactory.createEmptyBorder(4, 12, 6, 12) }, BorderLayout.SOUTH)
         frame.defaultCloseOperation = WindowConstants.DISPOSE_ON_CLOSE
         frame.addWindowListener(object : WindowAdapter() {
             override fun windowClosed(e: WindowEvent) = shutdown()
         })
-        frame.iconImages = listOf(16, 32, 48, 256).mapNotNull { n ->
-            MainWindow::class.java.getResourceAsStream("/icon-$n.png")?.use { javax.imageio.ImageIO.read(it) }
-        }
-        frame.minimumSize = Dimension(640, 520)
+        frame.minimumSize = Dimension(740, 620)
         frame.setLocationRelativeTo(null)
 
         runButton.addActionListener { startRun(verifyRuns = 0) }
@@ -2522,6 +3277,7 @@ class MainWindow {
             session = DiagnosticSession()
             status.text = "Motor ${Native.engineVersion()} hazır · TLS güveni: ${WindowsPlatform.trust.second}"
             watcher.start()
+            ticker.start()
         } catch (e: NativeException) {
             runButton.isEnabled = false
             output.text = "Yerel motor başlatılamadı: ${e.message}"
@@ -2581,14 +3337,24 @@ class MainWindow {
             ui {
                 output.text = text + "\n" + output.text
                 output.caretPosition = 0
-                desyncButton.text = if (next.active) "Engelsiz Modu Durdur (127.0.0.1:${next.port})" else "Engelsiz Modu Başlat (DPI Aşma)"
-                status.text = if (next.active) "Engelsiz Mod etkin (127.0.0.1:${next.port})" else "Engelsiz Mod durduruldu"
+                pulsePanel.isActive = next.active
+                pulsePanel.portInfo = if (next.active) "127.0.0.1:${next.port}" else ""
+                if (next.active) {
+                    desyncButton.text = "🛡️ ENGELSİZ MODU DURDUR (127.0.0.1:${next.port})"
+                    desyncButton.background = Color(220, 38, 38)
+                    desyncButton.foreground = Color.WHITE
+                    status.text = "Engelsiz Mod etkin (127.0.0.1:${next.port})"
+                } else {
+                    desyncButton.text = "⚡ ENGELSİZ MODU BAŞLAT (DPI Aşma)"
+                    desyncButton.background = Color(0, 200, 83)
+                    desyncButton.foreground = Color(10, 14, 23)
+                    status.text = "Engelsiz Mod durduruldu"
+                }
                 desyncButton.isEnabled = true
             }
         }
     }
 
-    /** Machine-wide connections per process (user mode, IP Helper; nothing is stored). */
     private fun showSystem() {
         systemButton.isEnabled = false
         status.text = "Sistem bağlantıları okunuyor…"
@@ -2607,7 +3373,6 @@ class MainWindow {
         }
     }
 
-    /** User reports applying the recommendation; the engine verifies it over two evaluations. */
     private fun applied() {
         val s = session ?: return
         val d = lastDecision ?: return
@@ -2650,6 +3415,8 @@ class MainWindow {
     }
 
     private fun shutdown() {
+        pulsePanel.stop()
+        ticker.stop()
         watcher.stop()
         worker.shutdownNow()
         runCatching { worker.awaitTermination(2, TimeUnit.SECONDS) }

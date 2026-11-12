@@ -3507,15 +3507,18 @@ pub mod desync {
         cfg: &DesyncConfig,
         counters: &ProxyCounters,
     ) -> io::Result<()> {
+        let _ = client.set_nodelay(true);
         if greeting.len() < 2 {
             return Ok(());
         }
         // No-auth reply (0x05, 0x00)
         client.write_all(&[0x05, 0x00])?;
+        client.flush()?;
         let mut req = [0u8; 512];
         let n = client.read(&mut req)?;
         if n < 7 || req[0] != 0x05 || req[1] != 0x01 {
             let _ = client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            let _ = client.flush();
             return Ok(());
         }
         let target_addr: String = match req[3] {
@@ -3546,10 +3549,12 @@ pub mod desync {
             Ok(s) => s,
             Err(_) => {
                 let _ = client.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                let _ = client.flush();
                 return Ok(());
             }
         };
         client.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])?;
+        client.flush()?;
         let mut payload = [0u8; 8192];
         let pn = client.read(&mut payload)?;
         if pn > 0 {
@@ -3564,12 +3569,14 @@ pub mod desync {
         cfg: &DesyncConfig,
         counters: &ProxyCounters,
     ) -> io::Result<()> {
+        let _ = client.set_nodelay(true);
         if initial.starts_with(b"CONNECT ") {
             let line_end = ascii::scan_pattern(initial, b"\r\n").unwrap_or(initial.len());
             let line = std::str::from_utf8(&initial[8..line_end]).unwrap_or("");
             let host_port = line.split_whitespace().next().unwrap_or("");
             let mut upstream = connect_target(host_port)?;
             client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+            client.flush()?;
             let mut payload = [0u8; 8192];
             let pn = client.read(&mut payload)?;
             if pn > 0 {
@@ -3606,6 +3613,12 @@ pub mod desync {
     }
 
     fn relay_bidirectional(mut client: TcpStream, mut upstream: TcpStream) -> io::Result<()> {
+        // Handshake-phase timeouts must not leak into the long-lived relay (WebSocket
+        // gateways and long polling stay idle for minutes).
+        let _ = client.set_read_timeout(None);
+        let _ = client.set_write_timeout(None);
+        let _ = upstream.set_read_timeout(None);
+        let _ = upstream.set_write_timeout(None);
         let mut c_read = client.try_clone()?;
         let mut u_write = upstream.try_clone()?;
         let t = thread::Builder::new()

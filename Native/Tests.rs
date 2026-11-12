@@ -3048,7 +3048,8 @@ fn local_proxy_socks5_and_http_connect_desync_roundtrip() {
     let up_port = upstream.local_addr().unwrap().port();
     let srv_thread = thread::spawn(move || {
         let (mut conn, _) = upstream.accept().unwrap();
-        conn.set_read_timeout(Some(Duration::from_millis(2000)))
+        let _ = conn.set_nodelay(true);
+        conn.set_read_timeout(Some(Duration::from_millis(3000)))
             .unwrap();
         let mut received = Vec::new();
         let mut buf = [0u8; 512];
@@ -3062,6 +3063,7 @@ fn local_proxy_socks5_and_http_connect_desync_roundtrip() {
             }
         }
         conn.write_all(b"SERVER_OK").unwrap();
+        let _ = conn.flush();
         received
     });
 
@@ -3078,10 +3080,12 @@ fn local_proxy_socks5_and_http_connect_desync_roundtrip() {
 
     // Connect via SOCKS5 to the local proxy
     let mut client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, pport)).unwrap();
+    let _ = client.set_nodelay(true);
     client
-        .set_read_timeout(Some(Duration::from_millis(2000)))
+        .set_read_timeout(Some(Duration::from_millis(3000)))
         .unwrap();
     client.write_all(&[0x05, 0x01, 0x00]).unwrap();
+    client.flush().unwrap();
     let mut auth_resp = [0u8; 2];
     client.read_exact(&mut auth_resp).unwrap();
     assert_eq!(auth_resp, [0x05, 0x00]);
@@ -3089,11 +3093,13 @@ fn local_proxy_socks5_and_http_connect_desync_roundtrip() {
     let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
     req.extend_from_slice(&up_port.to_be_bytes());
     client.write_all(&req).unwrap();
+    client.flush().unwrap();
     let mut conn_resp = [0u8; 10];
     client.read_exact(&mut conn_resp).unwrap();
     assert_eq!(conn_resp[1], 0x00);
 
     client.write_all(&ch).unwrap();
+    client.flush().unwrap();
     let mut reply = [0u8; 9];
     client.read_exact(&mut reply).unwrap();
     assert_eq!(&reply, b"SERVER_OK");
