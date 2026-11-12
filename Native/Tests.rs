@@ -3407,3 +3407,45 @@ fn restricted_isp_middlebox_sni_rst_tls_record_fragmentation_and_udp_voice_game_
         "second UDP packet is intact Roblox RakNet"
     );
 }
+
+#[test]
+fn dns_poisoning_detection_and_classification() {
+    let tt_v4: Ipv4Addr = "195.175.254.2".parse().unwrap();
+    let tt_v6: Ipv6Addr = "2a01:358:4014:a00::3".parse().unwrap();
+    assert!(probe::is_poisoned_ipv4(&tt_v4));
+    assert!(probe::is_poisoned_ipv6(&tt_v6));
+    assert!(probe::is_poisoned_response(
+        "discord.com",
+        &[tt_v4],
+        &[tt_v6]
+    ));
+    assert!(probe::is_poisoned_response("roblox.com", &[tt_v4], &[]));
+
+    let mut tr = probe::TargetReport::default();
+    tr.target = probe::parse_target("discord.com").unwrap();
+    tr.dns = probe::DnsResult {
+        status: Status::Blocked,
+        rcode: 0,
+        latency_us: 73000,
+        v4: vec![tt_v4],
+        v6: vec![tt_v6],
+        poisoned: true,
+        ..Default::default()
+    };
+    let run = probe::RunReport {
+        targets: vec![tr],
+        ..Default::default()
+    };
+    let diags = intel::classify(None, &run);
+    assert!(!diags.is_empty());
+    assert_eq!(diags[0].category, intel::Category::DnsResolutionFailure);
+    assert_eq!(diags[0].confidence, 100);
+    assert!(diags[0]
+        .observations
+        .iter()
+        .any(|o| o.code == intel::Obs::DnsPoisoned));
+    assert_eq!(
+        decide::recommend_desync_mode(&diags),
+        desync::DesyncMode::RealityVision
+    );
+}

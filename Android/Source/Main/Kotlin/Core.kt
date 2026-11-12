@@ -23,6 +23,12 @@ import android.content.Context
 import android.content.Intent
 import android.app.Activity
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.pm.ServiceInfo
+import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import java.io.FileInputStream
@@ -1118,12 +1124,13 @@ object Text {
             42 -> "Şifreli DNS $s yanıt vermedi (${status(o.args.getOrNull(0)?.toInt() ?: 5)}); uç nokta veya ağ politikası olabilir"
             43 -> "$s: sistem DNS'i alan adı yok diyor, bağımsız şifreli DNS (${Text.encProtocol(o.args.getOrNull(0)?.toInt() ?: 0)}) çözüyor — çözümleyici düzeyinde tutarsızlık"
             44 -> "$s: şifreli DNS de alan adının olmadığını doğruluyor"
+            45 -> "$s: DNS yanıtı zehirlenmiş / sansür IP'sine yönlendirildi (${a(0)}.${a(1)}.${a(2)}.${a(3)})"
             39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; THE DPI bu izni istemez). Bu bir ağ arızası değildir."
             else -> "Gözlem ${o.code} $s ${o.args}"
         }
     }
 
-    const val KNOWN_OBSERVATIONS = 44
+    const val KNOWN_OBSERVATIONS = 45
 
     fun encProtocol(p: Int): String = when (p) {
         EncProtocol.DOH -> "DoH (HTTP/2)"
@@ -2173,7 +2180,12 @@ class TunBridge(
         dropRst = true,
     ),
     private val blockQuic: Boolean = true,
+    private val logger: ((String, String) -> Unit)? = null,
 ) : AutoCloseable {
+    private fun log(tag: String, msg: String) {
+        logger?.invoke(tag, msg)
+    }
+
     private data class FlowKey(val srcIp: Int, val srcPort: Int, val dstIp: Int, val dstPort: Int)
 
     private val running = AtomicBoolean(false)
@@ -2219,6 +2231,7 @@ class TunBridge(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        log("TunBridge", "TunBridge worker başlatıldı (DoH=${dohEndpoints.size}, DNS=${upstreamDnsServers.size})")
         readerThread = Thread({ readLoop() }, "thedpi-tun-reader").apply {
             isDaemon = true
             start()
@@ -3319,6 +3332,7 @@ class TheDpiVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         CrashLogger.log("TheDpiVpnService", "onCreate çağrıldı")
+        createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -3336,8 +3350,69 @@ class TheDpiVpnService : VpnService() {
         return START_STICKY
     }
 
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "THE DPI Engelsiz Mod Tüneli",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "THE DPI sistem geneli TUN köprüsü ve sansür kalkanı durum bildirimi"
+                setShowBadge(false)
+            }
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(statusText: String): Notification {
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val stopIntent = PendingIntent.getService(
+            this,
+            1,
+            Intent(this, TheDpiVpnService::class.java).apply {
+                action = ACTION_STOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        return builder
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("THE DPI — Engelsiz Mod Aktif")
+            .setContentText(statusText)
+            .setContentIntent(pendingIntent)
+            .addAction(Notification.Action.Builder(null, "Durdur", stopIntent).build())
+            .setOngoing(true)
+            .build()
+    }
+
     private fun startTunnel(customDoh: List<String>, customDns: List<String>) {
         CrashLogger.log("TheDpiVpnService", "startTunnel başlatılıyor... (doh=${customDoh.size}, dns=${customDns.size})")
+        createNotificationChannel()
+        val notif = buildNotification("Sistem Geneli TUN Köprüsü Devrede (DoH + REALITY/Vision)")
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIFICATION_ID, notif)
+            }
+            CrashLogger.log("TheDpiVpnService", "startForeground başarıyla çağrıldı (Foreground Service aktif).")
+        } catch (e: Throwable) {
+            CrashLogger.log("TheDpiVpnService", "startForeground uyarı/hata: ${e.message}", e)
+        }
+
         try {
             val s = DiagnosticSession()
             session = s
@@ -3381,6 +3456,7 @@ class TheDpiVpnService : VpnService() {
                         dropRst = true,
                     ),
                     blockQuic = true,
+                    logger = { tag, msg -> CrashLogger.log(tag, msg) },
                 )
                 bridge = b
                 ActiveBridgeHolder.current = b
@@ -3442,6 +3518,16 @@ class TheDpiVpnService : VpnService() {
         tun = null
         runCatching { session?.stopProxy(); session?.close() }
         session = null
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (t: Throwable) {
+            CrashLogger.log("TheDpiVpnService", "stopForeground hatası: ${t.message}", t)
+        }
     }
 
     override fun onRevoke() {
@@ -3460,6 +3546,8 @@ class TheDpiVpnService : VpnService() {
         const val ACTION_STOP = "com.the.dpi.STOP_TUNNEL"
         const val EXTRA_DOH = "com.the.dpi.EXTRA_DOH"
         const val EXTRA_DNS = "com.the.dpi.EXTRA_DNS"
+        const val NOTIFICATION_CHANNEL_ID = "thedpi_vpn_channel"
+        const val NOTIFICATION_ID = 2026
         val isRunning = AtomicBoolean(false)
     }
 }
@@ -3609,6 +3697,11 @@ class MainActivity : Activity() {
         try {
             cm = getSystemService(ConnectivityManager::class.java)
             setContentView(buildUi(savedInstanceState))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
+                }
+            }
         } catch (t: Throwable) {
             CrashLogger.log("MainActivity", "setContentView / buildUi hatası!", t)
             throw t
@@ -3787,7 +3880,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 setMargins(0, 0, dp(4), 0)
             }
-            setOnClickListener { startRun(verifyRuns = 0) }
+            setOnClickListener { startRun(verifyRuns = 1) }
         }
         appliedButton = Button(this).apply {
             text = "Öneriyi Doğrula"
@@ -3995,7 +4088,7 @@ class MainActivity : Activity() {
         if (!busy.compareAndSet(false, true)) return
         val targetList = split(targets.text.toString())
         val altList = split(altDns.text.toString())
-        val dohList = split(dohEndpoints.text.toString())
+        val dohList = split(dohEndpoints.text.toString()).ifEmpty { TunBridge.DEFAULT_DOH_ENDPOINTS }
         runButton.isEnabled = false
         appliedButton.isEnabled = false
         status.text = "Tanılanıyor (Poison-Free DoH & TLS)..."
@@ -4110,8 +4203,12 @@ class MainActivity : Activity() {
                 val vpnIntent = Intent(this, TheDpiVpnService::class.java)
                     .putStringArrayListExtra(TheDpiVpnService.EXTRA_DOH, dohList)
                     .putStringArrayListExtra(TheDpiVpnService.EXTRA_DNS, dnsList)
-                startService(vpnIntent)
-                CrashLogger.log("MainActivity", "TheDpiVpnService startService çağrıldı")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(vpnIntent)
+                } else {
+                    startService(vpnIntent)
+                }
+                CrashLogger.log("MainActivity", "TheDpiVpnService startForegroundService çağrıldı")
             }.onFailure {
                 CrashLogger.log("MainActivity", "TheDpiVpnService başlatılamadı!", it)
             }
@@ -4177,6 +4274,7 @@ class MainActivity : Activity() {
 
     private companion object {
         const val REQ_VPN = 1001
+        const val REQ_NOTIF = 1002
         const val KEY_TARGETS = "targets"
         const val KEY_ALT = "alt"
         const val KEY_DOH = "doh"

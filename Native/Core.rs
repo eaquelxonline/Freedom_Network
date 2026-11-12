@@ -4564,6 +4564,34 @@ pub mod probe {
         st
     }
 
+    pub fn is_poisoned_ipv4(ip: &Ipv4Addr) -> bool {
+        let oct = ip.octets();
+        // Turkish ISP / BTK censorship sinkhole (195.175.254.0/24 e.g. 195.175.254.2)
+        (oct[0] == 195 && oct[1] == 175 && oct[2] == 254)
+        // 0.0.0.0 sinkhole
+        || (oct[0] == 0 && oct[1] == 0 && oct[2] == 0 && oct[3] == 0)
+    }
+
+    pub fn is_poisoned_ipv6(ip: &Ipv6Addr) -> bool {
+        let seg = ip.segments();
+        // Turkish ISP IPv6 censorship sinkhole (2a01:358:4014::/48 or 2a01:358:4014:a00::/64)
+        (seg[0] == 0x2a01 && seg[1] == 0x0358 && seg[2] == 0x4014)
+        // Unspecified :: sinkhole
+        || ip.is_unspecified()
+    }
+
+    pub fn is_poisoned_response(host: &str, v4: &[Ipv4Addr], v6: &[Ipv6Addr]) -> bool {
+        if host.eq_ignore_ascii_case("localhost")
+            || host.ends_with(".local")
+            || host.ends_with(".test")
+            || host.ends_with(".example")
+            || host.ends_with(".invalid")
+        {
+            return false;
+        }
+        v4.iter().any(is_poisoned_ipv4) || v6.iter().any(is_poisoned_ipv6)
+    }
+
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct DnsResult {
         pub status: Status,
@@ -4574,6 +4602,7 @@ pub mod probe {
         pub https: Option<dns::Svcb>,
         pub server: Option<SocketAddr>,
         pub via_tcp: bool,
+        pub poisoned: bool,
     }
 
     pub fn resolve(
@@ -4658,7 +4687,10 @@ pub mod probe {
             }
             r.v4.truncate(16);
             r.v6.truncate(16);
-            r.status = if r.v4.is_empty() && r.v6.is_empty() {
+            r.poisoned = is_poisoned_response(&target.host, &r.v4, &r.v6);
+            r.status = if r.poisoned {
+                Status::Blocked
+            } else if r.v4.is_empty() && r.v6.is_empty() {
                 Status::NoData
             } else {
                 Status::Ok
@@ -4983,13 +5015,13 @@ pub mod probe {
     ) -> TargetReport {
         let dns = resolve(t, servers, cfg.timeout, deadline);
         let run_tcp = |ip: Option<IpAddr>| match ip {
-            Some(ip) => tcp_probe(
+            Some(ip) if !dns.poisoned => tcp_probe(
                 SocketAddr::new(ip, t.port),
                 cfg.tcp_samples,
                 cfg.timeout,
                 deadline,
             ),
-            None => TcpResult::default(),
+            _ => TcpResult::default(),
         };
         let tcp4 = run_tcp(dns.v4.first().map(|a| IpAddr::V4(*a)));
         let tcp6 = run_tcp(dns.v6.first().map(|a| IpAddr::V6(*a)));
@@ -5362,6 +5394,7 @@ pub mod intel {
         EncryptedDnsFailed = 42,
         ResolverDiscrepancy = 43,
         EncryptedDnsConfirmsNxdomain = 44,
+        DnsPoisoned = 45,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5607,6 +5640,22 @@ pub mod intel {
         let env_v6 = env.map_or(UNKNOWN, |e| e.has_ipv6);
         for t in &run.targets {
             let h = t.target.host.as_str();
+            if t.dns.poisoned {
+                let first_v4 = t.dns.v4.iter().find(|a| probe::is_poisoned_ipv4(a));
+                let args: Vec<i64> = match first_v4 {
+                    Some(a) => {
+                        let o = a.octets();
+                        vec![i64::from(o[0]), i64::from(o[1]), i64::from(o[2]), i64::from(o[3])]
+                    }
+                    None => vec![],
+                };
+                b.add(
+                    Category::DnsResolutionFailure,
+                    100,
+                    vec![obs(Obs::DnsPoisoned, h, &args)],
+                );
+                continue;
+            }
             match t.dns.status {
                 Status::Ok | Status::Skipped => {}
                 Status::NameError => {
@@ -6024,13 +6073,13 @@ pub mod decide {
         use crate::desync::DesyncMode;
         for d in diags {
             match d.category {
-                Category::TlsNegotiationFailure => return DesyncMode::AdaptiveFull,
+                Category::TlsNegotiationFailure => return DesyncMode::RealityVision,
                 Category::TcpConnectionFailure => return DesyncMode::FakeAutoTtl,
                 Category::QuicIncompatibility | Category::Http3Incompatibility => {
                     return DesyncMode::QuicScramble;
                 }
                 Category::DnsResolutionFailure | Category::DnsTimeout => {
-                    return DesyncMode::Disorder;
+                    return DesyncMode::RealityVision;
                 }
                 _ => {}
             }

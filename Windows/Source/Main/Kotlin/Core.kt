@@ -1115,12 +1115,13 @@ object Text {
             42 -> "Şifreli DNS $s yanıt vermedi (${status(o.args.getOrNull(0)?.toInt() ?: 5)}); uç nokta veya ağ politikası olabilir"
             43 -> "$s: sistem DNS'i alan adı yok diyor, bağımsız şifreli DNS (${Text.encProtocol(o.args.getOrNull(0)?.toInt() ?: 0)}) çözüyor — çözümleyici düzeyinde tutarsızlık"
             44 -> "$s: şifreli DNS de alan adının olmadığını doğruluyor"
+            45 -> "$s: DNS yanıtı zehirlenmiş / sansür IP'sine yönlendirildi (${a(0)}.${a(1)}.${a(2)}.${a(3)})"
             39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; THE DPI bu izni istemez). Bu bir ağ arızası değildir."
             else -> "Gözlem ${o.code} $s ${o.args}"
         }
     }
 
-    const val KNOWN_OBSERVATIONS = 44
+    const val KNOWN_OBSERVATIONS = 45
 
     fun encProtocol(p: Int): String = when (p) {
         EncProtocol.DOH -> "DoH (HTTP/2)"
@@ -2170,7 +2171,12 @@ class TunBridge(
         dropRst = true,
     ),
     private val blockQuic: Boolean = true,
+    private val logger: ((String, String) -> Unit)? = null,
 ) : AutoCloseable {
+    private fun log(tag: String, msg: String) {
+        logger?.invoke(tag, msg)
+    }
+
     private data class FlowKey(val srcIp: Int, val srcPort: Int, val dstIp: Int, val dstPort: Int)
 
     private val running = AtomicBoolean(false)
@@ -2216,6 +2222,7 @@ class TunBridge(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        log("TunBridge", "TunBridge worker başlatıldı (DoH=${dohEndpoints.size}, DNS=${upstreamDnsServers.size})")
         readerThread = Thread({ readLoop() }, "thedpi-tun-reader").apply {
             isDaemon = true
             start()
