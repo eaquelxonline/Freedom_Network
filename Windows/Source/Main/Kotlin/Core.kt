@@ -2041,10 +2041,9 @@ class DirectDohClient(
         val ip = IpPackets.parseIpLiteral(host)?.let { InetAddress.getByAddress(IpPackets.ipToBytes(it)) }
             ?: BOOTSTRAP[host.lowercase()]?.let { InetAddress.getByAddress(IpPackets.ipToBytes(IpPackets.parseIpLiteral(it)!!)) }
             ?: InetAddress.getByName(host)
-        val channel = SocketChannel.open()
-        channel.configureBlocking(true)
-        val raw = channel.socket()
+        val raw = Socket()
         try {
+            raw.bind(null)
             protectSocket(raw)
             raw.tcpNoDelay = true
             raw.connect(InetSocketAddress(ip, port), timeoutMs)
@@ -2239,7 +2238,7 @@ class TunBridge(
             try {
                 tunOutput.write(pkt)
                 tunOutput.flush()
-            } catch (_: IOException) {
+            } catch (_: Throwable) {
             }
         }
     }
@@ -2249,7 +2248,7 @@ class TunBridge(
         while (running.get()) {
             val n = try {
                 tunInput.read(buf)
-            } catch (_: IOException) {
+            } catch (_: Throwable) {
                 break
             }
             if (n <= 0) {
@@ -2263,11 +2262,19 @@ class TunBridge(
                 val pktLen = IpPackets.u16(buf, off + 2)
                 if (pktLen < 20 || off + pktLen > n) break
                 val pkt = buf.copyOfRange(off, off + pktLen)
-                dispatchPacket(pkt)
+                try {
+                    dispatchPacket(pkt)
+                } catch (_: Throwable) {
+                    if (!running.get()) break
+                }
                 off += pktLen
             }
             if (off == 0) {
-                dispatchPacket(buf.copyOf(n))
+                try {
+                    dispatchPacket(buf.copyOf(n))
+                } catch (_: Throwable) {
+                    if (!running.get()) break
+                }
             }
         }
     }
@@ -2291,12 +2298,12 @@ class TunBridge(
                     quicFallbacks.incrementAndGet()
                     IpPackets.buildIcmpv4Unreachable(raw)?.let { writeTun(it) }
                 } else {
-                    handleUdp(raw, udp)
+                    handleUdp(udp)
                 }
             }
             IpPackets.PROTO_TCP -> {
                 val tcp = IpPackets.parseTcp(raw, ip) ?: return
-                handleTcp(raw, tcp)
+                handleTcp(tcp)
             }
         }
     }
@@ -2306,15 +2313,18 @@ class TunBridge(
         if (query.size < 12) return
         dnsQueries.incrementAndGet()
         ioPool.execute {
-            val answer = resolveDnsQuery(query, udp.ip.dstIp) ?: return@execute
-            val reply = IpPackets.buildIpv4Udp(
-                srcIp = udp.ip.dstIp,
-                dstIp = udp.ip.srcIp,
-                srcPort = udp.dstPort,
-                dstPort = udp.srcPort,
-                payload = answer,
-            )
-            writeTun(reply)
+            try {
+                val answer = resolveDnsQuery(query, udp.ip.dstIp) ?: return@execute
+                val reply = IpPackets.buildIpv4Udp(
+                    srcIp = udp.ip.dstIp,
+                    dstIp = udp.ip.srcIp,
+                    srcPort = udp.dstPort,
+                    dstPort = udp.srcPort,
+                    payload = answer,
+                )
+                writeTun(reply)
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -2371,14 +2381,12 @@ class TunBridge(
             if (srv.isBlank()) continue
             val host = srv.substringBefore(':')
             val port = srv.substringAfter(':', "53").toIntOrNull() ?: 53
-            val ch = try {
-                DatagramChannel.open().apply { configureBlocking(true) }
+            val sock = try {
+                DatagramSocket()
             } catch (_: Exception) {
                 continue
             }
-            val sock = ch.socket()
             try {
-                sock.bind(null)
                 protectDatagram(sock)
                 val target = InetSocketAddress(InetAddress.getByName(host), port)
                 sock.send(DatagramPacket(query, query.size, target))
@@ -2406,7 +2414,7 @@ class TunBridge(
         return null
     }
 
-    private fun handleUdp(raw: ByteArray, udp: IpPackets.UdpDatagram) {
+    private fun handleUdp(udp: IpPackets.UdpDatagram) {
         if (udp.payload.isEmpty()) return
         val key = FlowKey(udp.ip.srcIp, udp.srcPort, udp.ip.dstIp, udp.dstPort)
         if (udpTable.size > 512) {
@@ -2423,18 +2431,15 @@ class TunBridge(
             udpFlows.incrementAndGet()
             UdpFlow(k).also { it.start() }
         }
-        flow.sendOutbound(raw, udp.payload)
+        flow.sendOutbound(udp.payload)
     }
 
     private inner class UdpFlow(val key: FlowKey) {
         val socket: DatagramSocket? = runCatching {
-            val ch = DatagramChannel.open()
-            ch.configureBlocking(true)
-            val ds = ch.socket()
-            ds.bind(null)
-            protectDatagram(ds)
-            ds.soTimeout = 30_000
-            ds
+            DatagramSocket().also {
+                protectDatagram(it)
+                it.soTimeout = 30_000
+            }
         }.getOrNull()
         private val closed = AtomicBoolean(false)
         private val targetAddress: InetSocketAddress? = runCatching {
@@ -2449,10 +2454,10 @@ class TunBridge(
         fun start() {
             val s = socket ?: return
             ioPool.execute {
-                val buf = ByteArray(16384)
+                val buf = ByteArray(2048)
                 while (running.get() && !closed.get()) {
-                    val dp = DatagramPacket(buf, buf.size)
                     try {
+                        val dp = DatagramPacket(buf, buf.size)
                         s.receive(dp)
                         if (dp.length > 0) {
                             bytesDown.addAndGet(dp.length.toLong())
@@ -2467,7 +2472,7 @@ class TunBridge(
                         }
                     } catch (_: SocketTimeoutException) {
                         break
-                    } catch (_: IOException) {
+                    } catch (_: Throwable) {
                         break
                     }
                 }
@@ -2475,32 +2480,14 @@ class TunBridge(
             }
         }
 
-        fun sendOutbound(rawIpPacket: ByteArray, payload: ByteArray) {
+        fun sendOutbound(payload: ByteArray) {
             val s = socket ?: return
             val dst = targetAddress ?: return
-            ioPool.execute {
-                try {
-                    bytesUp.addAndGet(payload.size.toLong())
-                    // Apply QUIC Initial scramble via Native.desyncPacket when applicable
-                    val res = if (key.dstPort == 443) {
-                        runCatching { session.desyncPacket(rawIpPacket, desyncConfig) }.getOrNull()
-                    } else {
-                        null
-                    }
-                    if (res != null && res.status == Codes.OK && !res.dropped && res.packets.size > 1) {
-                        desyncedFlows.incrementAndGet()
-                        for (pkt in res.packets) {
-                            val u = IpPackets.parseUdp(pkt) ?: continue
-                            if (u.payload.isNotEmpty()) {
-                                s.send(DatagramPacket(u.payload, u.payload.size, dst))
-                            }
-                        }
-                    } else {
-                        s.send(DatagramPacket(payload, payload.size, dst))
-                    }
-                } catch (_: IOException) {
-                    close()
-                }
+            try {
+                bytesUp.addAndGet(payload.size.toLong())
+                s.send(DatagramPacket(payload, payload.size, dst))
+            } catch (_: Throwable) {
+                close()
             }
         }
 
@@ -2512,7 +2499,7 @@ class TunBridge(
         }
     }
 
-    private fun handleTcp(raw: ByteArray, tcp: IpPackets.TcpSegment) {
+    private fun handleTcp(tcp: IpPackets.TcpSegment) {
         val key = FlowKey(tcp.ip.srcIp, tcp.srcPort, tcp.ip.dstIp, tcp.dstPort)
         val isSyn = (tcp.flags and IpPackets.TCP_SYN) != 0 && (tcp.flags and IpPackets.TCP_ACK) == 0
         val isRst = (tcp.flags and IpPackets.TCP_RST) != 0
@@ -2542,7 +2529,7 @@ class TunBridge(
         }
         val flow = tcpTable[key] ?: return
         if (tcp.payload.isNotEmpty()) {
-            flow.onClientData(raw, tcp)
+            flow.onClientData(tcp)
         }
         if (isFin) {
             flow.onClientFin(tcp)
@@ -2552,14 +2539,11 @@ class TunBridge(
     private inner class TcpFlow(val key: FlowKey, var clientNextSeq: Long) {
         val lock = Any()
         var serverSeq: Long = 0x5000_0000L
-        var helloBuf: ByteArrayOutputStream? = null
-        var connected = false
-        var finFromClient = false
-        var firstPayloadDone = false
-        var visionSpliced = false
         val closed = AtomicBoolean(false)
-        val pending = ArrayList<Pair<ByteArray, ByteArray>>()
+        val outboundQueue = java.util.concurrent.LinkedBlockingQueue<ByteArray>(256)
         @Volatile var upstreamSocket: Socket? = null
+        @Volatile var finFromClient = false
+        var visionSpliced = false
 
         fun onSyn() {
             val synAckSeq: Long
@@ -2584,9 +2568,8 @@ class TunBridge(
             ioPool.execute { connectAndPump() }
         }
 
-        fun onClientData(raw: ByteArray, tcp: IpPackets.TcpSegment) {
+        fun onClientData(tcp: IpPackets.TcpSegment) {
             val ackPkt: ByteArray
-            var immediateSend: Pair<ByteArray, ByteArray>? = null
             synchronized(lock) {
                 if (tcp.seq != clientNextSeq) {
                     ackPkt = IpPackets.buildIpv4Tcp(
@@ -2609,20 +2592,10 @@ class TunBridge(
                         ack = clientNextSeq,
                         flags = IpPackets.TCP_ACK,
                     )
-                    val item = raw.copyOf() to tcp.payload.copyOf()
-                    if (connected) {
-                        immediateSend = item
-                    } else {
-                        pending.add(item)
-                    }
+                    outboundQueue.offer(tcp.payload.copyOf())
                 }
             }
             writeTun(ackPkt)
-            immediateSend?.let { (r, p) ->
-                synchronized(lock) {
-                    sendToUpstreamLocked(r, p)
-                }
-            }
         }
 
         fun onClientFin(tcp: IpPackets.TcpSegment) {
@@ -2641,78 +2614,82 @@ class TunBridge(
                     ack = clientNextSeq,
                     flags = IpPackets.TCP_ACK,
                 )
-                if (connected) {
-                    runCatching { upstreamSocket?.shutdownOutput() }
-                }
             }
             writeTun(finAckPkt)
         }
 
-        private fun sendToUpstreamLocked(rawIpPacket: ByteArray, payload: ByteArray) {
-            val sock = upstreamSocket ?: return
+        private fun pumpOutbound(sock: Socket, out: OutputStream) {
+            var firstPayloadDone = false
+            var helloBuf: ByteArrayOutputStream? = null
             try {
-                val out = sock.getOutputStream()
-                bytesUp.addAndGet(payload.size.toLong())
-                if (!firstPayloadDone) {
-                    // Reassemble a TLS ClientHello that spans several TCP segments (post-quantum
-                    // key shares push it past one MSS) so the SNI can be protected as a whole.
-                    val acc = helloBuf
-                    val data: ByteArray
-                    if (acc != null) {
-                        acc.write(payload)
-                        data = acc.toByteArray()
-                    } else {
-                        data = payload
-                    }
-                    val isTls = data.size >= 5 && (data[0].toInt() and 0xFF) == 0x16 && (data[1].toInt() and 0xFF) == 0x03
-                    if (isTls) {
-                        val need = 5 + IpPackets.u16(data, 3)
-                        if (data.size < need && need <= 16384 + 5) {
-                            if (acc == null) helloBuf = ByteArrayOutputStream().apply { write(data) }
-                            return
+                while (running.get() && !closed.get()) {
+                    val payload = outboundQueue.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    if (payload != null) {
+                        bytesUp.addAndGet(payload.size.toLong())
+                        if (!firstPayloadDone) {
+                            val acc = helloBuf
+                            val data = if (acc != null) {
+                                acc.write(payload)
+                                acc.toByteArray()
+                            } else {
+                                payload
+                            }
+                            val isTls = data.size >= 5 && (data[0].toInt() and 0xFF) == 0x16 && (data[1].toInt() and 0xFF) == 0x03
+                            if (isTls) {
+                                val need = 5 + IpPackets.u16(data, 3)
+                                if (data.size < need && need <= 16384 + 5) {
+                                    if (acc == null) helloBuf = ByteArrayOutputStream().apply { write(data) }
+                                    continue
+                                }
+                            }
+                            helloBuf = null
+                            firstPayloadDone = true
+                            val packet = IpPackets.buildIpv4Tcp(
+                                srcIp = key.srcIp, dstIp = key.dstIp, srcPort = key.srcPort, dstPort = key.dstPort,
+                                seq = 1L, ack = 1L, flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = data,
+                            )
+                            val res = runCatching { session.desyncPacket(packet, desyncConfig) }.getOrNull()
+                            val nativeChunks = IpPackets.extractOrderedStreamChunks(packet, data, res)
+                            val chunks = IpPackets.planFirstPayload(data, nativeChunks)
+                            if (chunks.size > 1) {
+                                desyncedFlows.incrementAndGet()
+                            }
+                            if (isTls && chunks.size > 1 && chunks.all { it.size >= 5 && (it[0].toInt() and 0xFF) == 0x16 }) {
+                                tlsRecordFragmented.incrementAndGet()
+                            }
+                            if (desyncConfig.mode == DesyncMode.REALITY_VISION && isTls) {
+                                visionSpliced = true
+                                visionSplicedFlows.incrementAndGet()
+                            }
+                            for (i in chunks.indices) {
+                                out.write(chunks[i])
+                                out.flush()
+                                if (i < chunks.size - 1) {
+                                    try { Thread.sleep(3) } catch (_: InterruptedException) { break }
+                                }
+                            }
+                        } else {
+                            if (!visionSpliced && payload.size >= 5 && (payload[0].toInt() and 0xFF) == 0x17 && (payload[1].toInt() and 0xFF) == 0x03) {
+                                visionSpliced = true
+                                visionSplicedFlows.incrementAndGet()
+                            }
+                            out.write(payload)
+                            out.flush()
                         }
+                    } else if (finFromClient && outboundQueue.isEmpty()) {
+                        runCatching { sock.shutdownOutput() }
+                        break
                     }
-                    helloBuf = null
-                    firstPayloadDone = true
-                    val packet = if (data === payload) rawIpPacket else IpPackets.buildIpv4Tcp(
-                        srcIp = key.srcIp, dstIp = key.dstIp, srcPort = key.srcPort, dstPort = key.dstPort,
-                        seq = 1L, ack = 1L, flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = data,
-                    )
-                    val res = runCatching { session.desyncPacket(packet, desyncConfig) }.getOrNull()
-                    val nativeChunks = IpPackets.extractOrderedStreamChunks(packet, data, res)
-                    val chunks = IpPackets.planFirstPayload(data, nativeChunks)
-                    if (chunks.size > 1) {
-                        desyncedFlows.incrementAndGet()
-                    }
-                    if (isTls && chunks.size > 1 && chunks.all { it.size >= 5 && (it[0].toInt() and 0xFF) == 0x16 }) {
-                        tlsRecordFragmented.incrementAndGet()
-                    }
-                    if (desyncConfig.mode == DesyncMode.REALITY_VISION && isTls) {
-                        visionSpliced = true
-                        visionSplicedFlows.incrementAndGet()
-                    }
-                    for (chunk in chunks) {
-                        out.write(chunk)
-                        out.flush()
-                    }
-                } else {
-                    if (!visionSpliced && payload.size >= 5 && (payload[0].toInt() and 0xFF) == 0x17 && (payload[1].toInt() and 0xFF) == 0x03) {
-                        visionSpliced = true
-                        visionSplicedFlows.incrementAndGet()
-                    }
-                    out.write(payload)
-                    out.flush()
                 }
-            } catch (_: IOException) {
+            } catch (_: Throwable) {
                 close()
             }
         }
 
         private fun connectAndPump() {
-            val channel = SocketChannel.open()
-            channel.configureBlocking(true)
-            val sock = channel.socket()
+            val sock = Socket()
             try {
+                sock.bind(null)
                 protectSocket(sock)
                 sock.tcpNoDelay = true
                 runCatching { sock.keepAlive = true }
@@ -2723,22 +2700,13 @@ class TunBridge(
                     InetAddress.getByAddress(IpPackets.ipToBytes(key.dstIp))
                 }
                 sock.connect(InetSocketAddress(dstInet, key.dstPort), 5000)
-                synchronized(lock) {
-                    if (closed.get()) {
-                        runCatching { sock.close() }
-                        return
-                    }
-                    upstreamSocket = sock
-                    connected = true
-                    val queued = ArrayList(pending)
-                    pending.clear()
-                    for ((r, p) in queued) {
-                        sendToUpstreamLocked(r, p)
-                    }
-                    if (finFromClient) {
-                        runCatching { sock.shutdownOutput() }
-                    }
+                if (closed.get()) {
+                    runCatching { sock.close() }
+                    return
                 }
+                upstreamSocket = sock
+                val out = sock.getOutputStream()
+                ioPool.execute { pumpOutbound(sock, out) }
 
                 val input = sock.getInputStream()
                 val buf = ByteArray(1360)
@@ -2788,7 +2756,7 @@ class TunBridge(
                         )
                     }
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 val rstSeq: Long
                 val ackNum: Long
                 synchronized(lock) {
@@ -2814,6 +2782,7 @@ class TunBridge(
         fun close() {
             if (closed.compareAndSet(false, true)) {
                 tcpTable.remove(key, this)
+                outboundQueue.clear()
                 runCatching { upstreamSocket?.close() }
             }
         }
@@ -2821,6 +2790,8 @@ class TunBridge(
 
     override fun close() {
         if (running.compareAndSet(true, false)) {
+            runCatching { tunInput.close() }
+            runCatching { tunOutput.close() }
             readerThread?.interrupt()
             for (f in tcpTable.values) f.close()
             for (u in udpTable.values) u.close()
