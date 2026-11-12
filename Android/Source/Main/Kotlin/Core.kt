@@ -4079,6 +4079,7 @@ class ThroughputSparklineView(context: Context) : View(context) {
  * ModernMetricCard:
  * Sleek glassmorphic card with vector icon, bold metric value, and subtle secondary detail.
  */
+@android.annotation.SuppressLint("ViewConstructor")
 class ModernMetricCard(context: Context, val iconType: Int, val titleText: String, val heroColor: Int) : LinearLayout(context) {
     val valView = TextView(context).apply {
         text = "0"
