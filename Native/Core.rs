@@ -1324,6 +1324,8 @@ pub mod probe {
         Unsupported = 10,
         Skipped = 11,
         LocalLimit = 12,
+        /// The platform refused the socket operation (e.g. Android 17 local-network protection).
+        Blocked = 13,
     }
 
     impl Status {
@@ -1338,6 +1340,7 @@ pub mod probe {
             return Status::LocalLimit;
         }
         match e.kind() {
+            K::PermissionDenied => Status::Blocked,
             K::TimedOut | K::WouldBlock => Status::Timeout,
             // Windows reports ICMP port-unreachable on UDP as WSAECONNRESET.
             K::ConnectionRefused | K::ConnectionReset => Status::Refused,
@@ -2392,6 +2395,7 @@ pub mod intel {
         RestrictedBackground = 36,
         PrivateDnsActive = 37,
         NoDnsServers = 38,
+        PlatformBlocked = 39,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2545,7 +2549,17 @@ pub mod intel {
         let tcp_ok_targets = run.targets.iter().filter(|t| t.tcp_ok()).count();
 
         // Resolver-level evidence.
-        if !primaries.is_empty() && !any_primary_answer {
+        let all_blocked =
+            !primaries.is_empty() && primaries.iter().all(|r| r.status == Status::Blocked);
+        if all_blocked {
+            for r in &primaries {
+                b.add(
+                    Category::Advisory,
+                    100,
+                    vec![obs(Obs::PlatformBlocked, &r.server.to_string(), &[])],
+                );
+            }
+        } else if !primaries.is_empty() && !any_primary_answer {
             let mut o: Vec<Observation> = primaries
                 .iter()
                 .map(|r| {
@@ -2672,6 +2686,17 @@ pub mod intel {
             }
             let ok4 = t.tcp4.successes > 0;
             let ok6 = t.tcp6.successes > 0;
+            if !ok4
+                && !ok6
+                && (t.tcp4.status == Status::Blocked || t.tcp6.status == Status::Blocked)
+            {
+                b.add(
+                    Category::Advisory,
+                    100,
+                    vec![obs(Obs::PlatformBlocked, h, &[])],
+                );
+                continue;
+            }
             if t.tcp4.attempts > 0 && !ok4 && ok6 {
                 b.add(
                     Category::Ipv4ConnectivityFailure,

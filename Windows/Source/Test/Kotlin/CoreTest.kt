@@ -362,7 +362,7 @@ fun main() {
         for (a in 0..Text.KNOWN_ACTIONS) expect(!Text.actionTitle(a).startsWith("Eylem") && Text.actionDetail(a, 1400).isNotEmpty()) { "action $a" }
         for (o in 1..Text.KNOWN_OBSERVATIONS) expect(!Text.observation(Observation(o, "x", listOf(1, 2))).startsWith("Gözlem")) { "observation $o" }
         for (s in 0..7) expect(!Text.state(s).startsWith("Durum")) { "state $s" }
-        for (s in 0..12) expect(!Text.status(s).startsWith("durum")) { "status $s" }
+        for (s in 0..13) expect(!Text.status(s).startsWith("durum")) { "status $s" }
     }
 
     println()

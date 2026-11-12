@@ -583,7 +583,7 @@ object Text {
     fun status(s: Int): String = when (s) {
         0 -> "çalışmadı"; 1 -> "başarılı"; 2 -> "zaman aşımı"; 3 -> "reddedildi"; 4 -> "erişilemez"
         5 -> "hata"; 6 -> "geçersiz yanıt"; 7 -> "kayıt yok"; 8 -> "alan adı yok"; 9 -> "sunucu hatası"
-        10 -> "desteklenmiyor"; 11 -> "atlandı"; 12 -> "yerel MTU sınırı"; else -> "durum $s"
+        10 -> "desteklenmiyor"; 11 -> "atlandı"; 12 -> "yerel MTU sınırı"; 13 -> "platform izin vermedi"; else -> "durum $s"
     }
 
     fun tls(s: Int): String = when (s) {
@@ -704,11 +704,12 @@ object Text {
             36 -> "Arka plan veri kısıtlaması (Veri Tasarrufu) etkin"
             37 -> "Özel DNS (DNS over TLS) etkin${if (s.isNotEmpty()) ": $s" else ""}"
             38 -> "Sistem DNS sunucusu bilgisi alınamadı"
+            39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; THE DPI bu izni istemez). Bu bir ağ arızası değildir."
             else -> "Gözlem ${o.code} $s ${o.args}"
         }
     }
 
-    const val KNOWN_OBSERVATIONS = 38
+    const val KNOWN_OBSERVATIONS = 39
     const val KNOWN_CATEGORIES = 17
     const val KNOWN_ACTIONS = 13
 

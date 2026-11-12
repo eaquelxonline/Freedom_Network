@@ -1265,6 +1265,50 @@ fn classify_quic_http3_and_mtu() {
 }
 
 #[test]
+fn platform_blocked_probes_are_not_misdiagnosed() {
+    // Android 17 blocks local-network sockets without ACCESS_LOCAL_NETWORK: that is a
+    // platform policy, not a TCP failure, so no specific cause may be claimed.
+    let mut t = healthy_target("192.168.1.10");
+    t.dns.status = Status::Skipped;
+    t.tcp4 = probe::TcpResult {
+        status: Status::Blocked,
+        address: None,
+        attempts: 3,
+        successes: 0,
+        median_us: 0,
+    };
+    t.tls = probe::TlsObservation::default();
+    let d = intel::classify(
+        Some(&env_with(|_| {})),
+        &run_of(
+            vec![t, healthy_target("a.test")],
+            vec![resolver(true, false)],
+        ),
+    );
+    assert!(
+        has(&d, Category::RemoteServiceFailure).is_none()
+            && has(&d, Category::TcpConnectionFailure).is_none()
+    );
+    assert!(
+        has(&d, Category::Advisory)
+            .unwrap()
+            .observations
+            .iter()
+            .any(|o| o.code == Obs::PlatformBlocked)
+    );
+    let mut r = resolver(false, false);
+    r.status = Status::Blocked;
+    let mut nt = healthy_target("a.test");
+    nt.dns.status = Status::Blocked;
+    let d2 = intel::classify(Some(&env_with(|_| {})), &run_of(vec![nt], vec![r]));
+    assert!(has(&d2, Category::DnsTimeout).is_none());
+    assert_eq!(
+        probe::status_from_io(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        Status::Blocked
+    );
+}
+
+#[test]
 fn classify_advisories_do_not_mask_health() {
     let env = env_with(|e| {
         e.os_name = "Windows".into();
