@@ -4119,7 +4119,7 @@ class MainActivity : Activity() {
         worker.execute {
             try {
                 val next = s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
-                CrashLogger.log("MainActivity", "startProxy tamamlandı: active=${next.active}, listenPort=${next.listenPort}")
+                CrashLogger.log("MainActivity", "startProxy tamamlandı: active=${next.active}, port=${next.port}")
                 val b = ActiveBridgeHolder.current
                 val text = Text.vpnStatus(
                     vpnActive = vpnGranted,
