@@ -25,6 +25,9 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.geom.Path2D
 import java.awt.geom.RoundRectangle2D
+import java.awt.geom.Arc2D
+import java.awt.geom.Ellipse2D
+import java.awt.geom.Line2D
 import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Dimension
@@ -3012,113 +3015,194 @@ fun runCli(args: List<String>): Int {
     }
 }
 
-// Swing Vector Icon Renderer (Pure Java2D Path2D - NO Emojis)
+// Swing Vector Icon Renderer (Pure Java2D Path2D - Standard 24x24 Lucide Vector Geometry)
 internal object SwingVectorIcons {
+    private val shieldPath = Path2D.Float().apply {
+        moveTo(12f, 2f)
+        lineTo(20f, 5f)
+        lineTo(20f, 12f)
+        curveTo(20.0, 18.0, 12.0, 22.0, 12.0, 22.0)
+        curveTo(12.0, 22.0, 4.0, 18.0, 4.0, 12.0)
+        lineTo(4f, 5f)
+        closePath()
+    }
+
+    private val boltPath = Path2D.Float().apply {
+        moveTo(13f, 2f)
+        lineTo(3f, 14f)
+        lineTo(12f, 14f)
+        lineTo(11f, 22f)
+        lineTo(21f, 10f)
+        lineTo(12f, 10f)
+        closePath()
+    }
+
+    private val lockShacklePath = Path2D.Float().apply {
+        moveTo(7f, 11f)
+        lineTo(7f, 7f)
+        curveTo(7.0, 4.24, 9.24, 2.0, 12.0, 2.0)
+        curveTo(14.76, 2.0, 17.0, 4.24, 17.0, 7.0)
+        lineTo(17f, 11f)
+    }
+    private val lockBodyRect = RoundRectangle2D.Float(4f, 11f, 16f, 11f, 5f, 5f)
+
+    private val gamepadBodyRect = RoundRectangle2D.Float(2f, 6f, 20f, 12f, 8f, 8f)
+
+    private val globeOval = Ellipse2D.Float(2f, 2f, 20f, 20f)
+    private val globeMeridianPath = Path2D.Float().apply {
+        moveTo(12f, 2f)
+        curveTo(6.5, 2.0, 5.5, 6.5, 5.5, 12.0)
+        curveTo(5.5, 17.5, 6.5, 22.0, 12.0, 22.0)
+        curveTo(17.5, 22.0, 18.5, 17.5, 18.5, 12.0)
+        curveTo(18.5, 6.5, 17.5, 2.0, 12.0, 2.0)
+        closePath()
+    }
+
+    private val pulsePath = Path2D.Float().apply {
+        moveTo(2f, 12f)
+        lineTo(6f, 12f)
+        lineTo(9f, 3f)
+        lineTo(15f, 21f)
+        lineTo(18f, 12f)
+        lineTo(22f, 12f)
+    }
+
+    private val powerArc = Arc2D.Float(4f, 4f, 16f, 16f, 145f, 250f, Arc2D.OPEN)
+
+    private val terminalChevron = Path2D.Float().apply {
+        moveTo(4f, 17f)
+        lineTo(10f, 12f)
+        lineTo(4f, 7f)
+    }
+
+    private val copyFrontRect = RoundRectangle2D.Float(8f, 8f, 13f, 13f, 4f, 4f)
+    private val copyBackPath = Path2D.Float().apply {
+        moveTo(4f, 16f)
+        lineTo(4f, 5f)
+        curveTo(4.0, 4.45, 4.45, 4.0, 5.0, 4.0)
+        lineTo(16f, 4f)
+    }
+
+    private val checkPath = Path2D.Float().apply {
+        moveTo(20f, 6f)
+        lineTo(9f, 17f)
+        lineTo(4f, 12f)
+    }
+
+    private inline fun withMatrix(g2: Graphics2D, cx: Int, cy: Int, size: Int, block: () -> Unit) {
+        val oldTransform = g2.transform
+        val oldStroke = g2.stroke
+        g2.translate(cx.toDouble(), cy.toDouble())
+        val s = size.toDouble() / 24.0
+        g2.scale(s, s)
+        g2.translate(-12.0, -12.0)
+        block()
+        g2.transform = oldTransform
+        g2.stroke = oldStroke
+    }
+
     fun drawShield(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color, fill: Boolean = true) {
-        val half = size / 2.0
-        val p = Path2D.Double().apply {
-            moveTo(cx.toDouble(), cy - half * 0.85)
-            lineTo(cx + half * 0.75, cy - half * 0.65)
-            curveTo(cx + half * 0.85, cy + half * 0.1, cx + half * 0.45, cy + half * 0.65, cx.toDouble(), cy + half * 0.9)
-            curveTo(cx - half * 0.45, cy + half * 0.65, cx - half * 0.85, cy + half * 0.1, cx - half * 0.75, cy - half * 0.65)
-            closePath()
-        }
-        g2.color = color
-        if (fill) {
-            g2.fill(p)
-        } else {
-            val oldStroke = g2.stroke
-            g2.stroke = BasicStroke((size * 0.12f).coerceAtLeast(1.5f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
-            g2.draw(p)
-            g2.stroke = oldStroke
+        withMatrix(g2, cx, cy, size) {
+            if (fill) {
+                g2.color = Color(color.red, color.green, color.blue, 38)
+                g2.fill(shieldPath)
+            }
+            g2.color = color
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(shieldPath)
         }
     }
 
     fun drawBolt(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
-        val half = size / 2.0
-        val p = Path2D.Double().apply {
-            moveTo(cx + half * 0.1, cy - half * 0.9)
-            lineTo(cx - half * 0.65, cy + half * 0.05)
-            lineTo(cx - half * 0.05, cy + half * 0.05)
-            lineTo(cx - half * 0.25, cy + half * 0.9)
-            lineTo(cx + half * 0.65, cy - half * 0.05)
-            lineTo(cx + half * 0.05, cy - half * 0.05)
-            closePath()
+        withMatrix(g2, cx, cy, size) {
+            g2.color = Color(color.red, color.green, color.blue, 45)
+            g2.fill(boltPath)
+            g2.color = color
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(boltPath)
         }
-        g2.color = color
-        g2.fill(p)
     }
 
     fun drawLock(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
-        val half = size / 2.0
-        val oldStroke = g2.stroke
-        g2.color = color
-        g2.stroke = BasicStroke((size * 0.12f).coerceAtLeast(1.5f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
-        g2.drawArc((cx - half * 0.4).toInt(), (cy - half * 0.85).toInt(), (half * 0.8).toInt(), (half * 0.8).toInt(), 0, 180)
-        g2.fillRoundRect((cx - half * 0.65).toInt(), (cy - half * 0.15).toInt(), (half * 1.3).toInt(), (half * 0.9).toInt(), (size * 0.2).toInt(), (size * 0.2).toInt())
-        g2.color = Color(7, 11, 20)
-        g2.fillOval(cx - 2, (cy + half * 0.25).toInt() - 2, 4, 4)
-        g2.stroke = oldStroke
+        withMatrix(g2, cx, cy, size) {
+            g2.color = Color(color.red, color.green, color.blue, 35)
+            g2.fill(lockBodyRect)
+            g2.color = color
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(lockShacklePath)
+            g2.draw(lockBodyRect)
+            g2.draw(Line2D.Float(12f, 15f, 12f, 18f))
+        }
     }
 
     fun drawGamepad(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
-        val half = size / 2.0
-        g2.color = color
-        g2.fillRoundRect((cx - half * 0.85).toInt(), (cy - half * 0.45).toInt(), (half * 1.7).toInt(), (half * 1.0).toInt(), (size * 0.25).toInt(), (size * 0.25).toInt())
-        g2.color = Color(7, 11, 20)
-        val pw = (size * 0.06).toInt().coerceAtLeast(2)
-        val pl = (size * 0.2).toInt().coerceAtLeast(4)
-        g2.fillRect((cx - half * 0.5).toInt() - pw / 2, (cy + half * 0.05).toInt() - pl / 2, pw, pl)
-        g2.fillRect((cx - half * 0.5).toInt() - pl / 2, (cy + half * 0.05).toInt() - pw / 2, pl, pw)
-        val btnDot = (size * 0.1).toInt().coerceAtLeast(2)
-        g2.fillOval((cx + half * 0.5).toInt() - btnDot / 2, (cy - half * 0.05).toInt() - btnDot / 2, btnDot, btnDot)
-        g2.fillOval((cx + half * 0.5).toInt() - btnDot / 2, (cy + half * 0.2).toInt() - btnDot / 2, btnDot, btnDot)
-        g2.fillOval((cx + half * 0.35).toInt() - btnDot / 2, (cy + half * 0.07).toInt() - btnDot / 2, btnDot, btnDot)
-        g2.fillOval((cx + half * 0.65).toInt() - btnDot / 2, (cy + half * 0.07).toInt() - btnDot / 2, btnDot, btnDot)
+        withMatrix(g2, cx, cy, size) {
+            g2.color = Color(color.red, color.green, color.blue, 35)
+            g2.fill(gamepadBodyRect)
+            g2.color = color
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(gamepadBodyRect)
+            // D-Pad Cross
+            g2.draw(Line2D.Float(6.5f, 12f, 10.5f, 12f))
+            g2.draw(Line2D.Float(8.5f, 10f, 8.5f, 14f))
+            // Action Buttons
+            g2.color = color
+            g2.fill(Ellipse2D.Float(14.3f, 10.8f, 2.4f, 2.4f))
+            g2.fill(Ellipse2D.Float(16.8f, 8.8f, 2.4f, 2.4f))
+        }
+    }
+
+    fun drawGlobe(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        withMatrix(g2, cx, cy, size) {
+            g2.color = color
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(globeOval)
+            g2.draw(Line2D.Float(2f, 12f, 22f, 12f))
+            g2.draw(globeMeridianPath)
+        }
     }
 
     fun drawPulse(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
-        val half = size / 2.0
-        val oldStroke = g2.stroke
-        g2.color = color
-        g2.stroke = BasicStroke((size * 0.12f).coerceAtLeast(1.5f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
-        val p = Path2D.Double().apply {
-            moveTo(cx - half * 0.9, cy.toDouble())
-            lineTo(cx - half * 0.4, cy.toDouble())
-            lineTo(cx - half * 0.2, cy - half * 0.7)
-            lineTo(cx + half * 0.15, cy + half * 0.7)
-            lineTo(cx + half * 0.35, cy - half * 0.25)
-            lineTo(cx + half * 0.5, cy.toDouble())
-            lineTo(cx + half * 0.9, cy.toDouble())
+        withMatrix(g2, cx, cy, size) {
+            g2.color = color
+            g2.stroke = BasicStroke(2.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(pulsePath)
         }
-        g2.draw(p)
-        g2.stroke = oldStroke
     }
 
     fun drawPower(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
-        val r = (size * 0.36).toInt()
-        val oldStroke = g2.stroke
-        g2.color = color
-        g2.stroke = BasicStroke((size * 0.13f).coerceAtLeast(2f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
-        g2.drawArc(cx - r, cy - r, r * 2, r * 2, -35, 250)
-        g2.drawLine(cx, (cy - r * 1.15).toInt(), cx, (cy - r * 0.2).toInt())
-        g2.stroke = oldStroke
+        withMatrix(g2, cx, cy, size) {
+            g2.color = color
+            g2.stroke = BasicStroke(2.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(powerArc)
+            g2.draw(Line2D.Float(12f, 3f, 12f, 11f))
+        }
     }
 
     fun drawTerminal(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
-        val half = size / 2.0
-        val oldStroke = g2.stroke
-        g2.color = color
-        g2.stroke = BasicStroke((size * 0.1f).coerceAtLeast(1.5f), BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
-        g2.drawRoundRect((cx - half * 0.85).toInt(), (cy - half * 0.7).toInt(), (half * 1.7).toInt(), (half * 1.4).toInt(), (size * 0.15).toInt(), (size * 0.15).toInt())
-        val p = Path2D.Double().apply {
-            moveTo(cx - half * 0.45, cy - half * 0.3)
-            lineTo(cx - half * 0.15, cy.toDouble())
-            lineTo(cx - half * 0.45, cy + half * 0.3)
+        withMatrix(g2, cx, cy, size) {
+            g2.color = color
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(terminalChevron)
+            g2.draw(Line2D.Float(12f, 19f, 20f, 19f))
         }
-        g2.draw(p)
-        g2.drawLine(cx, (cy + half * 0.3).toInt(), (cx + half * 0.4).toInt(), (cy + half * 0.3).toInt())
-        g2.stroke = oldStroke
+    }
+
+    fun drawCopy(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        withMatrix(g2, cx, cy, size) {
+            g2.color = color
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(copyBackPath)
+            g2.draw(copyFrontRect)
+        }
+    }
+
+    fun drawCheck(g2: Graphics2D, cx: Int, cy: Int, size: Int, color: Color) {
+        withMatrix(g2, cx, cy, size) {
+            g2.color = color
+            g2.stroke = BasicStroke(2.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.draw(checkPath)
+        }
     }
 }
 
@@ -3421,7 +3505,7 @@ class ModernStatCard(val iconType: Int, title: String, val heroColor: Color) : J
             isOpaque = false
             val iconPanel = object : JPanel() {
                 init {
-                    preferredSize = Dimension(12, 12)
+                    preferredSize = Dimension(16, 16)
                     isOpaque = false
                 }
                 override fun paintComponent(g: Graphics) {
@@ -3429,10 +3513,10 @@ class ModernStatCard(val iconType: Int, title: String, val heroColor: Color) : J
                     val g2 = g.create() as Graphics2D
                     g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
                     when (iconType) {
-                        0 -> SwingVectorIcons.drawBolt(g2, 6, 6, 12, heroColor)
-                        1 -> SwingVectorIcons.drawShield(g2, 6, 6, 12, heroColor, fill = false)
-                        2 -> SwingVectorIcons.drawGamepad(g2, 6, 6, 12, heroColor)
-                        else -> SwingVectorIcons.drawLock(g2, 6, 6, 12, heroColor)
+                        0 -> SwingVectorIcons.drawBolt(g2, 8, 8, 16, heroColor)
+                        1 -> SwingVectorIcons.drawLock(g2, 8, 8, 16, heroColor)
+                        2 -> SwingVectorIcons.drawGamepad(g2, 8, 8, 16, heroColor)
+                        else -> SwingVectorIcons.drawGlobe(g2, 8, 8, 16, heroColor)
                     }
                     g2.dispose()
                 }

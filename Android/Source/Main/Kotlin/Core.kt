@@ -22,6 +22,8 @@ import android.net.http.HttpEngine
 import android.content.Context
 import android.content.Intent
 import android.app.Activity
+import android.app.AlertDialog
+import android.view.HapticFeedbackConstants
 import android.app.Application
 import android.app.Notification
 import android.app.NotificationChannel
@@ -3571,165 +3573,206 @@ internal object ActiveBridgeHolder {
     @Volatile var current: TunBridge? = null
 }
 
-// Modern Vector Icon Renderer (Pure Canvas Path - NO Emojis)
+// Modern Vector Icon Renderer (Pure Canvas Path - Standard 24x24 Lucide / Feather Vector Geometry)
 internal object AndroidVectorIcons {
+    // 24x24 standard vector paths (Lucide specifications)
+    // Preallocated once — zero memory allocations during Canvas onDraw!
+    private val shieldPath = Path().apply {
+        // M12 2L20 5V12C20 18 12 22 12 22C12 22 4 18 4 12V5L12 2Z
+        moveTo(12f, 2f)
+        lineTo(20f, 5f)
+        lineTo(20f, 12f)
+        cubicTo(20f, 18f, 12f, 22f, 12f, 22f)
+        cubicTo(12f, 22f, 4f, 18f, 4f, 12f)
+        lineTo(4f, 5f)
+        close()
+    }
+
+    private val boltPath = Path().apply {
+        // M13 2L3 14H12L11 22L21 10H12L13 2Z
+        moveTo(13f, 2f)
+        lineTo(3f, 14f)
+        lineTo(12f, 14f)
+        lineTo(11f, 22f)
+        lineTo(21f, 10f)
+        lineTo(12f, 10f)
+        close()
+    }
+
+    private val lockShacklePath = Path().apply {
+        moveTo(7f, 11f)
+        lineTo(7f, 7f)
+        cubicTo(7f, 4.24f, 9.24f, 2f, 12f, 2f)
+        cubicTo(14.76f, 2f, 17f, 4.24f, 17f, 7f)
+        lineTo(17f, 11f)
+    }
+    private val lockBodyRect = RectF(4f, 11f, 20f, 22f)
+
+    private val gamepadBodyRect = RectF(2f, 6f, 22f, 18f)
+
+    private val globeOvalRect = RectF(2f, 2f, 22f, 22f)
+    private val globeMeridianPath = Path().apply {
+        moveTo(12f, 2f)
+        cubicTo(6.5f, 2f, 5.5f, 6.5f, 5.5f, 12f)
+        cubicTo(5.5f, 17.5f, 6.5f, 22f, 12f, 22f)
+        cubicTo(17.5f, 22f, 18.5f, 17.5f, 18.5f, 12f)
+        cubicTo(18.5f, 6.5f, 17.5f, 2f, 12f, 2f)
+        close()
+    }
+
+    private val pulsePath = Path().apply {
+        // M22 12H18L15 21L9 3L6 12H2
+        moveTo(2f, 12f)
+        lineTo(6f, 12f)
+        lineTo(9f, 3f)
+        lineTo(15f, 21f)
+        lineTo(18f, 12f)
+        lineTo(22f, 12f)
+    }
+
+    private val powerArcRect = RectF(4f, 4f, 20f, 20f)
+
+    private val terminalChevron = Path().apply {
+        moveTo(4f, 17f)
+        lineTo(10f, 12f)
+        lineTo(4f, 7f)
+    }
+
+    private val copyFrontRect = RectF(8f, 8f, 21f, 21f)
+    private val copyBackPath = Path().apply {
+        moveTo(4f, 16f)
+        lineTo(4f, 5f)
+        cubicTo(4f, 4.45f, 4.45f, 4f, 5f, 4f)
+        lineTo(16f, 4f)
+    }
+
+    private val checkPath = Path().apply {
+        moveTo(20f, 6f)
+        lineTo(9f, 17f)
+        lineTo(4f, 12f)
+    }
+
+    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+
+    private inline fun withMatrix(canvas: Canvas, cx: Float, cy: Float, size: Float, block: () -> Unit) {
+        canvas.save()
+        canvas.translate(cx, cy)
+        val s = size / 24f
+        canvas.scale(s, s)
+        canvas.translate(-12f, -12f)
+        block()
+        canvas.restore()
+    }
+
     fun drawShield(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int, fill: Boolean = true) {
-        val half = size / 2f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = if (fill) Paint.Style.FILL else Paint.Style.STROKE
-            strokeWidth = size * 0.12f
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
+        withMatrix(canvas, cx, cy, size) {
+            if (fill) {
+                fillPaint.color = Color.argb(38, Color.red(color), Color.green(color), Color.blue(color))
+                canvas.drawPath(shieldPath, fillPaint)
+            }
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2f
+            canvas.drawPath(shieldPath, strokePaint)
         }
-        val path = Path().apply {
-            moveTo(cx, cy - half * 0.85f)
-            lineTo(cx + half * 0.75f, cy - half * 0.65f)
-            cubicTo(cx + half * 0.85f, cy + half * 0.1f, cx + half * 0.45f, cy + half * 0.65f, cx, cy + half * 0.9f)
-            cubicTo(cx - half * 0.45f, cy + half * 0.65f, cx - half * 0.85f, cy + half * 0.1f, cx - half * 0.75f, cy - half * 0.65f)
-            close()
-        }
-        canvas.drawPath(path, paint)
     }
 
     fun drawBolt(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
-        val half = size / 2f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.FILL
+        withMatrix(canvas, cx, cy, size) {
+            fillPaint.color = Color.argb(45, Color.red(color), Color.green(color), Color.blue(color))
+            canvas.drawPath(boltPath, fillPaint)
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2f
+            canvas.drawPath(boltPath, strokePaint)
         }
-        val path = Path().apply {
-            moveTo(cx + half * 0.1f, cy - half * 0.9f)
-            lineTo(cx - half * 0.65f, cy + half * 0.05f)
-            lineTo(cx - half * 0.05f, cy + half * 0.05f)
-            lineTo(cx - half * 0.25f, cy + half * 0.9f)
-            lineTo(cx + half * 0.65f, cy - half * 0.05f)
-            lineTo(cx + half * 0.05f, cy - half * 0.05f)
-            close()
-        }
-        canvas.drawPath(path, paint)
     }
 
     fun drawLock(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
-        val half = size / 2f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.STROKE
-            strokeWidth = size * 0.12f
-            strokeCap = Paint.Cap.ROUND
+        withMatrix(canvas, cx, cy, size) {
+            fillPaint.color = Color.argb(35, Color.red(color), Color.green(color), Color.blue(color))
+            canvas.drawRoundRect(lockBodyRect, 2.5f, 2.5f, fillPaint)
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2f
+            canvas.drawPath(lockShacklePath, strokePaint)
+            canvas.drawRoundRect(lockBodyRect, 2.5f, 2.5f, strokePaint)
+            canvas.drawLine(12f, 15f, 12f, 18f, strokePaint)
         }
-        val shackle = Path().apply {
-            arcTo(RectF(cx - half * 0.4f, cy - half * 0.85f, cx + half * 0.4f, cy - half * 0.05f), 180f, 180f, false)
-        }
-        canvas.drawPath(shackle, paint)
-        paint.style = Paint.Style.FILL
-        val bodyRect = RectF(cx - half * 0.65f, cy - half * 0.15f, cx + half * 0.65f, cy + half * 0.75f)
-        canvas.drawRoundRect(bodyRect, size * 0.12f, size * 0.12f, paint)
-        paint.color = Color.parseColor("#070B14")
-        canvas.drawCircle(cx, cy + half * 0.25f, size * 0.09f, paint)
     }
 
     fun drawGamepad(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
-        val half = size / 2f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.FILL
+        withMatrix(canvas, cx, cy, size) {
+            fillPaint.color = Color.argb(35, Color.red(color), Color.green(color), Color.blue(color))
+            canvas.drawRoundRect(gamepadBodyRect, 4f, 4f, fillPaint)
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2f
+            canvas.drawRoundRect(gamepadBodyRect, 4f, 4f, strokePaint)
+            // D-Pad Cross
+            canvas.drawLine(6.5f, 12f, 10.5f, 12f, strokePaint)
+            canvas.drawLine(8.5f, 10f, 8.5f, 14f, strokePaint)
+            // Action Buttons
+            fillPaint.color = color
+            canvas.drawCircle(15.5f, 12f, 1.2f, fillPaint)
+            canvas.drawCircle(18f, 10f, 1.2f, fillPaint)
         }
-        val rect = RectF(cx - half * 0.85f, cy - half * 0.45f, cx + half * 0.85f, cy + half * 0.55f)
-        canvas.drawRoundRect(rect, size * 0.22f, size * 0.22f, paint)
-        paint.color = Color.parseColor("#070B14")
-        val plusW = size * 0.06f
-        val plusLen = size * 0.2f
-        canvas.drawRect(cx - half * 0.5f - plusW / 2, cy + half * 0.05f - plusLen / 2, cx - half * 0.5f + plusW / 2, cy + half * 0.05f + plusLen / 2, paint)
-        canvas.drawRect(cx - half * 0.5f - plusLen / 2, cy + half * 0.05f - plusW / 2, cx - half * 0.5f + plusLen / 2, cy + half * 0.05f + plusW / 2, paint)
-        canvas.drawCircle(cx + half * 0.5f, cy - half * 0.05f, size * 0.05f, paint)
-        canvas.drawCircle(cx + half * 0.5f, cy + half * 0.2f, size * 0.05f, paint)
-        canvas.drawCircle(cx + half * 0.35f, cy + half * 0.07f, size * 0.05f, paint)
-        canvas.drawCircle(cx + half * 0.65f, cy + half * 0.07f, size * 0.05f, paint)
+    }
+
+    fun drawGlobe(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
+        withMatrix(canvas, cx, cy, size) {
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2f
+            canvas.drawOval(globeOvalRect, strokePaint)
+            canvas.drawLine(2f, 12f, 22f, 12f, strokePaint)
+            canvas.drawPath(globeMeridianPath, strokePaint)
+        }
     }
 
     fun drawPulse(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
-        val half = size / 2f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.STROKE
-            strokeWidth = size * 0.12f
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
+        withMatrix(canvas, cx, cy, size) {
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2.2f
+            canvas.drawPath(pulsePath, strokePaint)
         }
-        val path = Path().apply {
-            moveTo(cx - half * 0.9f, cy)
-            lineTo(cx - half * 0.4f, cy)
-            lineTo(cx - half * 0.2f, cy - half * 0.7f)
-            lineTo(cx + half * 0.15f, cy + half * 0.7f)
-            lineTo(cx + half * 0.35f, cy - half * 0.25f)
-            lineTo(cx + half * 0.5f, cy)
-            lineTo(cx + half * 0.9f, cy)
-        }
-        canvas.drawPath(path, paint)
     }
 
     fun drawPower(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
-        val r = size * 0.36f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.STROKE
-            strokeWidth = size * 0.13f
-            strokeCap = Paint.Cap.ROUND
+        withMatrix(canvas, cx, cy, size) {
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2.5f
+            canvas.drawArc(powerArcRect, 55f, 250f, false, strokePaint)
+            canvas.drawLine(12f, 3f, 12f, 11f, strokePaint)
         }
-        val oval = RectF(cx - r, cy - r, cx + r, cy + r)
-        canvas.drawArc(oval, 55f, 250f, false, paint)
-        canvas.drawLine(cx, cy - r * 1.15f, cx, cy - r * 0.2f, paint)
     }
 
     fun drawTerminal(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
-        val half = size / 2f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.STROKE
-            strokeWidth = size * 0.1f
-            strokeCap = Paint.Cap.ROUND
+        withMatrix(canvas, cx, cy, size) {
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2f
+            canvas.drawPath(terminalChevron, strokePaint)
+            canvas.drawLine(12f, 19f, 20f, 19f, strokePaint)
         }
-        val rect = RectF(cx - half * 0.85f, cy - half * 0.7f, cx + half * 0.85f, cy + half * 0.7f)
-        canvas.drawRoundRect(rect, size * 0.15f, size * 0.15f, paint)
-        val p = Path().apply {
-            moveTo(cx - half * 0.45f, cy - half * 0.3f)
-            lineTo(cx - half * 0.15f, cy)
-            lineTo(cx - half * 0.45f, cy + half * 0.3f)
-        }
-        canvas.drawPath(p, paint)
-        canvas.drawLine(cx, cy + half * 0.3f, cx + half * 0.4f, cy + half * 0.3f, paint)
     }
 
     fun drawCopy(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
-        val half = size / 2f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.STROKE
-            strokeWidth = size * 0.1f
-            strokeCap = Paint.Cap.ROUND
+        withMatrix(canvas, cx, cy, size) {
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2f
+            canvas.drawPath(copyBackPath, strokePaint)
+            canvas.drawRoundRect(copyFrontRect, 2f, 2f, strokePaint)
         }
-        val rBack = RectF(cx - half * 0.35f, cy - half * 0.75f, cx + half * 0.75f, cy + half * 0.35f)
-        canvas.drawRoundRect(rBack, size * 0.1f, size * 0.1f, paint)
-        val rFront = RectF(cx - half * 0.75f, cy - half * 0.35f, cx + half * 0.35f, cy + half * 0.75f)
-        canvas.drawRoundRect(rFront, size * 0.1f, size * 0.1f, paint)
     }
 
     fun drawCheck(canvas: Canvas, cx: Float, cy: Float, size: Float, color: Int) {
-        val half = size / 2f
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
-            style = Paint.Style.STROKE
-            strokeWidth = size * 0.14f
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
+        withMatrix(canvas, cx, cy, size) {
+            strokePaint.color = color
+            strokePaint.strokeWidth = 2.5f
+            canvas.drawPath(checkPath, strokePaint)
         }
-        val path = Path().apply {
-            moveTo(cx - half * 0.7f, cy)
-            lineTo(cx - half * 0.15f, cy + half * 0.55f)
-            lineTo(cx + half * 0.75f, cy - half * 0.55f)
-        }
-        canvas.drawPath(path, paint)
     }
 }
 
@@ -3796,6 +3839,7 @@ class ModernPowerShieldView(context: Context) : View(context) {
     override fun performClick(): Boolean {
         super.performClick()
         playSoundEffect(android.view.SoundEffectConstants.CLICK)
+        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
         onToggleListener?.invoke()
         return true
     }
@@ -3803,27 +3847,52 @@ class ModernPowerShieldView(context: Context) : View(context) {
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                pressScale = 0.94f
-                invalidate()
-                return true
-            }
-            MotionEvent.ACTION_UP -> {
-                pressScale = 1.0f
-                invalidate()
                 val cx = width / 2f
                 val cy = height / 2f
-                val btnR = minOf(cx, cy) * 0.44f
+                val maxR = minOf(cx, cy) * 0.94f
+                val btnR = maxR * 0.58f
                 val dx = event.x - cx
                 val dy = event.y - cy
                 if (dx * dx + dy * dy <= (btnR * 1.35f) * (btnR * 1.35f)) {
-                    performClick()
+                    isPressed = true
+                    pressScale = 0.93f
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    invalidate()
+                    return true
                 }
-                return true
+                return false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (isPressed) {
+                    val cx = width / 2f
+                    val cy = height / 2f
+                    val maxR = minOf(cx, cy) * 0.94f
+                    val btnR = maxR * 0.58f
+                    val dx = event.x - cx
+                    val dy = event.y - cy
+                    if (dx * dx + dy * dy > (btnR * 1.65f) * (btnR * 1.65f)) {
+                        isPressed = false
+                        pressScale = 1.0f
+                        parent?.requestDisallowInterceptTouchEvent(false)
+                        invalidate()
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                if (isPressed) {
+                    isPressed = false
+                    pressScale = 1.0f
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    invalidate()
+                    performClick()
+                    return true
+                }
             }
             MotionEvent.ACTION_CANCEL -> {
+                isPressed = false
                 pressScale = 1.0f
+                parent?.requestDisallowInterceptTouchEvent(false)
                 invalidate()
-                return true
             }
         }
         return super.onTouchEvent(event)
@@ -3833,7 +3902,7 @@ class ModernPowerShieldView(context: Context) : View(context) {
         super.onDraw(canvas)
         val cx = width / 2f
         val cy = height / 2f
-        val maxR = minOf(cx, cy) * 0.95f
+        val maxR = minOf(cx, cy) * 0.94f
         if (maxR <= 0f) return
 
         val density = resources.displayMetrics.density
@@ -3841,23 +3910,33 @@ class ModernPowerShieldView(context: Context) : View(context) {
         val r = Color.red(baseColor)
         val g = Color.green(baseColor)
         val b = Color.blue(baseColor)
+        val btnR = maxR * 0.58f
 
         // 1) Concentric expanding radar pulse rings
-        val waveCount = if (isActive) 3 else 1
-        for (i in 0 until waveCount) {
-            val phase = (pulseFraction + i * (1f / waveCount)) % 1f
-            val ringR = maxR * (0.48f + phase * 0.52f)
-            val alpha = ((1f - phase) * (if (isActive) 140 else 40)).toInt().coerceIn(0, 255)
+        if (isActive) {
+            val waveCount = 3
+            for (i in 0 until waveCount) {
+                val phase = (pulseFraction + i * (1f / waveCount)) % 1f
+                val ringR = btnR + (maxR - btnR) * phase
+                val alpha = ((1f - phase) * 160).toInt().coerceIn(0, 255)
+                ringPaint.color = Color.argb(alpha, r, g, b)
+                ringPaint.strokeWidth = (2.8f - phase * 1.4f) * density
+                canvas.drawCircle(cx, cy, ringR, ringPaint)
+            }
+        } else {
+            // Gentle breathing wave when idle
+            val ringR = btnR + (maxR - btnR) * 0.35f * pulseFraction
+            val alpha = ((1f - pulseFraction) * 50).toInt().coerceIn(0, 255)
             ringPaint.color = Color.argb(alpha, r, g, b)
-            ringPaint.strokeWidth = (2.5f - phase * 1.2f) * density
+            ringPaint.strokeWidth = 1.5f * density
             canvas.drawCircle(cx, cy, ringR, ringPaint)
         }
 
         // 2) Orbital reticle / rotating dashed cyber arc
         if (isActive) {
-            val reticleR = maxR * 0.52f
-            ringPaint.color = Color.argb(160, r, g, b)
-            ringPaint.strokeWidth = 2f * density
+            val reticleR = btnR * 1.15f
+            ringPaint.color = Color.argb(175, r, g, b)
+            ringPaint.strokeWidth = 2.2f * density
             ringPaint.pathEffect = orbitalDash
             orbitalRect.set(cx - reticleR, cy - reticleR, cx + reticleR, cy + reticleR)
             canvas.save()
@@ -3871,13 +3950,11 @@ class ModernPowerShieldView(context: Context) : View(context) {
         canvas.save()
         canvas.scale(pressScale, pressScale, cx, cy)
 
-        val btnR = maxR * 0.44f
-
         // Ambient glow
-        val auraR = btnR * 1.25f
+        val auraR = btnR * 1.3f
         auraPaint.shader = RadialGradient(
             cx, cy, auraR,
-            Color.argb(if (isActive) 90 else 30, r, g, b),
+            Color.argb(if (isActive) 95 else 30, r, g, b),
             Color.TRANSPARENT,
             Shader.TileMode.CLAMP
         )
@@ -3888,13 +3965,13 @@ class ModernPowerShieldView(context: Context) : View(context) {
         buttonPaint.shader = if (isActive) {
             LinearGradient(
                 cx, cy - btnR, cx, cy + btnR,
-                Color.parseColor("#059669"), Color.parseColor("#10B981"),
+                Color.parseColor("#064E3B"), Color.parseColor("#059669"),
                 Shader.TileMode.CLAMP
             )
         } else {
             LinearGradient(
                 cx, cy - btnR, cx, cy + btnR,
-                Color.parseColor("#1E293B"), Color.parseColor("#0F172A"),
+                Color.parseColor("#0E1626"), Color.parseColor("#152238"),
                 Shader.TileMode.CLAMP
             )
         }
@@ -3902,25 +3979,25 @@ class ModernPowerShieldView(context: Context) : View(context) {
         buttonPaint.shader = null
 
         // Button border
-        ringPaint.color = if (isActive) Color.parseColor("#34D399") else Color.parseColor("#334155")
-        ringPaint.strokeWidth = 2.5f * density
+        ringPaint.color = if (isActive) Color.parseColor("#34D399") else Color.parseColor("#38BDF8")
+        ringPaint.strokeWidth = (if (isActive) 2.8f else 2.0f) * density
         canvas.drawCircle(cx, cy, btnR, ringPaint)
 
-        // Center Vector Power Icon
-        val iconSize = btnR * 0.62f
+        // Center Vector Power Icon (official Lucide geometry)
+        val iconSize = btnR * 0.54f
         val iconColor = if (isActive) Color.WHITE else Color.parseColor("#38BDF8")
-        AndroidVectorIcons.drawPower(canvas, cx, cy - btnR * 0.22f, iconSize, iconColor)
+        AndroidVectorIcons.drawPower(canvas, cx, cy - btnR * 0.16f, iconSize, iconColor)
 
         // Status text inside button
-        textPaint.textSize = 10f * density
-        textPaint.color = if (isActive) Color.WHITE else Color.parseColor("#94A3B8")
-        val statusText = if (isActive) "DEVREDE" else "KAPALI"
-        canvas.drawText(statusText, cx, cy + btnR * 0.36f, textPaint)
+        textPaint.textSize = 12f * density
+        textPaint.color = if (isActive) Color.WHITE else Color.parseColor("#F1F5F9")
+        val statusText = if (isActive) "ENGELSİZ AKTİF" else "DOKUN VE BAĞLAN"
+        canvas.drawText(statusText, cx, cy + btnR * 0.38f, textPaint)
 
-        subTextPaint.textSize = 8f * density
-        subTextPaint.color = if (isActive) Color.parseColor("#D1FAE5") else Color.parseColor("#64748B")
-        val subText = if (isActive) "DOKUN VE DURDUR" else "DOKUN VE BAĞLAN"
-        canvas.drawText(subText, cx, cy + btnR * 0.55f, subTextPaint)
+        subTextPaint.textSize = 8.5f * density
+        subTextPaint.color = if (isActive) Color.parseColor("#6EE7B7") else Color.parseColor("#64748B")
+        val subText = if (isActive) "SİSTEM GENELİ VPN" else "Korumasız Ağ"
+        canvas.drawText(subText, cx, cy + btnR * 0.58f, subTextPaint)
 
         canvas.restore()
     }
@@ -4122,7 +4199,7 @@ class ModernMetricCard(context: Context, val iconType: Int, val titleText: Strin
         }
         val iconView = object : View(context) {
             init {
-                layoutParams = LayoutParams(dp(14), dp(14)).apply {
+                layoutParams = LayoutParams(dp(18), dp(18)).apply {
                     setMargins(0, 0, dp(6), 0)
                 }
             }
@@ -4131,9 +4208,9 @@ class ModernMetricCard(context: Context, val iconType: Int, val titleText: Strin
                 val s = minOf(width, height).toFloat()
                 when (iconType) {
                     0 -> AndroidVectorIcons.drawBolt(c, s / 2, s / 2, s, heroColor)
-                    1 -> AndroidVectorIcons.drawShield(c, s / 2, s / 2, s, heroColor, fill = false)
+                    1 -> AndroidVectorIcons.drawLock(c, s / 2, s / 2, s, heroColor)
                     2 -> AndroidVectorIcons.drawGamepad(c, s / 2, s / 2, s, heroColor)
-                    else -> AndroidVectorIcons.drawLock(c, s / 2, s / 2, s, heroColor)
+                    else -> AndroidVectorIcons.drawGlobe(c, s / 2, s / 2, s, heroColor)
                 }
             }
         }
@@ -4370,7 +4447,9 @@ class MainActivity : Activity() {
 
         // Animated Power Shield Hero Button
         powerShieldView = ModernPowerShieldView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(175))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(230)).apply {
+                setMargins(0, dp(4), 0, dp(6))
+            }
             onToggleListener = { toggleDesync() }
         }
         panelControl.addView(powerShieldView)
@@ -4424,15 +4503,18 @@ class MainActivity : Activity() {
         // Quick Bottom Action Button
         heroActionButton = Button(this).apply {
             text = "KORUMAYI BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
-            textSize = 12.5f
+            textSize = 13.5f
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             setTextColor(Color.parseColor("#070B14"))
-            background = createCardShape("#10B981", cornerDp = 12f)
-            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = createCardShape("#10B981", cornerDp = 14f)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, dp(10), 0, dp(6))
+                setMargins(0, dp(12), 0, dp(10))
             }
-            setOnClickListener { toggleDesync() }
+            setOnClickListener {
+                it.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                toggleDesync()
+            }
         }
         panelControl.addView(heroActionButton)
 
@@ -4707,9 +4789,9 @@ class MainActivity : Activity() {
             tabBtnLog.background = if (index == 2) activeBg else inactiveBg
             tabBtnLog.setTextColor(if (index == 2) Color.WHITE else Color.parseColor("#64748B"))
 
-            panelControl.visibility = if (index == 0) View.VISIBLE else View.GONE
-            panelDiag.visibility = if (index == 1) View.VISIBLE else View.GONE
-            panelLog.visibility = if (index == 2) View.VISIBLE else View.GONE
+            scrollControl.visibility = if (index == 0) View.VISIBLE else View.GONE
+            scrollDiag.visibility = if (index == 1) View.VISIBLE else View.GONE
+            scrollLog.visibility = if (index == 2) View.VISIBLE else View.GONE
 
             if (index == 2) refreshLogViewer()
         }
@@ -4918,6 +5000,61 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun checkVpnConsentAndProceed(onConsent: () -> Unit) {
+        val prefs = getSharedPreferences("thedpi_prefs", Context.MODE_PRIVATE)
+        val consent = prefs.getBoolean("vpn_prominent_disclosure_accepted", false)
+        if (consent) {
+            onConsent()
+            return
+        }
+
+        // Google Play VpnService Prominent Disclosure & Consent Dialog
+        val pad = (18 * resources.displayMetrics.density).toInt()
+        val dialogView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+            background = createCardShape("#0E1626", borderColor = "#1E293B", cornerDp = 16f)
+
+            val titleRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, (10 * resources.displayMetrics.density).toInt())
+            }
+            val titleText = TextView(context).apply {
+                text = "VpnService ve Veri Güvenliği"
+                textSize = 15f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                setTextColor(Color.WHITE)
+            }
+            titleRow.addView(titleText)
+            addView(titleRow)
+
+            val desc = TextView(context).apply {
+                text = "The DPI, internet trafiğinizdeki sansür, DPI (Derin Paket İnceleme) bloklamaları ve haksız erişim engellerini aşabilmek için Android VpnService API'sini kullanır.\n\n" +
+                        "• Sıfır Veri Kaydı (No-Logs): Kişisel bilgileriniz, IP adresiniz veya gezinme geçmişiniz asla toplanmaz, kaydedilmez ve üçüncü taraflarla paylaşılmaz.\n" +
+                        "• Yerel Paket İşleme: Trafik uzak bir VPN sunucusuna aktarılmaz; paket parçalama doğrudan cihazınız içinde gerçekleşir.\n" +
+                        "• Şifreli DNS: DNS sorgularınız operatör sansürüne karşı şifreli DoH üzerinden korunur."
+                textSize = 11.5f
+                setTextColor(Color.parseColor("#94A3B8"))
+                setLineSpacing(4f * resources.displayMetrics.density, 1f)
+            }
+            addView(desc)
+        }
+
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setView(dialogView)
+            .setPositiveButton("Kabul Et ve Başlat") { d, _ ->
+                prefs.edit().putBoolean("vpn_prominent_disclosure_accepted", true).apply()
+                d.dismiss()
+                onConsent()
+            }
+            .setNegativeButton("İptal") { d, _ ->
+                d.dismiss()
+            }
+            .setCancelable(false)
+            .show()
+    }
+
     private fun toggleDesync() {
         val s = session ?: run {
             CrashLogger.log("MainActivity", "toggleDesync: session null!")
@@ -4948,20 +5085,23 @@ class MainActivity : Activity() {
             }
             return
         }
-        val prepIntent = try {
-            VpnService.prepare(this)
-        } catch (t: Throwable) {
-            CrashLogger.log("MainActivity", "VpnService.prepare hatası: ${t.message}", t)
-            null
-        }
-        if (prepIntent != null) {
-            CrashLogger.log("MainActivity", "VPN hazırlık intent'i başlatılıyor...")
-            diagStatus.text = "Sistem geneli DPI aşma için VPN izni bekleniyor…"
-            @Suppress("DEPRECATION")
-            startActivityForResult(prepIntent, REQ_VPN)
-        } else {
-            CrashLogger.log("MainActivity", "VPN hazırlık intent'i null (izin zaten var).")
-            activateEngelsizMod(vpnGranted = true)
+
+        checkVpnConsentAndProceed {
+            val prepIntent = try {
+                VpnService.prepare(this)
+            } catch (t: Throwable) {
+                CrashLogger.log("MainActivity", "VpnService.prepare hatası: ${t.message}", t)
+                null
+            }
+            if (prepIntent != null) {
+                CrashLogger.log("MainActivity", "VPN hazırlık intent'i başlatılıyor...")
+                diagStatus.text = "Sistem geneli DPI aşma için VPN izni bekleniyor…"
+                @Suppress("DEPRECATION")
+                startActivityForResult(prepIntent, REQ_VPN)
+            } else {
+                CrashLogger.log("MainActivity", "VPN hazırlık intent'i null (izin zaten var).")
+                activateEngelsizMod(vpnGranted = true)
+            }
         }
     }
 
