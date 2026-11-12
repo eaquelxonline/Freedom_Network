@@ -32,7 +32,7 @@ jobs:
       - name: Rust toolchain (pinned by Native/rust-toolchain.toml)
         run: |
           rustup toolchain install 1.99.1 --profile minimal -c clippy,rustfmt -t aarch64-linux-android -t x86_64-pc-windows-msvc -t x86_64-pc-windows-gnu
-          cargo --manifest-path Native/Cargo.toml --version
+          rustc +1.99.1 --version
 
       - name: Android SDK platform 37.0 and NDK 30
         run: |
@@ -76,7 +76,7 @@ jobs:
       - name: Rust toolchain (pinned by Native/rust-toolchain.toml)
         run: |
           rustup toolchain install 1.99.1 --profile minimal -c clippy,rustfmt -t aarch64-linux-android -t x86_64-pc-windows-msvc -t x86_64-pc-windows-gnu
-          cargo --manifest-path Native/Cargo.toml --version
+          rustc +1.99.1 --version
 
       - name: Test on real Windows and package
         run: ./gradlew --no-daemon "-Pthedpi.windowsOnly=true" :check :Windows:check :Windows:packageWindows
