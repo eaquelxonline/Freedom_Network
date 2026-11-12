@@ -3424,6 +3424,7 @@ pub mod desync {
                     while !stop_c.load(Ordering::Acquire) {
                         match listener.accept() {
                             Ok((client, _)) => {
+                                let _ = client.set_nonblocking(false);
                                 counters_c.connections.fetch_add(1, Ordering::Relaxed);
                                 let cfg_conn = cfg_c.clone();
                                 let cnt_conn = Arc::clone(&counters_c);
@@ -3485,6 +3486,7 @@ pub mod desync {
         cfg: &DesyncConfig,
         counters: &ProxyCounters,
     ) -> io::Result<()> {
+        let _ = client.set_nonblocking(false);
         client.set_read_timeout(Some(Duration::from_millis(3000)))?;
         client.set_write_timeout(Some(Duration::from_millis(3000)))?;
         let mut first = [0u8; 4096];
