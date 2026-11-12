@@ -2,8 +2,8 @@
 // Gradle 9.7.1 · AGP 9.3.1 · Kotlin 2.4.21 · Rust 1.99.1 · JDK 21 (build) · NDK 28.2.13676358
 plugins {
     base
-    id("com.android.application") version "9.3.1" apply false
-    id("org.jetbrains.kotlin.jvm") version "2.4.21" apply false
+    id("com.android.application") version "9.5.1" apply false
+    id("org.jetbrains.kotlin.jvm") version "2.5.0-RC" apply false
 }
 
 val nativeDir: Directory = layout.projectDirectory.dir("Native")

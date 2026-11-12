@@ -14,7 +14,7 @@ val isWindowsHost = System.getProperty("os.name").startsWith("Windows")
 kotlin {
     jvmToolchain(21)
     sourceSets {
-        named("main") { kotlin.setSrcDirs(listOf("Source/Main/Kotlin", "../Shared/Source/Main/Kotlin")) }
+        named("main") { kotlin.setSrcDirs(listOf("Source/Main/Kotlin")) }
         named("test") { kotlin.setSrcDirs(listOf("Source/Test/Kotlin")) }
     }
 }

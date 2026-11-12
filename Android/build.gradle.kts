@@ -11,7 +11,7 @@ val jniOut = layout.buildDirectory.dir("generated/jniLibs")
 android {
     namespace = "com.eaquelxonline.thedpi"
     compileSdk = 37
-    ndkVersion = "28.2.13676358"
+    ndkVersion = "30.0.16248370"
 
     defaultConfig {
         applicationId = "com.eaquelxonline.thedpi"
@@ -26,7 +26,7 @@ android {
         named("main") {
             manifest.srcFile("Source/Main/AndroidManifest.xml")
             kotlin.directories.clear()
-            kotlin.directories += listOf("Source/Main/Kotlin", "../Shared/Source/Main/Kotlin")
+            kotlin.directories += "Source/Main/Kotlin"
             java.directories.clear()
             res.directories.clear()
             res.directories += "Source/Main/Resources"
@@ -76,7 +76,7 @@ android {
         checkReleaseBuilds = true
         warningsAsErrors = true
         disable += setOf(
-            "SetTextI18n", // single Turkish catalogue shared with Windows lives in Shared/…/Bridge.kt (Text)
+            "SetTextI18n", // the single Turkish catalogue (object Text) is shared verbatim with the Windows module
             "ChromeOsAbiSupport", // arm64-v8a is the only in-scope ABI
             "AndroidGradlePluginVersion", "GradleDependency", "NewerVersionAvailable", // versions are pinned by the verified matrix
         )
