@@ -4852,6 +4852,7 @@ object NullIslandLocationShield {
     }
 
     @Suppress("DEPRECATION")
+    @android.annotation.SuppressLint("WrongConstant")
     private fun addAndPushProviderLegacy(lm: android.location.LocationManager, provider: String) {
         runCatching { lm.removeTestProvider(provider) }
         lm.addTestProvider(
@@ -5082,6 +5083,11 @@ class FreedomVpnService : VpnService() {
 
     private fun updateRouteNotification(routeLabel: String, masked: Boolean) {
         if (!running.get()) return
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
         val msg = if (masked) {
             "IP Gizli ($routeLabel) · DoH3 + Kalkan"
         } else {
