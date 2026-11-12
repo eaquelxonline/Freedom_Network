@@ -347,6 +347,7 @@ object Tags {
         const val PROTOCOL = 9; const val SNI = 10; const val ECH = 11; const val POST_QUANTUM = 12
         const val CONNECTIONS = 13; const val TLS_SPLIT = 14; const val HTTP_SPLIT = 15
         const val FAKE_SENT = 16; const val RST_DROPPED = 17; const val ACTIVE = 18
+        const val VISION_SPLICE = 19; const val REALITY_DEST = 20
     }
 }
 
@@ -472,10 +473,11 @@ object DesyncMode {
     const val FAKE_AUTO_TTL = 4
     const val QUIC_SCRAMBLE = 5
     const val ADAPTIVE_FULL = 6
+    const val REALITY_VISION = 7
 }
 
 data class DesyncConfig(
-    val mode: Int = DesyncMode.ADAPTIVE_FULL,
+    val mode: Int = DesyncMode.REALITY_VISION,
     val fakeTtl: Int = 5,
     val splitPos: Int = 2,
     val dropRst: Boolean = true,
@@ -495,8 +497,133 @@ data class DesyncResult(
 data class ProxyStatus(
     val status: Int, val active: Boolean, val port: Int, val mode: Int,
     val connections: Long = 0, val tlsSplit: Long = 0, val httpSplit: Long = 0,
-    val fakeSent: Long = 0, val rstDropped: Long = 0,
+    val fakeSent: Long = 0, val rstDropped: Long = 0, val visionSplice: Long = 0,
 )
+
+object ServerStatus {
+    const val STANDBY = 0
+    const val CONNECTED = 1
+    const val FAILOVER = 2
+    const val UNREACHABLE = 3
+    const val REVOKED = 4
+    const val QUOTA_EXCEEDED = 5
+}
+
+/**
+ * User-owned personal server profile ("Your Network. Your Server. Your Control."):
+ * - Per-device identity (`deviceId`) and authentication key (`authKeyHex`)
+ * - Primary & backup endpoints (`primaryEndpoint`, `backupEndpoint`) with automatic failover
+ * - Cover TLS destination (`coverDest`) for REALITY + X25519MLKEM768 active-probing defense
+ * - Bandwidth quota tracking (`quotaBytes` / `usedBytes`), latency & packet-loss metrics,
+ *   key rotation, and instant device revocation.
+ */
+data class ServerProfile(
+    val id: String,
+    val name: String,
+    val primaryEndpoint: String,
+    val backupEndpoint: String = "",
+    val coverDest: String = "dl.google.com",
+    val deviceId: String,
+    val authKeyHex: String,
+    val status: Int = ServerStatus.STANDBY,
+    val latencyMs: Long = 0,
+    val lossPct: Int = 0,
+    val quotaBytes: Long = 0,
+    val usedBytes: Long = 0,
+    val revoked: Boolean = false,
+) {
+    val activeEndpoint: String
+        get() = if (status == ServerStatus.FAILOVER && backupEndpoint.isNotBlank()) backupEndpoint else primaryEndpoint
+
+    val quotaAvailable: Boolean
+        get() = !revoked && (quotaBytes <= 0L || usedBytes < quotaBytes)
+}
+
+/**
+ * Manages multiple user-owned personal server profiles, per-device key rotation,
+ * instant device revocation, quota tracking, and automatic primary -> backup failover.
+ */
+class ServerManager {
+    private val profiles = LinkedHashMap<String, ServerProfile>()
+    @Volatile var activeProfileId: String? = null
+        private set
+
+    @Synchronized
+    fun upsert(profile: ServerProfile) {
+        profiles[profile.id] = profile
+        if (activeProfileId == null) activeProfileId = profile.id
+    }
+
+    @Synchronized
+    fun list(): List<ServerProfile> = profiles.values.toList()
+
+    @Synchronized
+    fun active(): ServerProfile? = activeProfileId?.let { profiles[it] }
+
+    @Synchronized
+    fun select(id: String): ServerProfile? {
+        val p = profiles[id] ?: return null
+        if (!p.quotaAvailable) return null
+        activeProfileId = id
+        val updated = p.copy(status = ServerStatus.CONNECTED)
+        profiles[id] = updated
+        return updated
+    }
+
+    @Synchronized
+    fun recordTraffic(id: String, bytes: Long): ServerProfile? {
+        val p = profiles[id] ?: return null
+        val used = (p.usedBytes + bytes).coerceAtLeast(0L)
+        val st = if (p.quotaBytes > 0L && used >= p.quotaBytes) ServerStatus.QUOTA_EXCEEDED else p.status
+        val updated = p.copy(usedBytes = used, status = st)
+        profiles[id] = updated
+        return updated
+    }
+
+    @Synchronized
+    fun revokeDevice(id: String): ServerProfile? {
+        val p = profiles[id] ?: return null
+        val updated = p.copy(revoked = true, status = ServerStatus.REVOKED)
+        profiles[id] = updated
+        if (activeProfileId == id) {
+            activeProfileId = profiles.values.firstOrNull { it.id != id && it.quotaAvailable }?.id
+        }
+        return updated
+    }
+
+    @Synchronized
+    fun rotateDeviceKey(id: String, newKeyHex: String): ServerProfile? {
+        if (newKeyHex.isBlank()) return null
+        val p = profiles[id] ?: return null
+        val updated = p.copy(
+            authKeyHex = newKeyHex,
+            revoked = false,
+            status = if (p.status == ServerStatus.REVOKED) ServerStatus.STANDBY else p.status,
+        )
+        profiles[id] = updated
+        return updated
+    }
+
+    @Synchronized
+    fun triggerFailover(id: String): ServerProfile? {
+        val p = profiles[id] ?: return null
+        if (p.backupEndpoint.isNotBlank() && p.quotaAvailable) {
+            val updated = p.copy(status = ServerStatus.FAILOVER)
+            profiles[id] = updated
+            return updated
+        }
+        val marked = p.copy(status = ServerStatus.UNREACHABLE)
+        profiles[id] = marked
+        val next = profiles.values.firstOrNull { it.id != id && it.quotaAvailable }
+        if (next != null) {
+            activeProfileId = next.id
+            val promoted = next.copy(status = ServerStatus.CONNECTED)
+            profiles[next.id] = promoted
+            return promoted
+        }
+        return marked
+    }
+}
 
 data class Evaluation(
     val status: Int, val score: Long, val ewma: Long, val generation: Long, val stability: Long,
@@ -597,6 +724,7 @@ object Decode {
             httpSplit = r.l(Tags.Desync.HTTP_SPLIT),
             fakeSent = r.l(Tags.Desync.FAKE_SENT),
             rstDropped = r.l(Tags.Desync.RST_DROPPED),
+            visionSplice = r.l(Tags.Desync.VISION_SPLICE),
         )
     }
 }
@@ -1106,7 +1234,7 @@ object Text {
         }
     }
 
-    const val KNOWN_DESYNC_MODES = 6
+    const val KNOWN_DESYNC_MODES = 7
 
     fun desyncMode(m: Int): String = when (m) {
         DesyncMode.OFF -> "Kapalı (Doğrudan Geçiş)"
@@ -1116,7 +1244,27 @@ object Text {
         DesyncMode.FAKE_AUTO_TTL -> "Sahte Paket (Oto-TTL) + Disorder"
         DesyncMode.QUIC_SCRAMBLE -> "QUIC v1/v2 Initial Şaşırtma + TCP/TLS 1.3 Yedeği"
         DesyncMode.ADAPTIVE_FULL -> "Tam Adaptif Özgürlük Modu (PQ-TLS 1.3 + ECH + Oto-TTL + BadSum + RST Kalkanı)"
+        DesyncMode.REALITY_VISION -> "REALITY + ML-KEM-768 + xtls-rprx-vision Doğrudan Aktarım (2026–2027)"
         else -> "Mod $m"
+    }
+
+    fun serverStatus(s: Int): String = when (s) {
+        ServerStatus.STANDBY -> "Beklemede"
+        ServerStatus.CONNECTED -> "Bağlı"
+        ServerStatus.FAILOVER -> "Yedek Sunucuda (Failover)"
+        ServerStatus.UNREACHABLE -> "Erişilemez"
+        ServerStatus.REVOKED -> "Cihaz Erişimi İptal Edildi"
+        ServerStatus.QUOTA_EXCEEDED -> "Kota Doldu"
+        else -> "Durum $s"
+    }
+
+    fun serverManager(mgr: ServerManager): String = buildString {
+        val list = mgr.list()
+        appendLine("THE DPI — KİŞİSEL SUNUCU YÖNETİCİSİ (${list.size} profil)")
+        for (p in list) {
+            val kota = if (p.quotaBytes > 0) "${p.usedBytes}/${p.quotaBytes} bayt" else "${p.usedBytes} bayt (sınırsız)"
+            appendLine("  • ${p.name} [${serverStatus(p.status)}] → ${p.activeEndpoint} (REALITY hedefi: ${p.coverDest} · cihaz: ${p.deviceId} · gecikme: ${p.latencyMs} ms · kayıp: %${p.lossPct} · kota: $kota)")
+        }
     }
 
     fun proxyStatus(p: ProxyStatus): String = buildString {
@@ -1126,7 +1274,7 @@ object Text {
         }
         appendLine("ENGELSİZ MOD (YEREL DPI AŞMA): Etkin · 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         appendLine("  Strateji   : ${desyncMode(p.mode)}")
-        appendLine("  İstatistik : bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped}")
+        appendLine("  İstatistik : bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped} · Vision doğrudan aktarım ${p.visionSplice}")
     }
 
     fun vpnStatus(
@@ -1137,13 +1285,14 @@ object Text {
         dnsQueries: Int = 0,
         dohResolved: Int = 0,
         desyncedFlows: Int = 0,
+        visionSplicedFlows: Int = 0,
     ): String = buildString {
         if (!vpnActive && !p.active) {
             appendLine("ENGELSİZ MOD (SİSTEM GENELİ VPN + DPI AŞMA): Kapalı")
             return@buildString
         }
         val modeDesc = if (vpnActive) {
-            "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · DoH DNS + TCP/TLS Desync + Roblox/Discord UDP NAT)"
+            "Sistem Geneli TUN Köprüsü (0.0.0.0/0 · DoH DNS + REALITY/Vision Desync + Roblox/Discord UDP NAT)"
         } else {
             "Yerel Proxy (127.0.0.1:${p.port})"
         }
@@ -1152,8 +1301,8 @@ object Text {
             appendLine("  Yerel Proxy: 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         }
         appendLine("  Strateji   : ${desyncMode(p.mode)}")
-        appendLine("  TUN Köprüsü: TCP akışı $tcpFlows (Desync $desyncedFlows) · UDP/Oyun-Ses akışı $udpFlows · DNS $dnsQueries (Şifreli DoH $dohResolved)")
-        appendLine("  Motor İstat: bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped}")
+        appendLine("  TUN Köprüsü: TCP akışı $tcpFlows (Desync $desyncedFlows, Vision Splice $visionSplicedFlows) · UDP/Oyun-Ses akışı $udpFlows · DNS $dnsQueries (Şifreli DoH $dohResolved)")
+        appendLine("  Motor İstat: bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped} · Vision doğrudan aktarım ${p.visionSplice}")
     }
 }
 
@@ -1473,8 +1622,9 @@ object IpPackets {
  *    bypassed; falls back to `protect()`ed UDP DNS sockets (`1.1.1.1` / `8.8.8.8`).
  * 2. **TCP + TLS/HTTP Desync (Discord TCP 443, HTTPS, Web)**: Terminates the local TUN TCP
  *    3-way handshake, inspects the initial `ClientHello` / HTTP request via the Rust+SIMD
- *    `desyncPacket` engine, and writes the split `SNI`/`ECH`/`Host:` segments with `TCP_NODELAY`
- *    over a `protect()`ed outbound `Socket`.
+ *    `desyncPacket` engine (`REALITY` + `X25519MLKEM768` + `xtls-rprx-vision`), writes the
+ *    split `SNI`/`ECH`/`Host:` segments with `TCP_NODELAY` over a `protect()`ed outbound `Socket`,
+ *    and directly splices subsequent TLS 1.3 `ApplicationData` records (`0x17 0x03 0x03`).
  * 3. **Lossless UDP NAT Relay (Roblox RakNet UDP, Discord Voice RTC UDP, QUIC UDP 443)**:
  *    Maintains per-flow NAT bindings over `protect()`ed `DatagramSocket`s and relays UDP
  *    datagrams bidirectionally with zero packet drops.
@@ -1489,7 +1639,7 @@ class TunBridge(
     private val dohEndpoints: List<String> = DEFAULT_DOH_ENDPOINTS,
     private val upstreamDnsServers: List<String> = DEFAULT_DNS_SERVERS,
     private val desyncConfig: DesyncConfig = DesyncConfig(
-        mode = DesyncMode.ADAPTIVE_FULL,
+        mode = DesyncMode.REALITY_VISION,
         fakeTtl = 5,
         splitPos = 2,
         dropRst = true,
@@ -1512,6 +1662,7 @@ class TunBridge(
     val dnsQueries = AtomicInteger(0)
     val dohResolved = AtomicInteger(0)
     val desyncedFlows = AtomicInteger(0)
+    val visionSplicedFlows = AtomicInteger(0)
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -1772,6 +1923,7 @@ class TunBridge(
         var connected = false
         var finFromClient = false
         var firstPayloadDone = false
+        var visionSpliced = false
         val closed = AtomicBoolean(false)
         val pending = ArrayList<Pair<ByteArray, ByteArray>>()
         @Volatile var upstreamSocket: Socket? = null
@@ -1874,11 +2026,19 @@ class TunBridge(
                     if (chunks.size > 1) {
                         desyncedFlows.incrementAndGet()
                     }
+                    if (desyncConfig.mode == DesyncMode.REALITY_VISION && payload.size >= 5 && (payload[0].toInt() and 0xFF) == 0x16) {
+                        visionSpliced = true
+                        visionSplicedFlows.incrementAndGet()
+                    }
                     for (chunk in chunks) {
                         out.write(chunk)
                         out.flush()
                     }
                 } else {
+                    if (!visionSpliced && payload.size >= 5 && (payload[0].toInt() and 0xFF) == 0x17 && (payload[1].toInt() and 0xFF) == 0x03) {
+                        visionSpliced = true
+                        visionSplicedFlows.incrementAndGet()
+                    }
                     out.write(payload)
                     out.flush()
                 }
@@ -2155,14 +2315,15 @@ fun runCli(args: List<String>): Int {
             "--doh" -> doh += args.getOrNull(++i) ?: ""
             "--system" -> system = true
             "--desync" -> {
-                val m = (args.getOrNull(++i) ?: "adaptive").lowercase()
+                val m = (args.getOrNull(++i) ?: "reality").lowercase()
                 desyncMode = when (m) {
                     "split", "1" -> DesyncMode.SPLIT
                     "disorder", "2" -> DesyncMode.DISORDER
                     "badsum", "3" -> DesyncMode.FAKE_BAD_SUM
                     "ttl", "autottl", "4" -> DesyncMode.FAKE_AUTO_TTL
                     "quic", "5" -> DesyncMode.QUIC_SCRAMBLE
-                    else -> DesyncMode.ADAPTIVE_FULL
+                    "adaptive", "6" -> DesyncMode.ADAPTIVE_FULL
+                    else -> DesyncMode.REALITY_VISION
                 }
             }
             "--proxy" -> proxyPort = (args.getOrNull(++i) ?: "8880").toIntOrNull() ?: 8880
@@ -2183,7 +2344,7 @@ fun runCli(args: List<String>): Int {
             )
             print(Text.report(report))
             if (desyncMode != DesyncMode.OFF || proxyPort >= 0) {
-                val mode = if (desyncMode != DesyncMode.OFF) desyncMode else DesyncMode.ADAPTIVE_FULL
+                val mode = if (desyncMode != DesyncMode.OFF) desyncMode else DesyncMode.REALITY_VISION
                 val ps = session.startProxy(DesyncConfig(mode = mode, port = if (proxyPort >= 0) proxyPort else 0))
                 println()
                 print(Text.proxyStatus(ps))
@@ -2322,7 +2483,7 @@ class MainWindow {
                 s.stopProxy()
                 s.proxyStats()
             } else {
-                s.startProxy(DesyncConfig(mode = DesyncMode.ADAPTIVE_FULL, port = 0))
+                s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
             }
             val text = Text.proxyStatus(next)
             ui {

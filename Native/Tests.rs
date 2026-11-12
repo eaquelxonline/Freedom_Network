@@ -3144,3 +3144,162 @@ fn api_desync_packet_and_proxy_lifecycle() {
 
     assert_eq!(api::destroy(h), code::OK);
 }
+
+#[test]
+fn reality_mlkem768_handshake_and_vision_flow_splice() {
+    let random = [0x33u8; 32];
+    let key = [0x77u8; 32];
+    let ch = desync::build_reality_mlkem768_client_hello(
+        "dl.google.com",
+        &random,
+        "android-pixel-9",
+        &key,
+    );
+    let (ext_rand, ext_sid, sni, pq) = desync::extract_reality_fields(&ch).expect("valid reality");
+    assert_eq!(ext_rand, random);
+    assert_eq!(sni, "dl.google.com");
+    assert!(pq, "must advertise X25519MLKEM768 (0x11ec)");
+    assert_eq!(
+        ext_sid,
+        desync::compute_reality_session_id(&random, "dl.google.com", "android-pixel-9", &key)
+    );
+
+    // Packet-plane RealityVision desynchronization
+    let src = Ipv4Addr::new(10, 215, 173, 1);
+    let dst = Ipv4Addr::new(162, 159, 135, 232);
+    let pkt = wrap_ipv4_tcp(src, dst, 51000, 443, 5000, 0x18, &ch);
+    let cfg = desync::DesyncConfig {
+        mode: desync::DesyncMode::RealityVision,
+        fake_ttl: 5,
+        split_pos: 2,
+        drop_spoofed_rst: true,
+        listen_port: 0,
+    };
+    let out = desync::desync_packet(&pkt, &cfg);
+    assert!(!out.dropped_inbound);
+    assert!(out.inspection.post_quantum);
+    assert!(out.packets.len() >= 4);
+
+    // VisionFlow transitions from HandshakePadding to DirectSplice on 0x17 0x03 0x03
+    let mut vision = desync::VisionFlow::new();
+    assert_eq!(vision.phase, desync::VisionPhase::HandshakePadding);
+    assert!(!vision.observe_chunk(&ch));
+    assert_eq!(vision.handshake_records, 1);
+    let app_data = [0x17, 0x03, 0x03, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'];
+    assert!(vision.observe_chunk(&app_data));
+    assert_eq!(vision.phase, desync::VisionPhase::DirectSplice);
+    assert_eq!(vision.spliced_bytes, app_data.len() as u64);
+}
+
+#[test]
+fn personal_relay_server_reality_active_probing_auth_revocation_quota_and_failover() {
+    use crate::relay::{
+        PersonalRelayServer, ServerProfile, ServerStatus, connect_with_failover, decode_ip_capsule,
+        decode_udp_capsule, encode_ip_capsule, encode_udp_capsule,
+    };
+
+    // 1. Start a mock legitimate cover server (`dest`) that returns a genuine ServerHello banner
+    let cover_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let cover_addr = cover_listener.local_addr().unwrap();
+    let cover_thread = thread::spawn(move || {
+        if let Ok((mut conn, _)) = cover_listener.accept() {
+            let _ = conn.set_read_timeout(Some(Duration::from_millis(1500)));
+            let mut probe_buf = [0u8; 512];
+            let _ = conn.read(&mut probe_buf);
+            let _ = conn.write_all(b"GENUINE_COVER_SERVER_HELLO_CERT_CHAIN");
+            let _ = conn.flush();
+        }
+    });
+
+    // 2. Start PersonalRelayServer with `cover_addr` for REALITY active-probing defense
+    let mut relay_srv =
+        PersonalRelayServer::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), Some(cover_addr))
+            .unwrap();
+    let relay_addr = relay_srv.addr();
+    let auth_key = [0x99u8; 32];
+    relay_srv.register_device("win11-workstation", auth_key, 128);
+
+    // 3. Active Prober connects with unauthenticated request -> deflected to cover_dest!
+    {
+        let mut prober = std::net::TcpStream::connect(relay_addr).unwrap();
+        prober
+            .set_read_timeout(Some(Duration::from_millis(2000)))
+            .unwrap();
+        prober
+            .write_all(b"GET / HTTP/1.1\r\nHost: dl.google.com\r\n\r\n")
+            .unwrap();
+        let mut resp = [0u8; 64];
+        let n = prober.read(&mut resp).unwrap();
+        assert_eq!(&resp[..n], b"GENUINE_COVER_SERVER_HELLO_CERT_CHAIN");
+    }
+    cover_thread.join().unwrap();
+    assert_eq!(
+        relay_srv
+            .counters()
+            .probers_deflected
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    // 4. Authenticated client with unreachable primary fails over to backup (`relay_addr`)
+    let mut profile = ServerProfile {
+        id: "srv-main".to_owned(),
+        name: "Personal Relay".to_owned(),
+        primary_endpoint: "127.0.0.1:1".to_owned(), // unreachable port 1 -> triggers failover
+        backup_endpoint: relay_addr.to_string(),
+        cover_sni: "dl.google.com".to_owned(),
+        device_id: "win11-workstation".to_owned(),
+        auth_key,
+        quota_bytes: 128,
+        ..ServerProfile::default()
+    };
+    let mut session = connect_with_failover(&mut profile).expect("failover should succeed");
+    assert!(session.used_backup);
+    assert_eq!(profile.status, ServerStatus::Failover);
+    assert_eq!(session.vision.phase, desync::VisionPhase::DirectSplice);
+
+    // Send spliced TLS 1.3 ApplicationData frame (MASQUE UDP capsule inside)
+    let udp_target = SocketAddr::from((Ipv4Addr::new(162, 159, 135, 232), 443));
+    let capsule = encode_udp_capsule(7, udp_target, b"ROBLOX_VOICE_FRAME");
+    let echoed = session.send_spliced(&capsule).unwrap();
+    let (ctx_id, dec_addr, dec_payload) = decode_udp_capsule(&echoed).unwrap();
+    assert_eq!(ctx_id, 7);
+    assert_eq!(dec_addr, udp_target);
+    assert_eq!(dec_payload, b"ROBLOX_VOICE_FRAME");
+    drop(session);
+
+    // 5. Revoke device -> immediate rejection (`ServerStatus::Revoked`)
+    assert!(relay_srv.revoke_device("win11-workstation"));
+    profile.primary_endpoint = relay_addr.to_string();
+    profile.backup_endpoint.clear();
+    let err_revoked = connect_with_failover(&mut profile).unwrap_err();
+    assert_eq!(err_revoked, ServerStatus::Revoked);
+
+    // 6. Rotate device key -> clears revocation and authorizes new key
+    let new_key = [0xabu8; 32];
+    assert!(relay_srv.rotate_device_key("win11-workstation", new_key));
+    profile.auth_key = new_key;
+    let session2 = connect_with_failover(&mut profile).expect("rotated key should connect");
+    assert_eq!(session2.status, ServerStatus::Connected);
+    drop(session2);
+
+    // 7. RFC 9484 HTTP/IP capsule and Wintun Layer-3 packet validation
+    let raw_ip = wrap_ipv4_tcp(
+        Ipv4Addr::new(10, 215, 173, 1),
+        Ipv4Addr::new(1, 1, 1, 1),
+        12345,
+        443,
+        1,
+        0x02,
+        b"",
+    );
+    assert!(sys::wintun::valid_l3_packet(&raw_ip));
+    assert!(sys::wintun::valid_ring_capacity(
+        sys::wintun::DEFAULT_RING_CAPACITY
+    ));
+    assert!(!sys::wintun::valid_ring_capacity(1000));
+    let ip_cap = encode_ip_capsule(&raw_ip).unwrap();
+    assert_eq!(decode_ip_capsule(&ip_cap).unwrap(), raw_ip);
+
+    relay_srv.stop();
+}

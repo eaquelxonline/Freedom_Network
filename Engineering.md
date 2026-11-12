@@ -451,14 +451,14 @@ The DPI/
 
 | Paket | Sonuç (12.11.2026) |
 |---|---|
-| Rust birim ve entegrasyon testleri, x86_64 Linux | **88/88** ✅ (+4 benchmark/stres testi, `--ignored`) |
-| Aynı testler, Windows x64 ikilisi (MinGW + Wine) | **88/88** ✅ |
-| Aynı testler, ARM64 (aarch64 + QEMU) | **88/88** ✅ |
+| Rust birim ve entegrasyon testleri, x86_64 Linux | **90/90** ✅ (+4 benchmark/stres testi, `--ignored`) |
+| Aynı testler, Windows x64 ikilisi (MinGW + Wine) | **90/90** ✅ |
+| Aynı testler, ARM64 (aarch64 + QEMU) | **90/90** ✅ |
 | clippy `-D warnings`: Linux, Android aarch64, Windows MSVC, Windows GNU | 0 uyarı ✅ |
 | rustfmt | ✅ |
-| JVM/JNI (`-Xcheck:jni`): codec, hatalar, TLS sertifika/hostname/zaman aşımı, yerel HTTPS üzerinden gerçek DoH turu, sistem geneli görünüm, uçtan uca, eşzamanlılık, stres, metin katalogu, aktif DPI desync + yerel proxy + `TunBridge` (DoH DNS + Roblox/Discord UDP NAT + Discord TCP/TLS Desync) | **22/22** ✅ |
+| JVM/JNI (`-Xcheck:jni`): codec, hatalar, TLS sertifika/hostname/zaman aşımı, yerel HTTPS üzerinden gerçek DoH turu, sistem geneli görünüm, uçtan uca, eşzamanlılık, stres, metin katalogu, aktif DPI desync (`REALITY + mlkem768 + xtls-rprx-vision`) + yerel proxy + `ServerManager` + `TunBridge` (DoH DNS + Roblox/Discord UDP NAT + Discord TCP/TLS Desync) | **23/23** ✅ |
 | Android lint (uyarılar hata sayılıyor) | 0 bulgu ✅ |
-| Gerçek ağda CLI duman testi (example.com + NXDOMAIN hedefi + `--desync adaptive`) | Doğru teşhis, karar ve yerel Desync proxy ✅ |
+| Gerçek ağda CLI duman testi (example.com + NXDOMAIN hedefi + `--desync reality`) | Doğru teşhis, karar ve yerel Desync proxy ✅ |
 
 **Yayın kabul kriterleri (1.0):**
 
@@ -479,7 +479,7 @@ The DPI/
 | QUIC/HTTP3 el sıkışması | Yalnızca Version Negotiation + Initial Scramble | Tam el sıkışma kriptografi gerektirir. h3 yeteneği DNS ilanı ve VN yanıtıyla dolaylı olarak raporlanır; QUIC Initial paketlerine düşük TTL'li şaşırtma uygulanır |
 | ECH kullanımı | İlan algılama + ECH (`0xfe0d`) segment bölme | Platform TLS'in işi (Android 17 destekliyor) + `desync` motorunda ECH uzantısı ortasından TCP bölme |
 | Windows captive portal ve ölçülü bağlantı | "Bilinmiyor" | `INetworkListManager` COM gerektirir; harici crate olmadan Rust'ta COM yazmak büyük bir unsafe yüzey getirir. Gerekirse 1.x'te ayrı bir modül olarak değerlendirilmeli |
-| Ağ yöneticisi politikası veya erişim kısıtlarını aşma | **Yalnızca kullanıcı onaylı yerel DPI aşma** | Uzak sunucu veya üçüncü taraf tünel kullanılmaz |
+| Ağ yöneticisi politikası veya erişim kısıtlarını aşma | **Kullanıcı onaylı yerel DPI aşma + Kişisel Sunucu Rölesi (`PersonalRelayServer`)** | Üçüncü taraf merkezi tünel kullanılmaz; kullanıcı kendi cihazında veya kendi sunucusunda çalıştırır |
 | x86_64 Android ve ChromeOS | Kapsam dışı | Talep ölçülürse eklenebilir |
 | ICMP tabanlı kayıp ölçümü | Yapılmadı | Ham soket ayrıcalık ister. Kayıp DNS/UDP örneklerinden ölçülüyor |
 
@@ -539,7 +539,7 @@ aşmaz.
 
 ## 20. THE DPI 2.0 — Aktif DPI Aşma (Desync), Yerel Tünel ve SIMD Assembly Mimarisi (2026–2027)
 
-Bu güncelleme ile THE DPI, sıfır üçüncü taraf bağımlılık (`std`-only Rust + saf SIMD Assembly) ve gizlilik ilkelerini koruyarak pasif tanılama motorunun yanına **tamamen yerel (on-device) çalışan aktif DPI aşma (desynchronization) veri düzlemi (`pub mod desync`)** ekler. Uzak bir VPN sunucusu kullanılmaz; trafik doğrudan kullanıcının kendi bağlantısı üzerinden hedefe gider.
+Bu güncelleme ile THE DPI, sıfır üçüncü taraf bağımlılık (`std`-only Rust + saf SIMD Assembly) ve gizlilik ilkelerini koruyarak pasif tanılama motorunun yanına **tamamen yerel (on-device) çalışan aktif DPI aşma (desynchronization) veri düzlemi (`pub mod desync`)** ekler.
 
 ### 20.1 Yeni SIMD Assembly Çekirdeği (`Native/Core.s` & `Native/Core.aarch64.s`)
 
@@ -560,14 +560,45 @@ Sıcak yolda (hot-path) paket başına gecikmeyi nanosaniye seviyesinde tutmak i
 4. **`FakeAutoTtl (4)`:** Sahte `www.iana.org` paketini geçerli TCP sağlama toplamı fakat düşürülmüş IPv4 `TTL` / IPv6 `Hop Limit` (varsayılan 5, `2..=16`) ile gönderir; paket ISS DPI cihazını yanıltıp hedef sunucuya ulaşmadan yolda düşer.
 5. **`QuicScramble (5)`:** UDP 443 üzerindeki QUIC v1 (RFC 9000) ve QUIC v2 (RFC 9369) `Initial` paketlerinden önce düşük TTL'li ayrılmış sürüm (`0x1a2a3a4a`) datagramı gönderir.
 6. **`AdaptiveFull (6)`:** Hibrit Post-Kuantum TLS 1.3 (`X25519MLKEM768`, `0x11ec`) ve ECH (`0xfe0d`) çoklu bölme + `FakeAutoTtl` + `FakeBadSum` + `Disorder` + `QuicScramble` + gelen pasif DPI sahte `TCP RST` ve `HTTP 302/403` paketlerini düşüren (`should_drop_inbound`) tam koruma kalkanı.
+7. **`RealityVision (7)` (Varsayılan 2026–2027 Modu):** Project X / Xray-core `REALITY` + `X25519MLKEM768` (`0x11ec`) post-kuantum el sıkışması + aktif yoklama (active probing) savunması + `xtls-rprx-vision` doğrudan TLS akış birleştirme (splice).
 
 ### 20.3 Platform Entegrasyonu (Windows & Android)
 
-* **Yerel SOCKS5 + HTTP CONNECT Desync Proxy (`desync::LocalProxy`):** Yönetici veya root izni gerektirmeden `127.0.0.1` üzerinde çalışır; `TCP_NODELAY` ve `sys::set_tcp_ttl` ile soket düzeyinde düşük TTL'li sahte paket ve SNI/ECH bölme uygular.
+* **Yerel SOCKS5 + HTTP CONNECT Desync Proxy (`desync::LocalProxy`):** Yönetici veya root izni gerektirmeden `127.0.0.1` üzerinde çalışır; `TCP_NODELAY` ve `sys::set_tcp_ttl` ile soket düzeyinde düşük TTL'li sahte paket, SNI/ECH bölme ve `xtls-rprx-vision` splice uygular.
 * **Android 11–17 Sistem Geneli `TheDpiVpnService` + Kullanıcı Modu `TunBridge` (`IpPackets` & `TunBridge`):**
   * `addRoute("0.0.0.0", 0)` ve `addDnsServer("10.215.173.2")` ile tüm cihaz trafiğini yerel `TUN` arayüzüne yönlendirir (`addDisallowedApplication(packageName)` ve `VpnService.protect()` ile kendi dış soketlerini döngüden korur).
   * **Şifreli DNS (DoH3/DoH) Köprüsü:** Cihazdaki uygulamaların UDP 53 üzerinden yaptığı DNS sorgularını yakalar; önce RFC 8484 formatında Şifreli DNS (`AndroidDohClient`) üzerinden çözer, gerekirse `protect()` edilmiş UDP DNS soketine (`1.1.1.1` / `8.8.8.8`) düşer. Böylece Discord ve Roblox için ISS DNS zehirlemesini otomatik aşar.
-  * **Kullanıcı Modu TCP Durum Makinesi + Aktif TLS/HTTP Desync:** `SYN` → `SYN+ACK (MSS 1360)` → `ACK` el sıkışmasını yerel olarak sonlandırır; Discord metin/giriş (TCP 443) ve web bağlantılarını `VpnService.protect(socket)` ile korunmuş gerçek TCP soketlerine aktarırken ilk `ClientHello` / HTTP paketini `Native.desyncPacket` ile SNI/ECH/`Host:` ortasından bölerek (`TCP_NODELAY` + `flush`) iletir.
+  * **Kullanıcı Modu TCP Durum Makinesi + `REALITY` / `xtls-rprx-vision` Desync:** `SYN` → `SYN+ACK (MSS 1360)` → `ACK` el sıkışmasını yerel olarak sonlandırır; Discord metin/giriş (TCP 443) ve web bağlantılarını `VpnService.protect(socket)` ile korunmuş gerçek TCP soketlerine aktarırken ilk `ClientHello` / HTTP paketini `Native.desyncPacket` ile SNI/ECH/`X25519MLKEM768` ortasından bölerek (`TCP_NODELAY` + `flush`) iletir, el sıkışma tamamlandığında ise (`is_tls_application_data`, `0x17 0x03 0x03`) `xtls-rprx-vision` ile sıfır ek yükle doğrudan (direct splice) aktarır.
   * **Kayıpsız UDP NAT Köprüsü (Roblox & Discord Ses):** Roblox oyun içi RakNet UDP trafiğini, Discord sesli kanal (RTC UDP) paketlerini ve QUIC (UDP 443, `desyncPacket` QUIC Initial Scramble dahil) datagramlarını `VpnService.protect(datagramSocket)` ile korunmuş UDP soketleri ve oturum tablosu üzerinden çift yönlü ve kayıpsız olarak dış internete aktarır.
   * **`MainActivity` VPN İzin ve Başlatma Akışı:** **"Engelsiz Modu Başlat (Sistem Geneli VPN + DPI Aşma)"** düğmesi `VpnService.prepare(this)` ile Android sistem VPN iznini ister (`startActivityForResult` / `onActivityResult`) ve hem `TheDpiVpnService` TUN köprüsünü hem de yerel proxy'yi birlikte başlatır/durdurur.
-* **Windows CLI ve Swing Arayüzü:** Arayüzde **"Engelsiz Modu Başlat (DPI Aşma)"** düğmesi ve komut satırında `TheDPI --cli example.com --desync adaptive --proxy 8880` desteği.
+* **Windows CLI ve Swing Arayüzü:** Arayüzde **"Engelsiz Modu Başlat (DPI Aşma)"** düğmesi ve komut satırında `TheDPI --cli example.com --desync reality --proxy 8880` desteği.
+
+---
+
+## 21. THE DPI 2026–2027 Hibrit Ağ Özgürlüğü Mimarisi ("Senin Ağın. Senin Sunucun. Senin Kontrolün.")
+
+Kullanıcının hem sunucusuz yerel DPI aşma modunda hem de kendi kişisel sunucusu (Self-Hosted Relay) üzerinden bağımsız, denetlenebilir ve aktif yoklamaya (active probing) dayanıklı biçimde çalışabilmesi için ortak Rust çekirdeğine (`Native/Core.rs`) ve her iki platformun Kotlin katmanına (`Android/Source/Main/Kotlin/Core.kt`, `Windows/Source/Main/Kotlin/Core.kt`) aşağıdaki bileşenler eklendi:
+
+### 21.1 `REALITY` + `mlkem768` (`X25519MLKEM768` `0x11ec`) + `xtls-rprx-vision`
+
+* **`REALITY` El Sıkışması ve Aktif Yoklama Savunması (`desync::build_reality_mlkem768_client_hello` & `relay::PersonalRelayServer`):**
+  * Dışarıya sahte veya kendinden imzalı bir sertifika sunmak yerine, TLS 1.3 `ClientHello` içinde gerçek bir meşru sitenin (`cover_sni`, ör. `www.cloudflare.com`) SNI bilgisini, hibrit post-kuantum `X25519MLKEM768` (`0x11ec`) + `X25519` (`0x001d`) anahtar paylaşımını, `h2`/`http/1.1` ALPN'ini ve `SessionId` alanı içine gizlenmiş 32 baytlık tek kullanımlık kimlik doğrulama jetonunu (`compute_reality_session_id`) taşır.
+  * Sunucuya bağlanan bir aktif yoklama (active prober / güvenlik duvarı tarayıcısı) geçerli cihaz anahtarına sahip olmadığı için `PersonalRelayServer` bağlantıyı anında gerçek hedef siteye (`cover_dest`) şeffaf biçimde yönlendirir (`DeflectedToCover`). Tarayıcı, gerçek sitenin birebir `ServerHello` ve sertifika zincirini görür.
+* **`xtls-rprx-vision` Doğrudan Akış Birleştirme (Direct Splice):**
+  * İlk TLS el sıkışma paketleri (`0x16`) geçtikten ve iç TLS `ApplicationData` (`0x17 0x03 0x03`) akışı başladığında (`desync::is_tls_application_data`), içteki şifreli TLS akışı tekrar paketlenmeden veya parçalanmadan (`vision_splice_count` / `visionSplicedFlows`) doğrudan soketler arasında aktarılır (çift şifreleme ve CPU ek yükü sıfırlanır).
+
+### 21.2 Kişisel Sunucu Rölesi (`pub mod relay`) ve Çoklu Profil Yöneticisi (`ServerManager`)
+
+* **Cihaz Kimlik Doğrulama, Anahtar Yenileme ve Anında İptal (`PersonalRelayServer` & `ServerManager`):**
+  * Her cihaz kendi `device_id` ve 32 baytlık `auth_key` anahtarıyla tanımlanır (`authorize_device`).
+  * Cihaz erişimi tek çağrıyla anında iptal edilebilir (`revoke_device` → `RejectedRevoked`) veya anahtarı kesintisiz yenilenebilir (`rotate_device_key`).
+  * Cihaz başına kota (`quota_bytes`) ve gerçek zamanlı bant genişliği kullanımı (`used_bytes`, `record_traffic`) izlenir; kota aşıldığında (`RejectedQuotaExceeded`) bağlantı güvenli şekilde reddedilir.
+* **Otomatik Yedek Sunucu Geçişi (Failover) ve Sağlık Ölçümü:**
+  * Hem Rust (`RelayProfile::select_endpoint`) hem de Kotlin (`ServerManager. probeAndSelectEndpoint`) katmanı birincil sunucunun (`primaryEndpoint`) gecikmesini ölçer; sunucu erişilemezse otomatik olarak kullanıcının tanımladığı yedek sunucuya (`backupEndpoint`) geçer (`ServerStatus.FAILOVER`).
+* **Standartlara Uygun Tünel Kapsülleri (RFC 9298 & RFC 9484 MASQUE):**
+  * `relay::encode_masque_udp_capsule` / `decode_masque_udp_capsule` ile HTTP/3 UDP tünelleme (RFC 9298) ve `relay::encode_masque_ip_packet` / `decode_masque_ip_packet` ile HTTP/IP Layer-3 paket taşıma (RFC 9484) kapsülleri sıfır harici crate ile gerçeklendi.
+
+### 21.3 Windows Wintun Layer-3 Sanal Ağ Adaptörü Doğrulayıcısı (`sys::wintun`)
+
+* Kendi çekirdek sürücümüzü yazmak yerine Windows'ta kullanıcı alanı Layer-3 sanal ağ arayüzü için `sys::wintun::WintunAdapterConfig` (`THE DPI Tunnel`, `10.215.173.1/24`, `fd00:7468:6564:7069::1/64`, MTU `1420`, halka arabellek `4 MiB`), halka kapasitesi doğrulayıcısı (`valid_ring_capacity`: `128 KiB ..= 64 MiB`, 2'nin kuvveti) ve Layer-3 IPv4/IPv6 paket doğrulayıcısı (`valid_l3_packet`) eklendi.
+

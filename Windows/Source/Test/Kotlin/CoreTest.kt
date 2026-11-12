@@ -479,18 +479,75 @@ fun main() {
             pkt[33] = 0x18.toByte()
             System.arraycopy(httpPayload, 0, pkt, 40, httpPayload.size)
 
-            val res = s.desyncPacket(pkt, DesyncConfig(mode = DesyncMode.ADAPTIVE_FULL, fakeTtl = 4))
+            val res = s.desyncPacket(pkt, DesyncConfig(mode = DesyncMode.REALITY_VISION, fakeTtl = 4))
             eq(res.status, Codes.OK, "desync status")
+            eq(res.mode, DesyncMode.REALITY_VISION, "reality_vision mode")
             eq(res.sni, "blocked.example.com", "extracted host")
-            expect(!res.dropped && res.packets.size >= 3) { "expected fake + disordered segments, got ${res.packets.size}" }
+            expect(!res.dropped && res.packets.size >= 3) { "expected REALITY + ML-KEM-768 decoy + disordered segments, got ${res.packets.size}" }
 
-            val started = s.startProxy(DesyncConfig(mode = DesyncMode.ADAPTIVE_FULL, port = 0))
+            val started = s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
             eq(started.status, Codes.OK, "startProxy status")
+            eq(started.mode, DesyncMode.REALITY_VISION, "startProxy mode")
             expect(started.active && started.port > 0) { "proxy active on port ${started.port}" }
-            expect("ENGELSİZ MOD" in Text.proxyStatus(started)) { "proxy Turkish status" }
+            expect("ENGELSİZ MOD" in Text.proxyStatus(started) && "REALITY + ML-KEM-768" in Text.proxyStatus(started)) { "proxy Turkish status" }
             eq(s.stopProxy(), Codes.OK, "stopProxy")
             expect(!s.proxyStats().active) { "proxy stopped" }
         }
+    }
+
+    test("ServerManager: multi-profile personal servers, failover, quota, key rotation, and device revocation") {
+        val mgr = ServerManager()
+        val s1 = ServerProfile(
+            id = "srv-01",
+            name = "Sunucu 01",
+            primaryEndpoint = "vpn.example.com:443",
+            backupEndpoint = "backup01.example.com:443",
+            coverDest = "dl.google.com",
+            deviceId = "android-arm64-01",
+            authKeyHex = "0102030405060708",
+            latencyMs = 18,
+            lossPct = 0,
+            quotaBytes = 10_000,
+        )
+        val s2 = ServerProfile(
+            id = "srv-02",
+            name = "Sunucu 02",
+            primaryEndpoint = "backup.example.com:443",
+            coverDest = "www.cloudflare.com",
+            deviceId = "windows-x64-01",
+            authKeyHex = "aabbccddeeff0011",
+            latencyMs = 34,
+            lossPct = 1,
+            quotaBytes = 50_000,
+        )
+        mgr.upsert(s1)
+        mgr.upsert(s2)
+        eq(mgr.list().size, 2, "2 profiles")
+        val selected = mgr.select("srv-01")!!
+        eq(selected.status, ServerStatus.CONNECTED, "srv-01 connected")
+        eq(selected.activeEndpoint, "vpn.example.com:443", "primary endpoint")
+
+        // Failover switches to backupEndpoint on srv-01
+        val failedOver = mgr.triggerFailover("srv-01")!!
+        eq(failedOver.status, ServerStatus.FAILOVER, "failover status")
+        eq(failedOver.activeEndpoint, "backup01.example.com:443", "backup endpoint active")
+
+        // Quota enforcement
+        val afterTraffic = mgr.recordTraffic("srv-01", 10_500)!!
+        eq(afterTraffic.status, ServerStatus.QUOTA_EXCEEDED, "quota exceeded")
+        expect(!afterTraffic.quotaAvailable) { "quota must be exhausted" }
+
+        // Device revocation switches active profile to srv-02
+        val revoked = mgr.revokeDevice("srv-01")!!
+        eq(revoked.status, ServerStatus.REVOKED, "revoked status")
+        eq(mgr.activeProfileId, "srv-02", "auto-promoted to srv-02")
+
+        // Key rotation restores device access
+        val rotated = mgr.rotateDeviceKey("srv-01", "9988776655443322")!!
+        expect(!rotated.revoked && rotated.authKeyHex == "9988776655443322") { "key rotated" }
+
+        val rendered = Text.serverManager(mgr)
+        expect("Sunucu 01" in rendered && "Sunucu 02" in rendered && "dl.google.com" in rendered) { rendered }
     }
 
     test("TunBridge end-to-end: DoH DNS, Roblox/Discord UDP NAT, and Discord TCP Desync over protected sockets") {

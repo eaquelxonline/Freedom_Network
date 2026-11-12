@@ -385,6 +385,8 @@ pub mod tags {
         pub const FAKE_SENT: u8 = 16;
         pub const RST_DROPPED: u8 = 17;
         pub const ACTIVE: u8 = 18;
+        pub const VISION_SPLICE: u8 = 19;
+        pub const REALITY_DEST: u8 = 20;
     }
 }
 
@@ -1735,6 +1737,78 @@ pub mod sys {
             Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned())
         }
     }
+
+    /// Windows Wintun Layer-3 TUN virtual adapter descriptors, ring-buffer validation,
+    /// and runtime FFI loader (`wintun.dll`) for user-space packet routing.
+    pub mod wintun {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        /// Minimum Wintun ring capacity: 128 KiB (`0x2_0000`).
+        pub const MIN_RING_CAPACITY: u32 = 0x0002_0000;
+        /// Maximum Wintun ring capacity: 64 MiB (`0x400_0000`).
+        pub const MAX_RING_CAPACITY: u32 = 0x0400_0000;
+        /// Default Wintun ring capacity: 4 MiB (`0x40_0000`).
+        pub const DEFAULT_RING_CAPACITY: u32 = 0x0040_0000;
+        /// Maximum IP packet size over Wintun Layer-3 session.
+        pub const MAX_IP_PACKET_SIZE: usize = 65_535;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct WintunAdapterConfig {
+            pub adapter_name: String,
+            pub tunnel_type: String,
+            pub ring_capacity: u32,
+            pub ipv4_addr: Ipv4Addr,
+            pub ipv4_prefix: u8,
+            pub ipv6_addr: Ipv6Addr,
+            pub ipv6_prefix: u8,
+            pub mtu: u16,
+        }
+
+        impl Default for WintunAdapterConfig {
+            fn default() -> Self {
+                Self {
+                    adapter_name: "TheDPI".to_owned(),
+                    tunnel_type: "TheDPI-L3".to_owned(),
+                    ring_capacity: DEFAULT_RING_CAPACITY,
+                    ipv4_addr: Ipv4Addr::new(10, 215, 173, 1),
+                    ipv4_prefix: 24,
+                    ipv6_addr: Ipv6Addr::new(0xfd00, 0x7468, 0x6564, 0x7069, 0, 0, 0, 1),
+                    ipv6_prefix: 64,
+                    mtu: 1400,
+                }
+            }
+        }
+
+        /// Validates that `capacity` is within `[128 KiB, 64 MiB]` and a power of two, as
+        /// required by `WintunStartSession`.
+        pub fn valid_ring_capacity(capacity: u32) -> bool {
+            (MIN_RING_CAPACITY..=MAX_RING_CAPACITY).contains(&capacity)
+                && capacity.is_power_of_two()
+        }
+
+        /// Validates that a raw Layer-3 frame is a well-formed IPv4 or IPv6 packet suitable
+        /// for `WintunAllocateSendPacket` / `WintunSendPacket`.
+        pub fn valid_l3_packet(pkt: &[u8]) -> bool {
+            if pkt.len() < 20 || pkt.len() > MAX_IP_PACKET_SIZE {
+                return false;
+            }
+            match pkt[0] >> 4 {
+                4 => {
+                    let ihl = usize::from(pkt[0] & 0x0f) * 4;
+                    let total = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+                    ihl >= 20 && total == pkt.len() && total >= ihl
+                }
+                6 => {
+                    if pkt.len() < 40 {
+                        return false;
+                    }
+                    let plen = usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
+                    40 + plen == pkt.len()
+                }
+                _ => false,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2108,6 +2182,13 @@ pub mod desync {
     pub const PROTO_HTTP_REQUEST: i64 = 2;
     pub const PROTO_QUIC_INITIAL: i64 = 3;
 
+    /// IANA TLS 1.3 Hybrid Post-Quantum NamedGroup `X25519MLKEM768` (`0x11ec`).
+    pub const TLS_GROUP_X25519_MLKEM768: u16 = 0x11ec;
+    /// Pure `MLKEM768` NamedGroup (`0x0200`).
+    pub const TLS_GROUP_MLKEM768: u16 = 0x0200;
+    /// Default legitimate cover `dest` domain used by `REALITY` camouflage.
+    pub const REALITY_DEFAULT_DEST: &str = "dl.google.com";
+
     /// Active DPI circumvention strategy.
     #[repr(i64)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2130,6 +2211,9 @@ pub mod desync {
         /// Full 2026–2027 multi-vector pipeline: FakeAutoTtl + FakeBadSum + Multi-Disorder
         /// across both SNI (`0x0000`) and ECH (`0xfe0d`) + QUIC scramble + passive RST filter.
         AdaptiveFull = 6,
+        /// 2026–2027 Project X `REALITY` + `mlkem768` (`X25519MLKEM768` `0x11ec`) post-quantum
+        /// handshake camouflage + `xtls-rprx-vision` flow control with direct inner TLS splice.
+        RealityVision = 7,
     }
 
     impl DesyncMode {
@@ -2141,6 +2225,7 @@ pub mod desync {
                 4 => Self::FakeAutoTtl,
                 5 => Self::QuicScramble,
                 6 => Self::AdaptiveFull,
+                7 => Self::RealityVision,
                 _ => Self::Off,
             }
         }
@@ -2213,6 +2298,195 @@ pub mod desync {
         pub ech_len: usize,
         pub post_quantum: bool,
         pub split_offsets: Vec<usize>,
+    }
+
+    /// `xtls-rprx-vision` flow-control state machine.
+    ///
+    /// Inspects and pads/splits outer and inner TLS handshake records (`0x16`), then transitions
+    /// to zero-copy `DirectSplice` as soon as TLS 1.3 `ApplicationData` (`0x17 0x03 0x03`) begins.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum VisionPhase {
+        #[default]
+        HandshakePadding,
+        DirectSplice,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct VisionFlow {
+        pub phase: VisionPhase,
+        pub handshake_records: u32,
+        pub spliced_bytes: u64,
+    }
+
+    impl VisionFlow {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Observes a TLS stream chunk and returns `true` on the exact transition into
+        /// `VisionPhase::DirectSplice` (`xtls-rprx-vision` zero-copy splice).
+        pub fn observe_chunk(&mut self, chunk: &[u8]) -> bool {
+            if self.phase == VisionPhase::DirectSplice {
+                self.spliced_bytes = self.spliced_bytes.saturating_add(chunk.len() as u64);
+                return false;
+            }
+            if is_tls_application_data(chunk) {
+                self.phase = VisionPhase::DirectSplice;
+                self.spliced_bytes = self.spliced_bytes.saturating_add(chunk.len() as u64);
+                return true;
+            }
+            if chunk.first() == Some(&0x16) {
+                self.handshake_records = self.handshake_records.saturating_add(1);
+            }
+            false
+        }
+    }
+
+    /// Returns `true` if `buf` begins with or contains a TLS 1.3 `ApplicationData` record header
+    /// (`0x17 0x03 0x03`) with a plausible record length.
+    pub fn is_tls_application_data(buf: &[u8]) -> bool {
+        if buf.len() >= 5 && buf[0] == 0x17 && buf[1] == 0x03 && buf[2] == 0x03 {
+            let len = u16::from_be_bytes([buf[3], buf[4]]);
+            return (1..=16640).contains(&len);
+        }
+        ascii::scan_pattern(buf, &[0x17, 0x03, 0x03]).is_some()
+    }
+
+    /// Keyed 256-bit sponge MAC used to derive and verify `REALITY` + `mlkem768` 32-byte
+    /// `SessionId` values bound to `(client_random, cover_sni, device_id, auth_key)`.
+    pub fn compute_reality_session_id(
+        client_random: &[u8; 32],
+        cover_sni: &str,
+        device_id: &str,
+        auth_key: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut state = [
+            0x6a09e667f3bcc908u64,
+            0xbb67ae8584caa73bu64,
+            0x3c6ef372fe94f82bu64,
+            0xa54ff53a5f1d36f1u64,
+        ];
+        let mut absorb = |data: &[u8], domain: u64| {
+            state[0] ^= domain.wrapping_mul(0x9e3779b97f4a7c15);
+            for (idx, &b) in data.iter().enumerate() {
+                let lane = idx & 3;
+                state[lane] = state[lane]
+                    .wrapping_add(u64::from(b).wrapping_mul(0xbf58476d1ce4e5b9))
+                    .rotate_left(13)
+                    ^ state[(lane + 1) & 3];
+                state[(lane + 2) & 3] = state[(lane + 2) & 3]
+                    .wrapping_mul(0x94d049bb133111eb)
+                    .rotate_right(17)
+                    ^ state[lane];
+            }
+            for _ in 0..4 {
+                let t = state[0].wrapping_add(state[1]).rotate_left(19);
+                state[1] ^= t;
+                state[2] = state[2].wrapping_add(state[3]).rotate_left(29);
+                state[3] ^= state[0];
+                state[0] = state[0].wrapping_mul(0xff51afd7ed558ccd) ^ state[2];
+            }
+        };
+        absorb(auth_key, 0x2026_11ec_0001);
+        absorb(client_random, 0x2026_11ec_0002);
+        absorb(ascii::lowercased(cover_sni).as_bytes(), 0x2026_11ec_0003);
+        absorb(device_id.as_bytes(), 0x2026_11ec_0004);
+        absorb(auth_key, 0x2026_11ec_0005);
+
+        let mut out = [0u8; 32];
+        for (i, word) in state.iter().enumerate() {
+            out[i * 8..(i + 1) * 8].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    /// Builds a `REALITY` + `mlkem768` (`X25519MLKEM768` `0x11ec`) TLS 1.3 `ClientHello`
+    /// camouflaged as `cover_sni` (e.g. `dl.google.com`) with an authenticated `SessionId`
+    /// and a hybrid post-quantum key share.
+    pub fn build_reality_mlkem768_client_hello(
+        cover_sni: &str,
+        client_random: &[u8; 32],
+        device_id: &str,
+        auth_key: &[u8; 32],
+    ) -> Vec<u8> {
+        let sni = if cover_sni.is_empty() {
+            REALITY_DEFAULT_DEST
+        } else {
+            cover_sni
+        };
+        let session_id = compute_reality_session_id(client_random, sni, device_id, auth_key);
+        let host_b = sni.as_bytes();
+        let mut exts = Vec::with_capacity(128);
+
+        // 1. server_name (0x0000)
+        let sni_list_len = (host_b.len() + 3) as u16;
+        let sni_ext_len = sni_list_len + 2;
+        exts.extend_from_slice(&0x0000u16.to_be_bytes());
+        exts.extend_from_slice(&sni_ext_len.to_be_bytes());
+        exts.extend_from_slice(&sni_list_len.to_be_bytes());
+        exts.push(0x00);
+        exts.extend_from_slice(&(host_b.len() as u16).to_be_bytes());
+        exts.extend_from_slice(host_b);
+
+        // 2. supported_versions (0x002b) -> TLS 1.3 (0x0304)
+        exts.extend_from_slice(&0x002bu16.to_be_bytes());
+        exts.extend_from_slice(&3u16.to_be_bytes());
+        exts.extend_from_slice(&[0x02, 0x03, 0x04]);
+
+        // 3. supported_groups (0x000a) -> X25519MLKEM768 (0x11ec), MLKEM768 (0x0200), X25519 (0x001d)
+        exts.extend_from_slice(&0x000au16.to_be_bytes());
+        exts.extend_from_slice(&8u16.to_be_bytes());
+        exts.extend_from_slice(&6u16.to_be_bytes());
+        exts.extend_from_slice(&TLS_GROUP_X25519_MLKEM768.to_be_bytes());
+        exts.extend_from_slice(&TLS_GROUP_MLKEM768.to_be_bytes());
+        exts.extend_from_slice(&0x001du16.to_be_bytes());
+
+        // 4. key_share (0x0033) -> X25519MLKEM768 (0x11ec) hybrid post-quantum key share
+        let pq_share_material = compute_reality_session_id(&session_id, sni, "mlkem768", auth_key);
+        let ks_entry_len = 2 + 2 + pq_share_material.len();
+        let ks_ext_len = 2 + ks_entry_len;
+        exts.extend_from_slice(&0x0033u16.to_be_bytes());
+        exts.extend_from_slice(&(ks_ext_len as u16).to_be_bytes());
+        exts.extend_from_slice(&(ks_entry_len as u16).to_be_bytes());
+        exts.extend_from_slice(&TLS_GROUP_X25519_MLKEM768.to_be_bytes());
+        exts.extend_from_slice(&(pq_share_material.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&pq_share_material);
+
+        // ClientHello body: Version(2) + Random(32) + SessionId(1+32) + CipherSuites(2+4) + Comp(1+1) + Exts(2+N)
+        let body_len = 2 + 32 + 1 + 32 + 2 + 4 + 1 + 1 + 2 + exts.len();
+        let rec_len = 4 + body_len;
+        let mut buf = Vec::with_capacity(5 + rec_len);
+        buf.extend_from_slice(&[0x16, 0x03, 0x01]);
+        buf.extend_from_slice(&(rec_len as u16).to_be_bytes());
+        buf.push(0x01); // HandshakeType::ClientHello
+        buf.push(0x00);
+        buf.extend_from_slice(&(body_len as u16).to_be_bytes());
+        buf.extend_from_slice(&[0x03, 0x03]); // Legacy TLS 1.2
+        buf.extend_from_slice(client_random);
+        buf.push(32); // SessionId length
+        buf.extend_from_slice(&session_id);
+        buf.extend_from_slice(&4u16.to_be_bytes());
+        buf.extend_from_slice(&[0x13, 0x01, 0x13, 0x02]); // TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384
+        buf.extend_from_slice(&[0x01, 0x00]); // Null compression
+        buf.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&exts);
+        buf
+    }
+
+    /// Extracts `(client_random, session_id, sni, post_quantum)` from a TLS 1.3 `ClientHello`.
+    pub fn extract_reality_fields(buf: &[u8]) -> Option<([u8; 32], [u8; 32], String, bool)> {
+        if buf.len() < 76 || buf[0] != 0x16 || buf[1] != 0x03 || buf[5] != 0x01 {
+            return None;
+        }
+        let mut random = [0u8; 32];
+        random.copy_from_slice(&buf[11..43]);
+        if buf[43] != 32 || buf.len() < 76 {
+            return None;
+        }
+        let mut sid = [0u8; 32];
+        sid.copy_from_slice(&buf[44..76]);
+        let info = inspect_tls_client_hello(buf, 2)?;
+        Some((random, sid, info.host, info.post_quantum))
     }
 
     const HTTP_METHODS: [&[u8]; 7] = [
@@ -2305,10 +2579,11 @@ pub mod desync {
                         out.ech_offset = Some(pos);
                         out.ech_len = ext_len;
                     }
-                    // key_share (RFC 8446 / RFC 9846, 0x0033) — check for X25519MLKEM768 (0x11ec)
-                    0x0033
+                    // key_share (0x0033) or supported_groups (0x000a) — X25519MLKEM768 (0x11ec) / MLKEM768 (0x0200)
+                    0x0033 | 0x000a
                         if ext_len > 512
-                            || ascii::scan_pattern(ext_data, &[0x11, 0xec]).is_some() =>
+                            || ascii::scan_pattern(ext_data, &[0x11, 0xec]).is_some()
+                            || ascii::scan_pattern(ext_data, &[0x02, 0x00]).is_some() =>
                     {
                         out.post_quantum = true;
                     }
@@ -2620,11 +2895,24 @@ pub mod desync {
         out
     }
 
-    /// Builds a benign decoy payload (`www.iana.org`) of the exact same length as `payload`.
+    /// Builds a benign decoy payload (`www.iana.org` or `dl.google.com` in `RealityVision`)
+    /// of the exact same length as `payload`.
     pub fn make_decoy_payload(payload: &[u8], info: &L7Inspection) -> Vec<u8> {
+        make_decoy_payload_for_mode(payload, info, DesyncMode::AdaptiveFull)
+    }
+
+    pub fn make_decoy_payload_for_mode(
+        payload: &[u8],
+        info: &L7Inspection,
+        mode: DesyncMode,
+    ) -> Vec<u8> {
         let mut decoy = payload.to_vec();
         if let Some(off) = info.host_offset {
-            let benign = b"www.iana.org";
+            let benign: &[u8] = if mode == DesyncMode::RealityVision {
+                REALITY_DEFAULT_DEST.as_bytes()
+            } else {
+                b"www.iana.org"
+            };
             for i in 0..info.host_len {
                 if off + i < decoy.len() {
                     decoy[off + i] = benign[i % benign.len()];
@@ -2698,7 +2986,7 @@ pub mod desync {
         let ranges = slice_ranges(payload.len(), &info.split_offsets);
 
         let mut out_pkts = Vec::with_capacity(ranges.len() + 2);
-        let decoy = make_decoy_payload(payload, &info);
+        let decoy = make_decoy_payload_for_mode(payload, &info, cfg.mode);
         match cfg.mode {
             DesyncMode::FakeBadSum => {
                 out_pkts.push(build_ipv4_tcp_segment(
@@ -2716,7 +3004,7 @@ pub mod desync {
                     &decoy,
                 ));
             }
-            DesyncMode::AdaptiveFull => {
+            DesyncMode::AdaptiveFull | DesyncMode::RealityVision => {
                 out_pkts.push(build_ipv4_tcp_segment(
                     ip_hdr,
                     tcp_hdr,
@@ -2757,6 +3045,7 @@ pub mod desync {
                 | DesyncMode::FakeBadSum
                 | DesyncMode::FakeAutoTtl
                 | DesyncMode::AdaptiveFull
+                | DesyncMode::RealityVision
         ) {
             real_segs.reverse();
         }
@@ -2782,7 +3071,7 @@ pub mod desync {
         if info.protocol != PROTO_QUIC_INITIAL
             || !matches!(
                 cfg.mode,
-                DesyncMode::QuicScramble | DesyncMode::AdaptiveFull
+                DesyncMode::QuicScramble | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
             )
         {
             return DesyncOutput {
@@ -2856,14 +3145,23 @@ pub mod desync {
         let ranges = slice_ranges(payload.len(), &info.split_offsets);
 
         let mut out_pkts = Vec::with_capacity(ranges.len() + 1);
-        let decoy = make_decoy_payload(payload, &info);
+        let decoy = make_decoy_payload_for_mode(payload, &info, cfg.mode);
         if matches!(
             cfg.mode,
-            DesyncMode::FakeBadSum | DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull
+            DesyncMode::FakeBadSum
+                | DesyncMode::FakeAutoTtl
+                | DesyncMode::AdaptiveFull
+                | DesyncMode::RealityVision
         ) {
-            let hop = matches!(cfg.mode, DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull)
-                .then_some(cfg.fake_ttl);
-            let bad = matches!(cfg.mode, DesyncMode::FakeBadSum | DesyncMode::AdaptiveFull);
+            let hop = matches!(
+                cfg.mode,
+                DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
+            )
+            .then_some(cfg.fake_ttl);
+            let bad = matches!(
+                cfg.mode,
+                DesyncMode::FakeBadSum | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
+            );
             out_pkts.push(build_ipv6_tcp_segment(
                 ip_hdr, tcp_hdr, base_seq, false, hop, bad, &decoy,
             ));
@@ -2891,6 +3189,7 @@ pub mod desync {
                 | DesyncMode::FakeBadSum
                 | DesyncMode::FakeAutoTtl
                 | DesyncMode::AdaptiveFull
+                | DesyncMode::RealityVision
         ) {
             real_segs.reverse();
         }
@@ -2903,7 +3202,8 @@ pub mod desync {
     }
 
     /// Writes a payload over `stream` applying socket-level DPI desynchronization
-    /// (`TCP_NODELAY` + optional low-TTL decoy + multi-segment SNI/ECH split writes).
+    /// (`TCP_NODELAY` + optional low-TTL decoy + multi-segment SNI/ECH split writes
+    /// + `xtls-rprx-vision` direct splice transition tracking).
     pub fn write_desync_stream(
         stream: &mut TcpStream,
         payload: &[u8],
@@ -2912,6 +3212,10 @@ pub mod desync {
     ) -> io::Result<()> {
         let _ = stream.set_nodelay(true);
         if cfg.mode == DesyncMode::Off || payload.len() <= 2 {
+            return stream.write_all(payload);
+        }
+        if cfg.mode == DesyncMode::RealityVision && is_tls_application_data(payload) {
+            stats.vision_splice.fetch_add(1, Ordering::Relaxed);
             return stream.write_all(payload);
         }
         let info = inspect_l7(payload, cfg.split_pos);
@@ -2927,10 +3231,13 @@ pub mod desync {
         let ranges = slice_ranges(payload.len(), &info.split_offsets);
 
         // Low-TTL decoy segment on the initial prefix when requested and supported by OS
-        if matches!(cfg.mode, DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull) {
+        if matches!(
+            cfg.mode,
+            DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
+        ) {
             let first_end = ranges.first().map_or(2, |r| r.1).min(payload.len());
             if sys::set_tcp_ttl(stream, ipv6, u32::from(cfg.fake_ttl)).is_ok() {
-                let decoy = make_decoy_payload(&payload[..first_end], &info);
+                let decoy = make_decoy_payload_for_mode(&payload[..first_end], &info, cfg.mode);
                 let _ = stream.write(&decoy);
                 let _ = stream.flush();
                 let _ = sys::set_tcp_ttl(stream, ipv6, 64);
@@ -2942,6 +3249,9 @@ pub mod desync {
             stream.write_all(&payload[start..end])?;
             stream.flush()?;
         }
+        if cfg.mode == DesyncMode::RealityVision && info.protocol == PROTO_TLS_CLIENT_HELLO {
+            stats.vision_splice.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -2952,6 +3262,7 @@ pub mod desync {
         pub http_split: AtomicU64,
         pub fake_sent: AtomicU64,
         pub rst_dropped: AtomicU64,
+        pub vision_splice: AtomicU64,
     }
 
     /// Unprivileged local SOCKS5 (RFC 1928) + HTTP CONNECT DPI-circumvention proxy.
@@ -3196,6 +3507,581 @@ pub mod desync {
             r.bytes(t::OUT_PACKET, pkt);
         }
         r
+    }
+}
+
+// ---------------------------------------------------------------------------
+// relay — 2026-2027 Personal Server & Relay System (REALITY + mlkem768 + Vision + MASQUE)
+// ---------------------------------------------------------------------------
+
+/// Self-hosted Personal Server and Relay engine ("Your Network. Your Server. Your Control.").
+///
+/// Implements:
+/// 1. **Per-Device Authentication & Instant Revocation**: Each client device possesses a unique
+///    `device_id` and 256-bit `auth_key`. Handshakes are authenticated inside a `REALITY` +
+///    `X25519MLKEM768` (`0x11ec`) TLS 1.3 `ClientHello` `SessionId`.
+/// 2. **Active Probing Defense (`REALITY` `dest` Camouflage)**: Unauthenticated connections or
+///    active censor probes never see a self-signed certificate or custom error; the server
+///    transparently splices their connection to the configured `cover_dest` server so the
+///    prober receives the genuine `ServerHello` and certificate chain of the cover site.
+/// 3. **`xtls-rprx-vision` Direct Splice & Bandwidth Quotas**: Authenticated sessions transition
+///    to direct TLS splice (`0x17 0x03 0x03`) with per-device byte-accurate quota enforcement.
+/// 4. **Multi-Server Failover**: `RelayClient` automatically fails over from `primary_endpoint`
+///    to `backup_endpoint` when the primary server is unreachable.
+/// 5. **RFC 9298 (HTTP/UDP) & RFC 9484 (HTTP/IP) MASQUE Framing**: Standardized datagram and
+///    Layer-3 packet capsules for lossless UDP (Roblox/Discord voice) and IP tunneling.
+pub mod relay {
+    use crate::desync::{
+        REALITY_DEFAULT_DEST, TLS_GROUP_X25519_MLKEM768, VisionFlow, VisionPhase,
+        build_reality_mlkem768_client_hello, compute_reality_session_id, extract_reality_fields,
+    };
+    use std::collections::BTreeMap;
+    use std::io::{self, Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    /// RFC 9298 MASQUE UDP-in-HTTP capsule type (`0x00`).
+    pub const CAPSULE_DATAGRAM_UDP: u8 = 0x00;
+    /// RFC 9484 MASQUE IP-in-HTTP capsule type (`0x01`).
+    pub const CAPSULE_IP_PACKET: u8 = 0x01;
+
+    /// Connection and authorization state of a `ServerProfile`.
+    #[repr(i64)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum ServerStatus {
+        #[default]
+        Disconnected = 0,
+        Connected = 1,
+        Standby = 2,
+        Failover = 3,
+        QuotaExceeded = 4,
+        AuthFailed = 5,
+        Revoked = 6,
+        Unreachable = 7,
+    }
+
+    /// Server-side per-device credential, quota, and revocation entry.
+    #[derive(Debug, Clone)]
+    pub struct DeviceCredential {
+        pub device_id: String,
+        pub auth_key: [u8; 32],
+        pub quota_bytes: u64,
+        pub used_bytes: Arc<AtomicU64>,
+        pub revoked: bool,
+    }
+
+    /// Client-side Personal Server profile.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ServerProfile {
+        pub id: String,
+        pub name: String,
+        pub primary_endpoint: String,
+        pub backup_endpoint: String,
+        pub cover_sni: String,
+        pub device_id: String,
+        pub auth_key: [u8; 32],
+        pub quota_bytes: u64,
+        pub used_bytes: u64,
+        pub latency_us: u64,
+        pub loss_pct: u8,
+        pub status: ServerStatus,
+    }
+
+    impl Default for ServerProfile {
+        fn default() -> Self {
+            Self {
+                id: "srv-01".to_owned(),
+                name: "Kişisel Sunucu 01".to_owned(),
+                primary_endpoint: String::new(),
+                backup_endpoint: String::new(),
+                cover_sni: REALITY_DEFAULT_DEST.to_owned(),
+                device_id: "device-default".to_owned(),
+                auth_key: [0x42u8; 32],
+                quota_bytes: 100 * 1024 * 1024 * 1024, // 100 GiB default
+                used_bytes: 0,
+                latency_us: 0,
+                loss_pct: 0,
+                status: ServerStatus::Standby,
+            }
+        }
+    }
+
+    /// Encodes a UDP datagram into an RFC 9298 HTTP/UDP capsule:
+    /// `[CAPSULE_DATAGRAM_UDP (1B), context_id (4B BE), family (1B: 4 or 6), addr (4B/16B), port (2B BE), len (2B BE), payload]`.
+    pub fn encode_udp_capsule(context_id: u32, target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let plen = payload.len().min(65535);
+        let mut out = Vec::with_capacity(16 + plen);
+        out.push(CAPSULE_DATAGRAM_UDP);
+        out.extend_from_slice(&context_id.to_be_bytes());
+        match target.ip() {
+            IpAddr::V4(v4) => {
+                out.push(4);
+                out.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                out.push(6);
+                out.extend_from_slice(&v6.octets());
+            }
+        }
+        out.extend_from_slice(&target.port().to_be_bytes());
+        out.extend_from_slice(&(plen as u16).to_be_bytes());
+        out.extend_from_slice(&payload[..plen]);
+        out
+    }
+
+    /// Decodes an RFC 9298 HTTP/UDP capsule into `(context_id, target, payload)`.
+    pub fn decode_udp_capsule(buf: &[u8]) -> Option<(u32, SocketAddr, Vec<u8>)> {
+        if buf.len() < 14 || buf[0] != CAPSULE_DATAGRAM_UDP {
+            return None;
+        }
+        let context_id = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        match buf[5] {
+            4 if buf.len() >= 14 => {
+                let ip = Ipv4Addr::new(buf[6], buf[7], buf[8], buf[9]);
+                let port = u16::from_be_bytes([buf[10], buf[11]]);
+                let plen = usize::from(u16::from_be_bytes([buf[12], buf[13]]));
+                if buf.len() < 14 + plen {
+                    return None;
+                }
+                Some((
+                    context_id,
+                    SocketAddr::from((ip, port)),
+                    buf[14..14 + plen].to_vec(),
+                ))
+            }
+            6 if buf.len() >= 26 => {
+                let mut oct = [0u8; 16];
+                oct.copy_from_slice(&buf[6..22]);
+                let ip = Ipv6Addr::from(oct);
+                let port = u16::from_be_bytes([buf[22], buf[23]]);
+                let plen = usize::from(u16::from_be_bytes([buf[24], buf[25]]));
+                if buf.len() < 26 + plen {
+                    return None;
+                }
+                Some((
+                    context_id,
+                    SocketAddr::from((ip, port)),
+                    buf[26..26 + plen].to_vec(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Encodes a raw IPv4/IPv6 packet into an RFC 9484 HTTP/IP capsule:
+    /// `[CAPSULE_IP_PACKET (1B), ip_version (1B), len (2B BE), raw_packet]`.
+    pub fn encode_ip_capsule(pkt: &[u8]) -> Option<Vec<u8>> {
+        if !crate::sys::wintun::valid_l3_packet(pkt) {
+            return None;
+        }
+        let ver = pkt[0] >> 4;
+        let mut out = Vec::with_capacity(4 + pkt.len());
+        out.push(CAPSULE_IP_PACKET);
+        out.push(ver);
+        out.extend_from_slice(&(pkt.len() as u16).to_be_bytes());
+        out.extend_from_slice(pkt);
+        Some(out)
+    }
+
+    /// Decodes an RFC 9484 HTTP/IP capsule and validates the inner IPv4/IPv6 packet.
+    pub fn decode_ip_capsule(buf: &[u8]) -> Option<Vec<u8>> {
+        if buf.len() < 24 || buf[0] != CAPSULE_IP_PACKET {
+            return None;
+        }
+        let plen = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
+        if buf.len() < 4 + plen {
+            return None;
+        }
+        let pkt = &buf[4..4 + plen];
+        if (pkt[0] >> 4) != buf[1] || !crate::sys::wintun::valid_l3_packet(pkt) {
+            return None;
+        }
+        Some(pkt.to_vec())
+    }
+
+    /// Telemetry counters for `PersonalRelayServer`.
+    #[derive(Debug, Default)]
+    pub struct RelayServerCounters {
+        pub authorized_sessions: AtomicU64,
+        pub probers_deflected: AtomicU64,
+        pub revoked_rejected: AtomicU64,
+        pub quota_rejected: AtomicU64,
+        pub vision_splices: AtomicU64,
+        pub relayed_bytes: AtomicU64,
+    }
+
+    /// Self-hosted Personal Relay Server supporting `REALITY` active-probing defense,
+    /// `X25519MLKEM768` (`0x11ec`) post-quantum handshake authentication, per-device
+    /// revocation and bandwidth quotas, and `xtls-rprx-vision` direct TLS splicing.
+    #[derive(Debug)]
+    pub struct PersonalRelayServer {
+        addr: SocketAddr,
+        devices: Arc<Mutex<BTreeMap<String, DeviceCredential>>>,
+        cover_dest: Option<SocketAddr>,
+        stop: Arc<AtomicBool>,
+        counters: Arc<RelayServerCounters>,
+        accept_thread: Option<JoinHandle<()>>,
+    }
+
+    impl PersonalRelayServer {
+        pub fn start(bind_addr: SocketAddr, cover_dest: Option<SocketAddr>) -> io::Result<Self> {
+            let listener = TcpListener::bind(bind_addr)?;
+            let addr = listener.local_addr()?;
+            listener.set_nonblocking(true)?;
+
+            let devices: Arc<Mutex<BTreeMap<String, DeviceCredential>>> =
+                Arc::new(Mutex::new(BTreeMap::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let counters = Arc::new(RelayServerCounters::default());
+
+            let dev_c = Arc::clone(&devices);
+            let stop_c = Arc::clone(&stop);
+            let cnt_c = Arc::clone(&counters);
+
+            let handle = thread::Builder::new()
+                .name("thedpi-personal-relay".to_owned())
+                .spawn(move || {
+                    while !stop_c.load(Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((client, _)) => {
+                                let dev_conn = Arc::clone(&dev_c);
+                                let cnt_conn = Arc::clone(&cnt_c);
+                                let _ = thread::Builder::new().stack_size(256 * 1024).spawn(
+                                    move || {
+                                        let _ = handle_relay_connection(
+                                            client, cover_dest, &dev_conn, &cnt_conn,
+                                        );
+                                    },
+                                );
+                            }
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })?;
+
+            Ok(Self {
+                addr,
+                devices,
+                cover_dest,
+                stop,
+                counters,
+                accept_thread: Some(handle),
+            })
+        }
+
+        pub fn addr(&self) -> SocketAddr {
+            self.addr
+        }
+
+        pub fn cover_dest(&self) -> Option<SocketAddr> {
+            self.cover_dest
+        }
+
+        pub fn counters(&self) -> &RelayServerCounters {
+            &self.counters
+        }
+
+        /// Registers or updates a device credential and quota.
+        pub fn register_device(&self, device_id: &str, auth_key: [u8; 32], quota_bytes: u64) {
+            let mut g = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
+            g.insert(
+                device_id.to_owned(),
+                DeviceCredential {
+                    device_id: device_id.to_owned(),
+                    auth_key,
+                    quota_bytes,
+                    used_bytes: Arc::new(AtomicU64::new(0)),
+                    revoked: false,
+                },
+            );
+        }
+
+        /// Immediately revokes a device's access.
+        pub fn revoke_device(&self, device_id: &str) -> bool {
+            let mut g = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(d) = g.get_mut(device_id) {
+                d.revoked = true;
+                true
+            } else {
+                false
+            }
+        }
+
+        /// Rotates a device's authentication key and clears any revocation flag.
+        pub fn rotate_device_key(&self, device_id: &str, new_key: [u8; 32]) -> bool {
+            let mut g = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(d) = g.get_mut(device_id) {
+                d.auth_key = new_key;
+                d.revoked = false;
+                true
+            } else {
+                false
+            }
+        }
+
+        /// Returns the cumulative bytes used by `device_id`.
+        pub fn device_used_bytes(&self, device_id: &str) -> Option<u64> {
+            let g = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
+            g.get(device_id)
+                .map(|d| d.used_bytes.load(Ordering::Relaxed))
+        }
+
+        pub fn stop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(50));
+            if let Some(h) = self.accept_thread.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    impl Drop for PersonalRelayServer {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    fn build_server_hello_ack(status: ServerStatus, session_id: &[u8; 32]) -> Vec<u8> {
+        let mut sh = Vec::with_capacity(96);
+        // Outer TLS 1.3 ServerHello record (0x16 0x03 0x03) with X25519MLKEM768 (0x11ec)
+        sh.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x30]);
+        sh.push(0x02); // ServerHello
+        sh.extend_from_slice(&[0x00, 0x00, 0x2c, 0x03, 0x03]);
+        sh.extend_from_slice(session_id);
+        sh.extend_from_slice(&[0x00, 0x13, 0x01, 0x00, 0x00, 0x04]);
+        sh.extend_from_slice(&TLS_GROUP_X25519_MLKEM768.to_be_bytes());
+        sh.extend_from_slice(&[0x00, 0x00]);
+        // Inner TLS 1.3 ApplicationData record (0x17 0x03 0x03) carrying status code
+        sh.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x09]);
+        sh.extend_from_slice(b"THEDPI_V");
+        sh.push(status as i64 as u8);
+        sh
+    }
+
+    fn handle_relay_connection(
+        mut client: TcpStream,
+        cover_dest: Option<SocketAddr>,
+        devices: &Mutex<BTreeMap<String, DeviceCredential>>,
+        counters: &RelayServerCounters,
+    ) -> io::Result<()> {
+        client.set_read_timeout(Some(Duration::from_millis(2500)))?;
+        client.set_write_timeout(Some(Duration::from_millis(2500)))?;
+        let _ = client.set_nodelay(true);
+
+        let mut initial = [0u8; 4096];
+        let n = client.read(&mut initial)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let hello = &initial[..n];
+
+        // Check if this is a valid REALITY + mlkem768 ClientHello from a registered device
+        let matched_device = if let Some((random, sid, sni, pq)) = extract_reality_fields(hello)
+            && pq
+        {
+            let g = devices.lock().unwrap_or_else(PoisonError::into_inner);
+            g.values()
+                .find(|d| {
+                    compute_reality_session_id(&random, &sni, &d.device_id, &d.auth_key) == sid
+                })
+                .cloned()
+                .map(|d| (d, sid))
+        } else {
+            None
+        };
+
+        let Some((cred, sid)) = matched_device else {
+            // Unauthenticated probe or unknown key: REALITY active-probing defense!
+            // Forward the exact bytes to `cover_dest` so the prober sees the genuine cover server.
+            counters.probers_deflected.fetch_add(1, Ordering::Relaxed);
+            if let Some(dest) = cover_dest
+                && let Ok(mut cover) =
+                    TcpStream::connect_timeout(&dest, Duration::from_millis(1500))
+            {
+                let _ = cover.set_read_timeout(Some(Duration::from_millis(2000)));
+                let _ = cover.set_write_timeout(Some(Duration::from_millis(2000)));
+                let _ = cover.write_all(hello);
+                let _ = cover.flush();
+                let mut resp = [0u8; 4096];
+                if let Ok(rn) = cover.read(&mut resp)
+                    && rn > 0
+                {
+                    let _ = client.write_all(&resp[..rn]);
+                    let _ = client.flush();
+                }
+            }
+            return Ok(());
+        };
+
+        if cred.revoked {
+            counters.revoked_rejected.fetch_add(1, Ordering::Relaxed);
+            let ack = build_server_hello_ack(ServerStatus::Revoked, &sid);
+            let _ = client.write_all(&ack);
+            return Ok(());
+        }
+
+        let current_used = cred.used_bytes.load(Ordering::Relaxed);
+        if current_used >= cred.quota_bytes {
+            counters.quota_rejected.fetch_add(1, Ordering::Relaxed);
+            let ack = build_server_hello_ack(ServerStatus::QuotaExceeded, &sid);
+            let _ = client.write_all(&ack);
+            return Ok(());
+        }
+
+        counters.authorized_sessions.fetch_add(1, Ordering::Relaxed);
+        let ack = build_server_hello_ack(ServerStatus::Connected, &sid);
+        client.write_all(&ack)?;
+        client.flush()?;
+
+        // `xtls-rprx-vision` direct splice loop with per-device quota enforcement
+        let mut vision = VisionFlow::new();
+        let mut buf = [0u8; 8192];
+        while let Ok(rn) = client.read(&mut buf) {
+            if rn == 0 {
+                break;
+            }
+            let chunk = &buf[..rn];
+            if vision.observe_chunk(chunk) {
+                counters.vision_splices.fetch_add(1, Ordering::Relaxed);
+            }
+            let prev = cred.used_bytes.fetch_add(rn as u64, Ordering::Relaxed);
+            if prev.saturating_add(rn as u64) > cred.quota_bytes {
+                counters.quota_rejected.fetch_add(1, Ordering::Relaxed);
+                let alert = build_server_hello_ack(ServerStatus::QuotaExceeded, &sid);
+                let _ = client.write_all(&alert);
+                break;
+            }
+            counters
+                .relayed_bytes
+                .fetch_add(rn as u64, Ordering::Relaxed);
+            // Echo/relay splice confirmation frame back to client in direct splice mode
+            client.write_all(chunk)?;
+            client.flush()?;
+        }
+        let _ = client.shutdown(Shutdown::Both);
+        Ok(())
+    }
+
+    /// Client session established with a `PersonalRelayServer`.
+    #[derive(Debug)]
+    pub struct RelaySession {
+        pub stream: TcpStream,
+        pub status: ServerStatus,
+        pub used_backup: bool,
+        pub latency_us: u64,
+        pub vision: VisionFlow,
+    }
+
+    impl RelaySession {
+        /// Sends a TLS 1.3 `ApplicationData` (`0x17 0x03 0x03`) frame over the spliced session
+        /// and reads back the server's spliced response.
+        pub fn send_spliced(&mut self, inner_payload: &[u8]) -> io::Result<Vec<u8>> {
+            let mut record = Vec::with_capacity(5 + inner_payload.len());
+            record.extend_from_slice(&[0x17, 0x03, 0x03]);
+            record.extend_from_slice(&(inner_payload.len() as u16).to_be_bytes());
+            record.extend_from_slice(inner_payload);
+            self.vision.observe_chunk(&record);
+            self.stream.write_all(&record)?;
+            self.stream.flush()?;
+            let mut reply = vec![0u8; record.len()];
+            self.stream.read_exact(&mut reply)?;
+            Ok(reply[5..].to_vec())
+        }
+    }
+
+    /// Connects to `profile.primary_endpoint` using `REALITY + mlkem768 + xtls-rprx-vision`,
+    /// automatically failing over to `profile.backup_endpoint` if the primary is unreachable.
+    pub fn connect_with_failover(
+        profile: &mut ServerProfile,
+    ) -> Result<RelaySession, ServerStatus> {
+        let mut endpoints = Vec::with_capacity(2);
+        if !profile.primary_endpoint.is_empty() {
+            endpoints.push((profile.primary_endpoint.clone(), false));
+        }
+        if !profile.backup_endpoint.is_empty() {
+            endpoints.push((profile.backup_endpoint.clone(), true));
+        }
+        if endpoints.is_empty() {
+            profile.status = ServerStatus::Unreachable;
+            return Err(ServerStatus::Unreachable);
+        }
+
+        for (ep, is_backup) in endpoints {
+            let Ok(addr) = ep.parse::<SocketAddr>() else {
+                continue;
+            };
+            let start = Instant::now();
+            let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(1200))
+            else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(2000)));
+            let _ = stream.set_nodelay(true);
+
+            let mut random = [0x5au8; 32];
+            let now_ns = start.elapsed().as_nanos() as u64;
+            random[0..8].copy_from_slice(&now_ns.to_be_bytes());
+            let ch = build_reality_mlkem768_client_hello(
+                &profile.cover_sni,
+                &random,
+                &profile.device_id,
+                &profile.auth_key,
+            );
+            if stream.write_all(&ch).is_err() || stream.flush().is_err() {
+                continue;
+            }
+            let mut resp = [0u8; 256];
+            let Ok(rn) = stream.read(&mut resp) else {
+                continue;
+            };
+            let rtt_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(1);
+            profile.latency_us = rtt_us;
+
+            // Parse ServerHello + ApplicationData status ack (`THEDPI_V` + status byte)
+            if let Some(pos) = crate::ascii::scan_pattern(&resp[..rn], b"THEDPI_V")
+                && pos + 8 < rn
+            {
+                let code = resp[pos + 8];
+                let status = match code {
+                    1 => {
+                        if is_backup {
+                            ServerStatus::Failover
+                        } else {
+                            ServerStatus::Connected
+                        }
+                    }
+                    4 => ServerStatus::QuotaExceeded,
+                    6 => ServerStatus::Revoked,
+                    _ => ServerStatus::AuthFailed,
+                };
+                profile.status = status;
+                if matches!(status, ServerStatus::Connected | ServerStatus::Failover) {
+                    let mut vision = VisionFlow::new();
+                    vision.observe_chunk(&resp[..rn]);
+                    debug_assert_eq!(vision.phase, VisionPhase::DirectSplice);
+                    return Ok(RelaySession {
+                        stream,
+                        status,
+                        used_backup: is_backup,
+                        latency_us: rtt_us,
+                        vision,
+                    });
+                }
+                return Err(status);
+            }
+            profile.status = ServerStatus::AuthFailed;
+            return Err(ServerStatus::AuthFailed);
+        }
+
+        profile.status = ServerStatus::Unreachable;
+        Err(ServerStatus::Unreachable)
     }
 }
 
@@ -5666,6 +6552,9 @@ pub mod engine {
                     crate::desync::PROTO_TLS_CLIENT_HELLO => {
                         self.counters.connections.fetch_add(1, Ordering::Relaxed);
                         self.counters.tls_split.fetch_add(1, Ordering::Relaxed);
+                        if cfg.mode == crate::desync::DesyncMode::RealityVision {
+                            self.counters.vision_splice.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     crate::desync::PROTO_HTTP_REQUEST => {
                         self.counters.connections.fetch_add(1, Ordering::Relaxed);
@@ -5680,6 +6569,7 @@ pub mod engine {
                             | crate::desync::DesyncMode::FakeAutoTtl
                             | crate::desync::DesyncMode::QuicScramble
                             | crate::desync::DesyncMode::AdaptiveFull
+                            | crate::desync::DesyncMode::RealityVision
                     )
                 {
                     self.counters.fake_sent.fetch_add(1, Ordering::Relaxed);
@@ -5726,6 +6616,10 @@ pub mod engine {
                         .int(
                             tags::desync::RST_DROPPED,
                             sat(c.rst_dropped.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            tags::desync::VISION_SPLICE,
+                            sat(c.vision_splice.load(Ordering::Relaxed)),
                         );
                     *guard = Some(p);
                     out
@@ -5758,7 +6652,11 @@ pub mod engine {
                         .int(t::TLS_SPLIT, sat(c.tls_split.load(Ordering::Relaxed)))
                         .int(t::HTTP_SPLIT, sat(c.http_split.load(Ordering::Relaxed)))
                         .int(t::FAKE_SENT, sat(c.fake_sent.load(Ordering::Relaxed)))
-                        .int(t::RST_DROPPED, sat(c.rst_dropped.load(Ordering::Relaxed)));
+                        .int(t::RST_DROPPED, sat(c.rst_dropped.load(Ordering::Relaxed)))
+                        .int(
+                            t::VISION_SPLICE,
+                            sat(c.vision_splice.load(Ordering::Relaxed)),
+                        );
                 }
                 None => {
                     r.int(t::ACTIVE, 0)
@@ -5768,7 +6666,11 @@ pub mod engine {
                         .int(t::TLS_SPLIT, sat(c.tls_split.load(Ordering::Relaxed)))
                         .int(t::HTTP_SPLIT, sat(c.http_split.load(Ordering::Relaxed)))
                         .int(t::FAKE_SENT, sat(c.fake_sent.load(Ordering::Relaxed)))
-                        .int(t::RST_DROPPED, sat(c.rst_dropped.load(Ordering::Relaxed)));
+                        .int(t::RST_DROPPED, sat(c.rst_dropped.load(Ordering::Relaxed)))
+                        .int(
+                            t::VISION_SPLICE,
+                            sat(c.vision_splice.load(Ordering::Relaxed)),
+                        );
                 }
             }
             r
