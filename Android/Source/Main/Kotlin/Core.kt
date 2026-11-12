@@ -73,6 +73,8 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
+import java.nio.channels.SocketChannel
+import java.nio.channels.DatagramChannel
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.security.cert.CertPathValidatorException
@@ -2048,7 +2050,9 @@ class DirectDohClient(
         val ip = IpPackets.parseIpLiteral(host)?.let { InetAddress.getByAddress(IpPackets.ipToBytes(it)) }
             ?: BOOTSTRAP[host.lowercase()]?.let { InetAddress.getByAddress(IpPackets.ipToBytes(IpPackets.parseIpLiteral(it)!!)) }
             ?: InetAddress.getByName(host)
-        val raw = Socket()
+        val channel = SocketChannel.open()
+        channel.configureBlocking(true)
+        val raw = channel.socket()
         try {
             protectSocket(raw)
             raw.tcpNoDelay = true
@@ -2376,12 +2380,14 @@ class TunBridge(
             if (srv.isBlank()) continue
             val host = srv.substringBefore(':')
             val port = srv.substringAfter(':', "53").toIntOrNull() ?: 53
-            val sock = try {
-                DatagramSocket()
+            val ch = try {
+                DatagramChannel.open().apply { configureBlocking(true) }
             } catch (_: Exception) {
                 continue
             }
+            val sock = ch.socket()
             try {
+                sock.bind(null)
                 protectDatagram(sock)
                 val target = InetSocketAddress(InetAddress.getByName(host), port)
                 sock.send(DatagramPacket(query, query.size, target))
@@ -2412,6 +2418,16 @@ class TunBridge(
     private fun handleUdp(raw: ByteArray, udp: IpPackets.UdpDatagram) {
         if (udp.payload.isEmpty()) return
         val key = FlowKey(udp.ip.srcIp, udp.srcPort, udp.ip.dstIp, udp.dstPort)
+        if (udpTable.size > 512) {
+            val it = udpTable.entries.iterator()
+            var evicted = 0
+            while (it.hasNext() && udpTable.size > 400 && evicted < 100) {
+                val entry = it.next()
+                entry.value.close()
+                it.remove()
+                evicted++
+            }
+        }
         val flow = udpTable.computeIfAbsent(key) { k ->
             udpFlows.incrementAndGet()
             UdpFlow(k).also { it.start() }
@@ -2421,10 +2437,13 @@ class TunBridge(
 
     private inner class UdpFlow(val key: FlowKey) {
         val socket: DatagramSocket? = runCatching {
-            DatagramSocket(0).also {
-                protectDatagram(it)
-                it.soTimeout = 30_000
-            }
+            val ch = DatagramChannel.open()
+            ch.configureBlocking(true)
+            val ds = ch.socket()
+            ds.bind(null)
+            protectDatagram(ds)
+            ds.soTimeout = 30_000
+            ds
         }.getOrNull()
         private val closed = AtomicBoolean(false)
         private val targetAddress: InetSocketAddress? = runCatching {
@@ -2513,6 +2532,16 @@ class TunBridge(
             return
         }
         if (isSyn) {
+            if (tcpTable.size > 256) {
+                val it = tcpTable.entries.iterator()
+                var evicted = 0
+                while (it.hasNext() && tcpTable.size > 200 && evicted < 50) {
+                    val entry = it.next()
+                    entry.value.close()
+                    it.remove()
+                    evicted++
+                }
+            }
             tcpTable.remove(key)?.close()
             val flow = TcpFlow(key, (tcp.seq + 1L) and 0xFFFFFFFFL)
             tcpTable[key] = flow
@@ -2689,19 +2718,20 @@ class TunBridge(
         }
 
         private fun connectAndPump() {
-            val sock = Socket()
+            val channel = SocketChannel.open()
+            channel.configureBlocking(true)
+            val sock = channel.socket()
             try {
                 protectSocket(sock)
                 sock.tcpNoDelay = true
                 runCatching { sock.keepAlive = true }
+                sock.soTimeout = 90_000
                 val dstInet = if (key.dstIp == virtualDnsIp) {
                     InetAddress.getByName(upstreamDnsServers.firstOrNull()?.substringBefore(':') ?: "1.1.1.1")
                 } else {
                     InetAddress.getByAddress(IpPackets.ipToBytes(key.dstIp))
                 }
                 sock.connect(InetSocketAddress(dstInet, key.dstPort), 5000)
-                // Long-lived idle streams (Discord gateway heartbeat ≈ 41 s) must not time out.
-                sock.soTimeout = 0
                 synchronized(lock) {
                     if (closed.get()) {
                         runCatching { sock.close() }
@@ -3418,6 +3448,9 @@ class TheDpiVpnService : VpnService() {
                 .addDnsServer(TunBridge.VPN_DNS_IP)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
+            builder.allowBypass()
+            val disResult = runCatching { builder.addDisallowedApplication(packageName) }
+            CrashLogger.log("TheDpiVpnService", "addDisallowedApplication($packageName) -> ${if (disResult.isSuccess) "başarılı" else disResult.exceptionOrNull()?.message}")
             // Route IPv6 into TUN so TunBridge answers with immediate ICMPv6 unreachable,
             // preventing dual-stack apps from leaking past the VPN to the ISP.
             runCatching {
@@ -3429,16 +3462,28 @@ class TheDpiVpnService : VpnService() {
             if (pfd != null) {
                 CrashLogger.log("TheDpiVpnService", "TUN arabirimi başarıyla açıldı (fd=${pfd.fd})")
                 // Sockets inside DirectDohClient and TunBridge are explicitly protected with protect(),
-                // allowing MainActivity's diagnostic tests to run through the VPN tunnel without loops.
+                // and com.the.dpi is excluded from VPN routing via addDisallowedApplication, preventing loops.
                 val doh = DirectDohClient(
-                    protectSocket = { sock -> protect(sock) },
+                    protectSocket = { sock ->
+                        val ok = protect(sock)
+                        if (!ok) CrashLogger.log("TheDpiVpnService", "protectSocket(doh) false döndü!")
+                        ok
+                    },
                 )
                 val b = TunBridge(
                     session = s,
                     tunInput = FileInputStream(pfd.fileDescriptor),
                     tunOutput = FileOutputStream(pfd.fileDescriptor),
-                    protectSocket = { sock -> protect(sock) },
-                    protectDatagram = { ds -> protect(ds) },
+                    protectSocket = { sock ->
+                        val ok = protect(sock)
+                        if (!ok) CrashLogger.log("TheDpiVpnService", "protectSocket(tun) false döndü!")
+                        ok
+                    },
+                    protectDatagram = { ds ->
+                        val ok = protect(ds)
+                        if (!ok) CrashLogger.log("TheDpiVpnService", "protectDatagram(tun) false döndü!")
+                        ok
+                    },
                     dohClient = doh,
                     dohEndpoints = customDoh.ifEmpty { TunBridge.DEFAULT_DOH_ENDPOINTS },
                     upstreamDnsServers = customDns.ifEmpty { TunBridge.DEFAULT_DNS_SERVERS },
