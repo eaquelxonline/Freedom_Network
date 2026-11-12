@@ -725,6 +725,26 @@ fn fake_quic(max_ip_size: usize) -> (SocketAddr, Arc<AtomicBool>, thread::JoinHa
     (addr, stop, h)
 }
 
+/// Loopback TCP endpoint that accepts and immediately closes connections, so the
+/// kernel accept queue never fills during long benchmarks (which would turn later
+/// probes into timeouts and measure the fixture instead of the engine).
+fn tcp_sink() -> (u16, Arc<AtomicBool>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    l.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    thread::spawn(move || {
+        while !st.load(Ordering::SeqCst) {
+            match l.accept() {
+                Ok((c, _)) => drop(c),
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    });
+    (port, stop)
+}
+
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
@@ -921,8 +941,7 @@ fn path_mtu_probe_finds_size_dependent_drop() {
 #[test]
 fn full_run_is_bounded_and_ordered() {
     let srv = fake_dns(DnsMode::Normal);
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
+    let (port, _sink) = tcp_sink();
     let targets: Vec<_> = ["svc.test", "other.test", "127.0.0.1"]
         .iter()
         .map(|h| probe::parse_target(&format!("{h}:{port}")).unwrap())
@@ -1474,13 +1493,41 @@ fn ewma_and_stability() {
 }
 
 #[test]
+fn nxdomain_only_evidence_suggests_checking_the_name() {
+    let mut nx = healthy_target("typo.test");
+    nx.dns.status = Status::NameError;
+    let run = run_of(
+        vec![nx, healthy_target("ok.test")],
+        vec![resolver(true, false)],
+    );
+    let d = intel::classify(Some(&env_with(|_| {})), &run);
+    assert_eq!(decide::action_for_diagnosis(&d[0]), Action::CheckTargetName);
+    assert!(!Action::CheckTargetName.is_high_impact());
+    let mut dec = Decider::new(0, 10);
+    dec.step(0, Some(800), &d);
+    assert_eq!(dec.step(1, Some(800), &d).action, Action::CheckTargetName);
+    // SERVFAIL evidence still points at the resolver.
+    let mut sf = healthy_target("a.test");
+    sf.dns.status = Status::ServerFailure;
+    let d2 = intel::classify(
+        Some(&env_with(|_| {})),
+        &run_of(vec![sf], vec![resolver(true, false)]),
+    );
+    assert_eq!(
+        decide::action_for_diagnosis(&d2[0]),
+        Action::UseAlternateDns
+    );
+}
+
+#[test]
 fn every_category_maps_to_an_action() {
     for c in 0..=17i64 {
         let cat: Category = unsafe_free_category(c);
         let a = decide::action_for(cat);
         assert!(decide::Action::from_code(a as i64).is_some());
     }
-    assert!(decide::Action::from_code(13).is_none());
+    assert!(decide::Action::from_code(13).is_some());
+    assert!(decide::Action::from_code(14).is_none());
     assert!(decide::Action::from_code(-1).is_none());
 }
 
@@ -1687,8 +1734,7 @@ fn api_rejects_invalid_requests() {
 fn engine_end_to_end_on_loopback() {
     let _g = registry_guard();
     let srv = fake_dns(DnsMode::Normal);
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
+    let (port, _sink) = tcp_sink();
     let h = api::create(Some(&config_bytes(|_| {})));
     assert_eq!(
         api::set_environment(h, &env_bytes(&srv.addr.to_string())),
@@ -1840,4 +1886,243 @@ fn random_ids_vary() {
     b.sort_unstable();
     b.dedup();
     assert_eq!(a.len(), b.len());
+}
+
+// ---------------------------------------------------------------- benchmarks & stress (run explicitly)
+//
+//   cargo test --release -- --ignored --nocapture --test-threads=1 bench_
+//   cargo test --release -- --ignored --nocapture stress_
+
+fn bench<F: FnMut()>(name: &str, iters: u32, mut f: F) -> f64 {
+    for _ in 0..iters / 10 + 1 {
+        f(); // warm-up
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        f();
+    }
+    let ns = start.elapsed().as_nanos() as f64 / f64::from(iters);
+    println!("BENCH {name:<44} {ns:>12.1} ns/op  ({iters} iterations)");
+    ns
+}
+
+fn sample_run(n: usize) -> RunReport {
+    let mut targets = Vec::new();
+    for i in 0..n {
+        let mut t = healthy_target(&format!("t{i}.test"));
+        t.dns.https = Some(dns::Svcb {
+            priority: 1,
+            alpn: vec!["h3".into(), "h2".into()],
+            ech: true,
+            ..dns::Svcb::default()
+        });
+        t.quic = probe::QuicResult {
+            status: Status::Ok,
+            rtt_us: 20_000,
+            versions: vec![quic::VERSION_1],
+        };
+        targets.push(t);
+    }
+    run_of(targets, vec![resolver(true, false), resolver(true, true)])
+}
+
+#[cfg(target_os = "linux")]
+fn rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+#[ignore]
+fn bench_core_paths() {
+    let q = dns::build_query(5, "svc.test", dns::TYPE_HTTPS, true).unwrap();
+    let resp = make_response(
+        &q,
+        0x8180,
+        &[
+            (dns::TYPE_HTTPS, https_rdata()),
+            (dns::TYPE_A, vec![1, 1, 1, 1]),
+        ],
+    );
+    bench("dns::build_query", 200_000, || {
+        std::hint::black_box(
+            dns::build_query(
+                7,
+                std::hint::black_box("www.example.com"),
+                dns::TYPE_A,
+                true,
+            )
+            .unwrap(),
+        );
+    });
+    bench("dns::parse_response (HTTPS + A)", 200_000, || {
+        std::hint::black_box(
+            dns::parse_response(std::hint::black_box(&resp), 5, "svc.test", dns::TYPE_HTTPS)
+                .unwrap(),
+        );
+    });
+    let d = [1u8; 8];
+    let s = [2u8; 8];
+    let vn = vn_packet(&s, &d, &[quic::VERSION_1, quic::VERSION_2]);
+    bench("quic::build_probe (1200 B)", 200_000, || {
+        std::hint::black_box(quic::build_probe(&d, &s, 1200));
+    });
+    bench("quic::parse_version_negotiation", 500_000, || {
+        std::hint::black_box(
+            quic::parse_version_negotiation(std::hint::black_box(&vn), &d, &s).unwrap(),
+        );
+    });
+    let run = sample_run(8);
+    let env = env_with(|_| {});
+    bench("intel::classify (8 targets)", 50_000, || {
+        std::hint::black_box(intel::classify(Some(&env), std::hint::black_box(&run)));
+    });
+    bench("engine::score (8 targets)", 200_000, || {
+        std::hint::black_box(engine::score(std::hint::black_box(&run)));
+    });
+    let diags = intel::classify(Some(&env), &run);
+    let mut decider = Decider::new(0, 10);
+    let mut t = 0u64;
+    bench("decide::Decider::step", 500_000, || {
+        t += 1;
+        std::hint::black_box(decider.step(t, Some(800), &diags));
+    });
+    let rec = engine::encode_run(&run, 1);
+    bench("wire::encode (run report, 8 targets)", 50_000, || {
+        std::hint::black_box(wire::encode(std::hint::black_box(&rec)).unwrap());
+    });
+    let bytes = wire::encode(&rec).unwrap();
+    println!("INFO  run report size (8 targets): {} bytes", bytes.len());
+    bench("wire::decode (run report, 8 targets)", 50_000, || {
+        std::hint::black_box(wire::decode(std::hint::black_box(&bytes)).unwrap());
+    });
+    let _g = registry_guard();
+    bench("api::create + api::destroy", 100_000, || {
+        let h = api::create(None);
+        api::destroy(h);
+    });
+}
+
+#[test]
+#[ignore]
+fn bench_loopback_diagnose() {
+    let _g = registry_guard();
+    let srv = fake_dns(DnsMode::Normal);
+    let (port, _sink) = tcp_sink();
+    let req = request(
+        &(0..4)
+            .map(|i| format!("t{i}.test:{port}"))
+            .collect::<Vec<_>>(),
+    );
+    for quic_on in [0, 1] {
+        let h = api::create(Some(&config_bytes(|r| {
+            r.int(tags::config::DNS_SAMPLES, 3)
+                .int(tags::config::TCP_SAMPLES, 3)
+                .int(tags::config::QUIC, quic_on);
+        })));
+        api::set_environment(h, &env_bytes(&srv.addr.to_string()));
+        let name = format!("diagnose + evaluate (4 targets, loopback, quic={quic_on})");
+        let ns = bench(&name, 30, || {
+            assert_eq!(
+                wire::decode(&api::diagnose(h, &req)).unwrap().status(),
+                Some(0)
+            );
+            std::hint::black_box(api::evaluate(h));
+        });
+        println!("INFO  {name}: {:.2} ms per run", ns / 1e6);
+        api::destroy(h);
+    }
+}
+
+#[test]
+#[ignore]
+fn stress_long_running_session() {
+    let _g = registry_guard();
+    let srv = fake_dns(DnsMode::Normal);
+    let (port, _sink) = tcp_sink();
+    let h = api::create(Some(&config_bytes(|r| {
+        r.int(tags::config::DNS_SAMPLES, 1)
+            .int(tags::config::TCP_SAMPLES, 1)
+            .int(tags::config::QUIC, 0);
+    })));
+    let env = env_bytes(&srv.addr.to_string());
+    let req = request(&[format!("svc.test:{port}"), format!("127.0.0.1:{port}")]);
+    let warm = 200;
+    let cycles = 5000;
+    #[cfg(target_os = "linux")]
+    let mut baseline = 0;
+    let start = Instant::now();
+    for i in 0..cycles {
+        if i % 50 == 0 {
+            api::network_changed(h);
+        }
+        assert_eq!(api::set_environment(h, &env), code::OK);
+        assert_eq!(
+            wire::decode(&api::diagnose(h, &req)).unwrap().status(),
+            Some(0)
+        );
+        assert_eq!(wire::decode(&api::evaluate(h)).unwrap().status(), Some(0));
+        if i % 7 == 0 {
+            let _ = api::mark_applied(h, i % 13);
+        }
+        #[cfg(target_os = "linux")]
+        if i == warm {
+            baseline = rss_kib();
+        }
+    }
+    let elapsed = start.elapsed();
+    api::destroy(h);
+    println!(
+        "STRESS {cycles} diagnose/evaluate cycles in {:.1} s",
+        elapsed.as_secs_f64()
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let end = rss_kib();
+        println!(
+            "STRESS RSS after warm-up {baseline} KiB, at end {end} KiB (Δ {} KiB)",
+            end as i64 - baseline as i64
+        );
+        assert!(
+            end < baseline + 4096,
+            "resident memory grew by more than 4 MiB: {baseline} → {end}"
+        );
+    }
+    let _ = warm;
+}
+
+#[test]
+#[ignore]
+fn stress_init_shutdown_and_concurrency() {
+    let _g = registry_guard();
+    let start = Instant::now();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            thread::spawn(|| {
+                for _ in 0..20_000 {
+                    let h = api::create(None);
+                    if h > 0 {
+                        let _ = api::evaluate(h);
+                        let _ = api::network_changed(h);
+                        assert_eq!(api::destroy(h), code::OK);
+                    }
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(api::engine_count(), 0);
+    println!(
+        "STRESS 160000 create/use/destroy cycles across 8 threads in {:.2} s",
+        start.elapsed().as_secs_f64()
+    );
 }

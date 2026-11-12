@@ -2045,7 +2045,13 @@ pub mod probe {
         };
         if let Some(ip) = quic_ip.filter(|_| cfg.quic) {
             let addr = SocketAddr::new(ip, quic_port);
-            quic = quic_probe(addr, cfg.timeout, 2, deadline);
+            // A silent UDP endpoint is only evidence when HTTP/3 is advertised (the classifier
+            // ignores it otherwise), so the retry is spent only where it can change a diagnosis.
+            let h3 = dns
+                .https
+                .as_ref()
+                .is_some_and(|s| s.alpn.iter().any(|a| a == "h3"));
+            quic = quic_probe(addr, cfg.timeout, if h3 { 2 } else { 1 }, deadline);
             if cfg.mtu && quic.status == Status::Ok {
                 mtu = mtu_probe(addr, iface_mtu, cfg.timeout, deadline);
             }
@@ -2879,6 +2885,7 @@ pub mod decide {
         ContactServiceOrAdmin = 10,
         RevertLastChange = 11,
         CheckLocalConnection = 12,
+        CheckTargetName = 13,
     }
 
     impl Action {
@@ -2898,6 +2905,7 @@ pub mod decide {
                 10 => ContactServiceOrAdmin,
                 11 => RevertLastChange,
                 12 => CheckLocalConnection,
+                13 => CheckTargetName,
                 _ => return None,
             })
         }
@@ -2913,6 +2921,19 @@ pub mod decide {
                     | Action::RevertLastChange
             )
         }
+    }
+
+    /// Evidence-aware mapping: a resolution failure whose only evidence is NXDOMAIN means
+    /// the name does not exist, so changing the resolver would not help.
+    pub fn action_for_diagnosis(d: &Diagnosis) -> Action {
+        let only_nxdomain = !d.observations.is_empty()
+            && d.observations
+                .iter()
+                .all(|o| o.code == crate::intel::Obs::DnsNameError);
+        if d.category == Category::DnsResolutionFailure && only_nxdomain {
+            return Action::CheckTargetName;
+        }
+        action_for(d.category)
     }
 
     pub fn action_for(c: Category) -> Action {
@@ -3130,7 +3151,7 @@ pub mod decide {
                         .then(b.category.cmp(&a.category))
                 });
             let (cand, conf, cat) = match top {
-                Some(d) => (action_for(d.category), d.confidence, d.category),
+                Some(d) => (action_for_diagnosis(d), d.confidence, d.category),
                 None => (Action::KeepCurrent, 0, Category::None),
             };
 

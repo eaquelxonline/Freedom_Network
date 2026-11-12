@@ -640,6 +640,7 @@ object Text {
         10 -> "Servis sağlayıcı / ağ yöneticisiyle iletişime geç"
         11 -> "Son değişikliği geri al"
         12 -> "Yerel bağlantıyı kontrol et"
+        13 -> "Hedef adını kontrol et"
         else -> "Eylem $a"
     }
 
@@ -657,6 +658,7 @@ object Text {
         10 -> "Sorun bu hedefe özgü görünüyor (diğer hedefler çalışıyor). Hizmet sağlayıcısıyla veya ağ yöneticisiyle iletişime geçin."
         11 -> "Uygulanan değişiklik (${actionTitle(param.toInt())}) bağlantıyı iyileştirmedi. Önceki ayara geri dönün."
         12 -> "Wi-Fi/kablo/mobil veri bağlantısını ve modemi kontrol edin."
+        13 -> "Alan adı DNS'te bulunamadı (NXDOMAIN) ve diğer adlar çözülüyor: büyük olasılıkla yazım hatası veya kaldırılmış bir ad. DNS ayarlarını değiştirmek bu sorunu çözmez."
         else -> ""
     }
 
@@ -708,7 +710,7 @@ object Text {
 
     const val KNOWN_OBSERVATIONS = 38
     const val KNOWN_CATEGORIES = 17
-    const val KNOWN_ACTIONS = 12
+    const val KNOWN_ACTIONS = 13
 
     private fun ms(us: Long) = "${us / 1000} ms"
 
@@ -751,7 +753,8 @@ object Text {
         }
         val e = r.evaluation ?: return@buildString
         appendLine()
-        appendLine("TEŞHİS (puan ${e.score}/1000, ortalama ${e.ewma}, kararlılık ${e.stability}/1000)")
+        val stability = if (e.evaluations >= 2) ", kararlılık ${e.stability}/1000" else ""
+        appendLine("TEŞHİS (puan ${e.score}/1000, ortalama ${e.ewma}$stability)")
         for (d in e.diagnoses) {
             appendLine("  • ${category(d.category)} — güven %${d.confidence}")
             d.observations.forEach { appendLine("      - ${observation(it)}") }
@@ -761,6 +764,9 @@ object Text {
             appendLine("KARAR: ${state(d.state)}")
             appendLine("  ${actionTitle(d.action)}${if (d.highImpact) " (sistem ayarı — yalnızca sizin onayınızla)" else ""}")
             actionDetail(d.action, d.param).takeIf { it.isNotEmpty() }?.let { appendLine("  $it") }
+            if ((d.state == 1 || d.state == 3) && d.param > 0) {
+                appendLine("  Değerlendirilen öneri: ${actionTitle(d.param.toInt())} (tek ölçümle sistem değişikliği önerilmez)")
+            }
             if (d.cooldownMs > 0) appendLine("  Yeni değişiklik önerisi için kalan süre: ${d.cooldownMs / 1000} sn")
         }
     }

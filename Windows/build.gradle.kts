@@ -93,6 +93,9 @@ val nativeBuildWindows = tasks.register<Exec>("nativeBuildWindows") {
     description = "Builds the_dpi.dll for x86_64-pc-windows-msvc (Windows host)."
     onlyIf { isWindowsHost }
     workingDir(nativeDir)
+    // Static CRT (no VC++ redistributable) and LOAD_LIBRARY_SEARCH_SYSTEM32 (0x800) for the DLL's
+    // own imports, so dependent system DLLs cannot be planted next to the application.
+    environment("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS", "-C target-feature=+crt-static -C link-arg=/DEPENDENTLOADFLAG:0x800")
     commandLine("cargo", "build", "--release", "--locked", "--target", "x86_64-pc-windows-msvc")
 }
 
