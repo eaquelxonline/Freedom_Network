@@ -4837,20 +4837,6 @@ object NullIslandLocationShield {
 
     val isActive: Boolean get() = active.get()
 
-    @android.annotation.TargetApi(31)
-    private fun addAndPushProvider31(lm: android.location.LocationManager, provider: String) {
-        val props = android.location.provider.ProviderProperties.Builder()
-            .setHasAltitudeSupport(true)
-            .setHasBearingSupport(true)
-            .setHasSpeedSupport(true)
-            .setPowerUsage(android.location.provider.ProviderProperties.POWER_USAGE_LOW)
-            .setAccuracy(android.location.provider.ProviderProperties.ACCURACY_FINE)
-            .build()
-        runCatching { lm.removeTestProvider(provider) }
-        lm.addTestProvider(provider, props)
-        lm.setTestProviderEnabled(provider, true)
-    }
-
     @Suppress("DEPRECATION")
     @android.annotation.SuppressLint("WrongConstant")
     private fun addAndPushProviderLegacy(lm: android.location.LocationManager, provider: String) {
@@ -4907,7 +4893,16 @@ object NullIslandLocationShield {
         for (p in providers) {
             try {
                 if (Build.VERSION.SDK_INT >= 31) {
-                    addAndPushProvider31(lm, p)
+                    val props = android.location.provider.ProviderProperties.Builder()
+                        .setHasAltitudeSupport(true)
+                        .setHasBearingSupport(true)
+                        .setHasSpeedSupport(true)
+                        .setPowerUsage(android.location.provider.ProviderProperties.POWER_USAGE_LOW)
+                        .setAccuracy(android.location.provider.ProviderProperties.ACCURACY_FINE)
+                        .build()
+                    runCatching { lm.removeTestProvider(p) }
+                    lm.addTestProvider(p, props)
+                    lm.setTestProviderEnabled(p, true)
                 } else {
                     addAndPushProviderLegacy(lm, p)
                 }
