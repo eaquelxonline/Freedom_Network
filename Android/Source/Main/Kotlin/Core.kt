@@ -3398,12 +3398,13 @@ class TheDpiVpnService : VpnService() {
             .build()
     }
 
+    @android.annotation.SuppressLint("InlinedApi")
     private fun startTunnel(customDoh: List<String>, customDns: List<String>) {
         CrashLogger.log("TheDpiVpnService", "startTunnel başlatılıyor... (doh=${customDoh.size}, dns=${customDns.size})")
         createNotificationChannel()
         val notif = buildNotification("Sistem Geneli TUN Köprüsü Devrede (DoH + REALITY/Vision)")
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (Build.VERSION.SDK_INT >= 34) { // Android 14+ (UPSIDE_DOWN_CAKE)
                 startForeground(NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             } else {
                 startForeground(NOTIFICATION_ID, notif)
