@@ -1610,6 +1610,83 @@ object IpPackets {
         }
         return listOf(origPayload)
     }
+
+    /**
+     * Fragments a single TLS 1.2/1.3 `ClientHello` record (`0x16 0x03 0x01..0x04 <len:2>`) across
+     * multiple valid `TLSPlaintext` handshake records (RFC 5246 §6.2.1 / RFC 8446 §5.1) aligned
+     * with the TCP split chunks so stateful TCP-reassembling ISP middleboxes never see an intact
+     * SNI (`0x0000`) or ECH (`0xfe0d`) extension in a single TLS record.
+     */
+    fun fragmentTlsClientHelloRecords(origPayload: ByteArray, tcpChunks: List<ByteArray>): List<ByteArray> {
+        if (origPayload.size < 43 ||
+            (origPayload[0].toInt() and 0xFF) != 0x16 ||
+            (origPayload[1].toInt() and 0xFF) != 0x03 ||
+            (origPayload[2].toInt() and 0xFF) > 0x04 ||
+            (origPayload[5].toInt() and 0xFF) != 0x01
+        ) {
+            return tcpChunks
+        }
+        val recLen = u16(origPayload, 3)
+        if (5 + recLen != origPayload.size || recLen <= 4 || tcpChunks.size <= 1) {
+            return tcpChunks
+        }
+        val hs = origPayload.copyOfRange(5, origPayload.size)
+        val splitPoints = ArrayList<Int>()
+        splitPoints.add(minOf(4, hs.size - 1))
+        var cursor = 0
+        for (i in 0 until tcpChunks.size - 1) {
+            cursor += tcpChunks[i].size
+            val hsOff = cursor - 5
+            if (hsOff in 1 until hs.size) {
+                splitPoints.add(hsOff)
+            }
+        }
+        val uniqueSplits = splitPoints.distinct().sorted()
+        if (uniqueSplits.isEmpty()) return tcpChunks
+        val records = ArrayList<ByteArray>(uniqueSplits.size + 1)
+        var prev = 0
+        for (sp in uniqueSplits + hs.size) {
+            if (sp <= prev || sp > hs.size) continue
+            val sliceLen = sp - prev
+            val rec = ByteArray(5 + sliceLen)
+            rec[0] = 0x16
+            rec[1] = origPayload[1]
+            rec[2] = origPayload[2]
+            putU16(rec, 3, sliceLen)
+            System.arraycopy(hs, prev, rec, 5, sliceLen)
+            records.add(rec)
+            prev = sp
+        }
+        return if (records.size > 1) records else tcpChunks
+    }
+
+    /** Builds a 74-byte Discord Voice UDP IP Discovery packet (`0x00 0x01 0x00 0x46` + SSRC). */
+    fun buildDiscordVoiceIpDiscovery(ssrc: Int, address: String = "", port: Int = 0): ByteArray {
+        val pkt = ByteArray(74)
+        putU16(pkt, 0, 0x0001)
+        putU16(pkt, 2, 70)
+        putU32(pkt, 4, ssrc.toLong() and 0xFFFFFFFFL)
+        val addrBytes = address.toByteArray(Charsets.UTF_8)
+        System.arraycopy(addrBytes, 0, pkt, 8, minOf(addrBytes.size, 63))
+        putU16(pkt, 72, port)
+        return pkt
+    }
+
+    /** Builds a Roblox RakNet `ID_OPEN_CONNECTION_REQUEST_1` (`0x05`) UDP handshake datagram. */
+    fun buildRobloxRakNetOpenConnectionRequest1(totalSize: Int = 48): ByteArray {
+        val size = maxOf(18, totalSize)
+        val pkt = ByteArray(size)
+        pkt[0] = 0x05
+        val magic = byteArrayOf(
+            0x00, 0xFF.toByte(), 0xFF.toByte(), 0x00,
+            0xFE.toByte(), 0xFE.toByte(), 0xFE.toByte(), 0xFE.toByte(),
+            0xFD.toByte(), 0xFD.toByte(), 0xFD.toByte(), 0xFD.toByte(),
+            0x12, 0x34, 0x56, 0x78,
+        )
+        System.arraycopy(magic, 0, pkt, 1, magic.size)
+        pkt[17] = 11 // RakNet protocol version
+        return pkt
+    }
 }
 
 /**
@@ -1663,6 +1740,21 @@ class TunBridge(
     val dohResolved = AtomicInteger(0)
     val desyncedFlows = AtomicInteger(0)
     val visionSplicedFlows = AtomicInteger(0)
+    val roamingRebinds = AtomicInteger(0)
+
+    /**
+     * Handles seamless Wi-Fi <-> Mobile Data (LTE/5G) roaming by refreshing ephemeral UDP NAT
+     * bindings and re-protecting active sockets without tearing down the TUN interface.
+     */
+    fun rebindActiveSessions() {
+        roamingRebinds.incrementAndGet()
+        for (u in udpTable.values) {
+            u.socket?.let { runCatching { protectDatagram(it) } }
+        }
+        for (t in tcpTable.values) {
+            t.upstreamSocket?.let { runCatching { protectSocket(it) } }
+        }
+    }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return

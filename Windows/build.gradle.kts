@@ -91,7 +91,8 @@ tasks.check { dependsOn(coreTest) }
 val nativeBuildWindows = tasks.register<Exec>("nativeBuildWindows") {
     group = "build"
     description = "Builds the_dpi.dll for x86_64-pc-windows-msvc (Windows host)."
-    onlyIf { isWindowsHost }
+    enabled = isWindowsHost
+    mustRunAfter(":nativeFormatCheck", ":nativeLint", ":nativeTest", ":nativeBuildHost")
     workingDir(nativeDir)
     // Static CRT (no VC++ redistributable) and LOAD_LIBRARY_SEARCH_SYSTEM32 (0x800) for the DLL's
     // own imports, so dependent system DLLs cannot be planted next to the application.
@@ -110,19 +111,24 @@ val packageInput = tasks.register<Copy>("packageInput") {
 val packageWindows = tasks.register<Exec>("packageWindows") {
     group = "distribution"
     description = "Creates the Windows app-image with jpackage (JDK tool). Sign with signtool afterwards."
-    onlyIf { isWindowsHost }
+    enabled = isWindowsHost
     dependsOn(packageInput)
+    val appVer = project.version.toString()
     val jdk = javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) }.get().metadata.installationPath
-    val out = layout.buildDirectory.dir("package/image").get().asFile
-    doFirst { out.deleteRecursively() }
+    val jpackageBin = jdk.file("bin/jpackage" + if (isWindowsHost) ".exe" else "").asFile.absolutePath
+    val inputDir = layout.buildDirectory.dir("package/input").get().asFile.absolutePath
+    val iconFile = layout.projectDirectory.file("Source/Main/Resources/icon.ico").asFile.absolutePath
+    val outPath = layout.buildDirectory.dir("package/image").get().asFile.absolutePath
+    doFirst { File(outPath).deleteRecursively() }
     commandLine(
-        jdk.file("bin/jpackage" + if (isWindowsHost) ".exe" else "").asFile.absolutePath,
-        "--type", "app-image", "--name", "TheDPI", "--app-version", project.version.toString(),
+        jpackageBin,
+        "--type", "app-image", "--name", "TheDPI", "--app-version", appVer,
         "--vendor", "THE DPI", "--description", "Network intelligence and diagnostics",
-        "--input", layout.buildDirectory.dir("package/input").get().asFile.absolutePath,
-        "--main-jar", "TheDPI-${project.version}.jar", "--main-class", "thedpi.CoreKt",
+        "--input", inputDir,
+        "--main-jar", "TheDPI-$appVer.jar", "--main-class", "thedpi.CoreKt",
         "--java-options", "-Djava.library.path=\$APPDIR",
-        "--icon", layout.projectDirectory.file("Source/Main/Resources/icon.ico").asFile.absolutePath,
-        "--dest", out.absolutePath,
+        "--icon", iconFile,
+        "--dest", outPath,
     )
 }
+

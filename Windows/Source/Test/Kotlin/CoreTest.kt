@@ -709,6 +709,69 @@ fun main() {
                     expect(bridge.desyncedFlows.get() >= 1) { "desyncedFlows must be >= 1" }
                     srvThread.join(2000)
                 }
+
+                // 4) Wi-Fi <-> Mobile Data roaming rebind refreshes active UDP/TCP sockets without dropping TUN
+                bridge.rebindActiveSessions()
+                expect(bridge.roamingRebinds.get() >= 1) { "roamingRebinds must be >= 1" }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ 24. Restricted ISP network simulation: TLS record fragmentation, Discord Voice 74B, Roblox RakNet 0x05
+    test("restricted network simulation: TLS record fragmentation, Discord Voice 74B, and Roblox RakNet 0x05") {
+        DiagnosticSession().use { s ->
+            val srcIp = IpPackets.parseIpLiteral("10.215.173.1")!!
+            val dstIp = IpPackets.parseIpLiteral("162.159.135.232")!!
+
+            // 1) Discord Voice 74-byte IP Discovery UDP datagram (`0x00 0x01 0x00 0x46`)
+            val voicePayload = IpPackets.buildDiscordVoiceIpDiscovery(0x11223344, "10.215.173.1", 50001)
+            eq(voicePayload.size, 74, "Discord Voice IP discovery size")
+            val voicePkt = IpPackets.buildIpv4Udp(srcIp, dstIp, 50001, 50000, voicePayload)
+            val voiceRes = s.desyncPacket(voicePkt, DesyncConfig(mode = DesyncMode.REALITY_VISION, fakeTtl = 3))
+            eq(voiceRes.status, Codes.OK, "Discord Voice desync status")
+            eq(voiceRes.protocol, 4, "PROTO_DISCORD_VOICE (4)")
+            eq(voiceRes.packets.size, 2, "low-TTL decoy + real Discord Voice packet")
+
+            // 2) Roblox RakNet OpenConnectionRequest1 (`0x05` + 16-byte offline magic)
+            val raknetPayload = IpPackets.buildRobloxRakNetOpenConnectionRequest1(48)
+            val raknetPkt = IpPackets.buildIpv4Udp(srcIp, dstIp, 55123, 59100, raknetPayload)
+            val raknetRes = s.desyncPacket(raknetPkt, DesyncConfig(mode = DesyncMode.REALITY_VISION, fakeTtl = 3))
+            eq(raknetRes.status, Codes.OK, "Roblox RakNet desync status")
+            eq(raknetRes.protocol, 5, "PROTO_ROBLOX_RAKNET (5)")
+            eq(raknetRes.packets.size, 2, "low-TTL decoy + real Roblox RakNet packet")
+
+            // 3) TLS 1.3 ClientHello Record-Layer Multi-Fragmentation (RFC 8446 §5.1)
+            val hostBytes = "gateway.discord.com".toByteArray(Charsets.US_ASCII)
+            val sniExtLen = 5 + hostBytes.size
+            val extsLen = 4 + sniExtLen
+            val bodyLen = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extsLen
+            val recLen = 4 + bodyLen
+            val ch = java.nio.ByteBuffer.allocate(5 + recLen).apply {
+                put(0x16.toByte()); put(0x03.toByte()); put(0x01.toByte())
+                putShort(recLen.toShort())
+                put(0x01.toByte())
+                put(0x00.toByte()); putShort(bodyLen.toShort())
+                put(0x03.toByte()); put(0x03.toByte())
+                put(ByteArray(32))
+                put(0x00.toByte())
+                putShort(2); put(0x13.toByte()); put(0x01.toByte())
+                put(0x01.toByte()); put(0x00.toByte())
+                putShort(extsLen.toShort())
+                putShort(0x0000); putShort(sniExtLen.toShort())
+                putShort((3 + hostBytes.size).toShort())
+                put(0x00.toByte()); putShort(hostBytes.size.toShort())
+                put(hostBytes)
+            }.array()
+            val tcpPkt = IpPackets.buildIpv4Tcp(srcIp, dstIp, 52000, 443, 1000L, 0L, IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = ch)
+            val desyncRes = s.desyncPacket(tcpPkt, DesyncConfig(mode = DesyncMode.REALITY_VISION, fakeTtl = 4))
+            val tcpChunks = IpPackets.extractOrderedStreamChunks(tcpPkt, ch, desyncRes)
+            val tlsRecords = IpPackets.fragmentTlsClientHelloRecords(ch, tcpChunks)
+            expect(tlsRecords.size >= 2) { "must fragment into multiple TLS 0x16 records" }
+            for (rec in tlsRecords) {
+                eq(rec[0].toInt() and 0xFF, 0x16, "each fragment is a valid TLS 0x16 record")
+                expect(!String(rec, Charsets.ISO_8859_1).contains("gateway.discord.com")) {
+                    "no single TLS record may contain full SNI"
+                }
             }
         }
     }
@@ -721,3 +784,4 @@ fun main() {
     }
     exitProcess(0)
 }
+

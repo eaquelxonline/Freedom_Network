@@ -52,8 +52,8 @@ android {
         named("release") {
             isMinifyEnabled = true
             isShrinkResources = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            signingConfig = signingConfigs.findByName("release")
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 
@@ -91,6 +91,7 @@ kotlin {
 val cargoBuildAndroid = tasks.register<Exec>("cargoBuildAndroid") {
     group = "build"
     description = "Builds libthe_dpi.so for aarch64-linux-android with the NDK linker."
+    mustRunAfter(":nativeFormatCheck", ":nativeLint", ":nativeTest", ":nativeBuildHost")
     val windowsHost = System.getProperty("os.name").startsWith("Windows")
     val hostTag = if (windowsHost) "windows-x86_64" else "linux-x86_64"
     val linker = androidComponents.sdkComponents.ndkDirectory.map {

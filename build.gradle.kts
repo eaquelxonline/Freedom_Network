@@ -9,34 +9,38 @@ plugins {
 val nativeDir: Directory = layout.projectDirectory.dir("Native")
 
 // Cargo is the single source of truth for the native crate; Gradle only orchestrates it.
-tasks.register<Exec>("nativeTest") {
-    group = "verification"
-    description = "Runs the Rust core test suite (release profile)."
-    workingDir(nativeDir)
-    commandLine("cargo", "test", "--release", "--locked")
-}
-
-tasks.register<Exec>("nativeLint") {
-    group = "verification"
-    description = "Runs clippy on the Rust core with warnings as errors."
-    workingDir(nativeDir)
-    commandLine("cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings")
-}
-
-tasks.register<Exec>("nativeFormatCheck") {
+val nativeFormatCheck = tasks.register<Exec>("nativeFormatCheck") {
     group = "verification"
     description = "Verifies rustfmt formatting of the Rust core."
     workingDir(nativeDir)
     commandLine("cargo", "fmt", "--check")
 }
 
-tasks.register<Exec>("nativeBuildHost") {
+val nativeLint = tasks.register<Exec>("nativeLint") {
+    group = "verification"
+    description = "Runs clippy on the Rust core with warnings as errors."
+    mustRunAfter(nativeFormatCheck)
+    workingDir(nativeDir)
+    commandLine("cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings")
+}
+
+val nativeTest = tasks.register<Exec>("nativeTest") {
+    group = "verification"
+    description = "Runs the Rust core test suite (release profile)."
+    mustRunAfter(nativeFormatCheck, nativeLint)
+    workingDir(nativeDir)
+    commandLine("cargo", "test", "--release", "--locked")
+}
+
+val nativeBuildHost = tasks.register<Exec>("nativeBuildHost") {
     group = "build"
     description = "Builds the Rust core for the build host (loaded by the JVM tests)."
+    mustRunAfter(nativeFormatCheck, nativeLint, nativeTest)
     workingDir(nativeDir)
     commandLine("cargo", "build", "--release", "--locked")
 }
 
 tasks.named("check") {
-    dependsOn("nativeTest", "nativeLint", "nativeFormatCheck")
+    dependsOn(nativeFormatCheck, nativeLint, nativeTest)
 }
+

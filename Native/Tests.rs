@@ -3303,3 +3303,100 @@ fn personal_relay_server_reality_active_probing_auth_revocation_quota_and_failov
 
     relay_srv.stop();
 }
+
+#[test]
+fn restricted_isp_middlebox_sni_rst_tls_record_fragmentation_and_udp_voice_game_bypass() {
+    // 1. TLS Record-Layer Multi-Fragmentation (RFC 8446 §5.1) against stateful TCP-reassembling DPI:
+    //    No single 0x16 TLSPlaintext record contains "discord.com", yet reassembling the records
+    //    reproduces the exact byte-identical ClientHello.
+    let discord_ch = sample_tls_client_hello("gateway.discord.com", true, true);
+    let fragmented =
+        desync::fragment_tls_client_hello_records(&discord_ch, 2).expect("must fragment records");
+    assert!(fragmented.len() > discord_ch.len());
+
+    // Simulate an ISP middlebox that inspects each individual TLS 0x16 record after TCP reassembly
+    let mut pos = 0usize;
+    let mut record_count = 0usize;
+    while pos < fragmented.len() {
+        assert_eq!(fragmented[pos], 0x16);
+        let rlen = usize::from(u16::from_be_bytes([
+            fragmented[pos + 3],
+            fragmented[pos + 4],
+        ]));
+        let rec_body = &fragmented[pos + 5..pos + 5 + rlen];
+        assert!(
+            ascii::scan_pattern(rec_body, b"gateway.discord.com").is_none(),
+            "no single TLS record may contain the full blocked SNI"
+        );
+        pos += 5 + rlen;
+        record_count += 1;
+    }
+    assert!(record_count >= 3, "must split into >= 3 TLS 0x16 records");
+    let reassembled = desync::reassemble_tls_records(&fragmented).expect("must reassemble");
+    assert_eq!(reassembled, discord_ch);
+
+    // 2. Discord Voice 74-byte IP Discovery UDP packet (`0x00 0x01 0x00 0x46 ...`)
+    let mut discord_voice = vec![0u8; 74];
+    discord_voice[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x46]);
+    discord_voice[4..8].copy_from_slice(&0x11223344u32.to_be_bytes()); // SSRC
+    let dv_info = desync::inspect_l7(&discord_voice, 2);
+    assert_eq!(dv_info.protocol, desync::PROTO_DISCORD_VOICE);
+    assert_eq!(dv_info.host, "discord.voice");
+
+    let mut dv_pkt = vec![0u8; 20 + 8 + discord_voice.len()];
+    dv_pkt[0] = 0x45;
+    let dv_total = dv_pkt.len() as u16;
+    dv_pkt[2..4].copy_from_slice(&dv_total.to_be_bytes());
+    dv_pkt[8] = 64;
+    dv_pkt[9] = 17;
+    dv_pkt[12..16].copy_from_slice(&[10, 215, 173, 1]);
+    dv_pkt[16..20].copy_from_slice(&[66, 22, 196, 10]);
+    dv_pkt[20..22].copy_from_slice(&50001u16.to_be_bytes());
+    dv_pkt[22..24].copy_from_slice(&50000u16.to_be_bytes());
+    dv_pkt[24..26].copy_from_slice(&((8 + discord_voice.len()) as u16).to_be_bytes());
+    dv_pkt[28..].copy_from_slice(&discord_voice);
+
+    let cfg = desync::DesyncConfig {
+        mode: desync::DesyncMode::RealityVision,
+        fake_ttl: 3,
+        ..desync::DesyncConfig::default()
+    };
+    let dv_out = desync::desync_packet(&dv_pkt, &cfg);
+    assert_eq!(dv_out.packets.len(), 2);
+    assert_eq!(dv_out.packets[0][8], 3, "first UDP packet is low-TTL decoy");
+    assert_eq!(
+        &dv_out.packets[1], &dv_pkt,
+        "second UDP packet is intact Discord Voice"
+    );
+
+    // 3. Roblox RakNet OpenConnectionRequest1 (`0x05` + 16-byte OFFLINE_MESSAGE_DATA_ID + protocol 11)
+    let mut roblox_raknet = Vec::with_capacity(48);
+    roblox_raknet.push(0x05);
+    roblox_raknet.extend_from_slice(&desync::RAKNET_OFFLINE_MAGIC);
+    roblox_raknet.push(11);
+    roblox_raknet.resize(48, 0);
+    let rk_info = desync::inspect_l7(&roblox_raknet, 2);
+    assert_eq!(rk_info.protocol, desync::PROTO_ROBLOX_RAKNET);
+    assert_eq!(rk_info.host, "roblox.raknet");
+
+    let mut rk_pkt = vec![0u8; 20 + 8 + roblox_raknet.len()];
+    rk_pkt[0] = 0x45;
+    let rk_total = rk_pkt.len() as u16;
+    rk_pkt[2..4].copy_from_slice(&rk_total.to_be_bytes());
+    rk_pkt[8] = 64;
+    rk_pkt[9] = 17;
+    rk_pkt[12..16].copy_from_slice(&[10, 215, 173, 1]);
+    rk_pkt[16..20].copy_from_slice(&[128, 116, 63, 20]);
+    rk_pkt[20..22].copy_from_slice(&55123u16.to_be_bytes());
+    rk_pkt[22..24].copy_from_slice(&59100u16.to_be_bytes());
+    rk_pkt[24..26].copy_from_slice(&((8 + roblox_raknet.len()) as u16).to_be_bytes());
+    rk_pkt[28..].copy_from_slice(&roblox_raknet);
+
+    let rk_out = desync::desync_packet(&rk_pkt, &cfg);
+    assert_eq!(rk_out.packets.len(), 2);
+    assert_eq!(rk_out.packets[0][8], 3, "first UDP packet is low-TTL decoy");
+    assert_eq!(
+        &rk_out.packets[1], &rk_pkt,
+        "second UDP packet is intact Roblox RakNet"
+    );
+}

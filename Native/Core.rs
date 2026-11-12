@@ -2181,6 +2181,14 @@ pub mod desync {
     pub const PROTO_TLS_CLIENT_HELLO: i64 = 1;
     pub const PROTO_HTTP_REQUEST: i64 = 2;
     pub const PROTO_QUIC_INITIAL: i64 = 3;
+    pub const PROTO_DISCORD_VOICE: i64 = 4;
+    pub const PROTO_ROBLOX_RAKNET: i64 = 5;
+
+    /// RakNet `OFFLINE_MESSAGE_DATA_ID` 16-byte magic used in Roblox UDP connection handshakes (`0x01`, `0x05`, `0x07`).
+    pub const RAKNET_OFFLINE_MAGIC: [u8; 16] = [
+        0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56,
+        0x78,
+    ];
 
     /// IANA TLS 1.3 Hybrid Post-Quantum NamedGroup `X25519MLKEM768` (`0x11ec`).
     pub const TLS_GROUP_X25519_MLKEM768: u16 = 0x11ec;
@@ -2489,6 +2497,74 @@ pub mod desync {
         Some((random, sid, info.host, info.post_quantum))
     }
 
+    /// Splits a single TLS 1.2/1.3 `ClientHello` record (`0x16 0x03 0x01..0x04 <len:2>`) across
+    /// multiple valid `TLSPlaintext` handshake records (RFC 5246 §6.2.1 / RFC 8446 §5.1) at the
+    /// exact SNI/ECH split boundaries so stateful TCP-reassembling ISP middleboxes that inspect
+    /// one TLS record at a time never see an intact SNI or ECH extension.
+    pub fn fragment_tls_client_hello_records(buf: &[u8], fallback_split: usize) -> Option<Vec<u8>> {
+        let info = inspect_tls_client_hello(buf, fallback_split)?;
+        let rec_len = usize::from(u16::from_be_bytes([buf[3], buf[4]]));
+        if buf.len() != 5 + rec_len || rec_len <= 4 {
+            return None;
+        }
+        let hs = &buf[5..];
+        let mut hs_splits = Vec::with_capacity(info.split_offsets.len() + 1);
+        hs_splits.push(4usize.min(hs.len().saturating_sub(1)));
+        for &off in &info.split_offsets {
+            if off > 5 && off - 5 < hs.len() {
+                hs_splits.push(off - 5);
+            }
+        }
+        hs_splits.sort_unstable();
+        hs_splits.dedup();
+        let ranges = slice_ranges(hs.len(), &hs_splits);
+        if ranges.len() <= 1 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(buf.len() + ranges.len() * 5);
+        for (start, end) in ranges {
+            let chunk = &hs[start..end];
+            if chunk.is_empty() {
+                continue;
+            }
+            out.push(0x16);
+            out.push(buf[1]);
+            out.push(buf[2]);
+            out.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+            out.extend_from_slice(chunk);
+        }
+        Some(out)
+    }
+
+    /// Reassembles consecutive TLS `Handshake` (`0x16`) records back into a single canonical
+    /// `TLSPlaintext` record for verification and testing.
+    pub fn reassemble_tls_records(buf: &[u8]) -> Option<Vec<u8>> {
+        if buf.len() < 6 || buf[0] != 0x16 || buf[1] != 0x03 {
+            return None;
+        }
+        let ver_hi = buf[1];
+        let ver_lo = buf[2];
+        let mut pos = 0usize;
+        let mut hs_payload = Vec::with_capacity(buf.len());
+        while pos < buf.len() {
+            if pos + 5 > buf.len() || buf[pos] != 0x16 || buf[pos + 1] != ver_hi {
+                return None;
+            }
+            let rlen = usize::from(u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]));
+            pos += 5;
+            if pos + rlen > buf.len() {
+                return None;
+            }
+            hs_payload.extend_from_slice(&buf[pos..pos + rlen]);
+            pos += rlen;
+        }
+        let mut out = Vec::with_capacity(5 + hs_payload.len());
+        out.extend_from_slice(&[0x16, ver_hi, ver_lo]);
+        out.extend_from_slice(&(hs_payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&hs_payload);
+        Some(out)
+    }
+
     const HTTP_METHODS: [&[u8]; 7] = [
         b"GET ",
         b"POST ",
@@ -2500,7 +2576,8 @@ pub mod desync {
     ];
 
     /// Inspects a TCP or UDP payload for TLS ClientHello (SNI 0x0000, ECH 0xfe0d, PQ KeyShare
-    /// 0x11ec), HTTP request (`Host:` header via SIMD `scan_pattern`), or QUIC v1/v2 Initial.
+    /// 0x11ec), HTTP request (`Host:` header via SIMD `scan_pattern`), QUIC v1/v2 Initial,
+    /// Discord Voice IP Discovery / STUN, or Roblox RakNet UDP handshake.
     pub fn inspect_l7(payload: &[u8], fallback_split: usize) -> L7Inspection {
         if let Some(tls) = inspect_tls_client_hello(payload, fallback_split) {
             return tls;
@@ -2510,6 +2587,12 @@ pub mod desync {
         }
         if let Some(q) = inspect_quic_initial(payload) {
             return q;
+        }
+        if let Some(dv) = inspect_discord_voice(payload) {
+            return dv;
+        }
+        if let Some(rk) = inspect_roblox_raknet(payload) {
+            return rk;
         }
         L7Inspection::default()
     }
@@ -2673,6 +2756,37 @@ pub mod desync {
         }
         Some(L7Inspection {
             protocol: PROTO_QUIC_INITIAL,
+            ..L7Inspection::default()
+        })
+    }
+
+    fn inspect_discord_voice(buf: &[u8]) -> Option<L7Inspection> {
+        // Discord Voice IP Discovery (74-byte `[0x00, 0x01, 0x00, 0x46, ...]` or 70-byte
+        // `[0x00, 0x01, 0x00, 0x42, ...]`) or RFC 5389 STUN Binding Request with magic `0x2112A442`.
+        let is_ip_discovery = (buf.len() == 74 && buf[..4] == [0x00, 0x01, 0x00, 0x46])
+            || (buf.len() == 70 && buf[..4] == [0x00, 0x01, 0x00, 0x42]);
+        let is_stun =
+            buf.len() >= 20 && buf[..2] == [0x00, 0x01] && buf[4..8] == [0x21, 0x12, 0xa4, 0x42];
+        if !is_ip_discovery && !is_stun {
+            return None;
+        }
+        Some(L7Inspection {
+            protocol: PROTO_DISCORD_VOICE,
+            host: "discord.voice".to_owned(),
+            ..L7Inspection::default()
+        })
+    }
+
+    fn inspect_roblox_raknet(buf: &[u8]) -> Option<L7Inspection> {
+        // Roblox RakNet connection establishment packets (`0x01` UnconnectedPing, `0x05`
+        // OpenConnectionRequest1, `0x07` OpenConnectionRequest2) carry the 16-byte offline magic.
+        if buf.len() < 17 || !matches!(buf[0], 0x01 | 0x02 | 0x05 | 0x07) {
+            return None;
+        }
+        ascii::scan_pattern(buf, &RAKNET_OFFLINE_MAGIC)?;
+        Some(L7Inspection {
+            protocol: PROTO_ROBLOX_RAKNET,
+            host: "roblox.raknet".to_owned(),
             ..L7Inspection::default()
         })
     }
@@ -3068,24 +3182,35 @@ pub mod desync {
         }
         let payload = &udp[8..];
         let info = inspect_l7(payload, cfg.split_pos);
-        if info.protocol != PROTO_QUIC_INITIAL
-            || !matches!(
-                cfg.mode,
-                DesyncMode::QuicScramble | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
-            )
-        {
+        if !matches!(
+            info.protocol,
+            PROTO_QUIC_INITIAL | PROTO_DISCORD_VOICE | PROTO_ROBLOX_RAKNET
+        ) || !matches!(
+            cfg.mode,
+            DesyncMode::QuicScramble | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
+        ) {
             return DesyncOutput {
                 packets: vec![pkt.to_vec()],
                 dropped_inbound: false,
                 inspection: info,
             };
         }
-        // Prepend a low-TTL QUIC reserved-version decoy UDP datagram before the real Initial.
-        let fake_payload = quic::build_probe(
-            &[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe],
-            &[0xca, 0xfe, 0xba, 0xbe, 0xde, 0xad, 0xbe, 0xef],
-            quic::MIN_INITIAL_DATAGRAM,
-        );
+        // Prepend a low-TTL decoy UDP datagram before the real QUIC Initial, Discord Voice IP
+        // Discovery, or Roblox RakNet connection request so stateful first-packet UDP DPI filters
+        // latch onto the benign decoy while it expires before reaching the destination server.
+        let fake_payload = if info.protocol == PROTO_QUIC_INITIAL {
+            quic::build_probe(
+                &[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe],
+                &[0xca, 0xfe, 0xba, 0xbe, 0xde, 0xad, 0xbe, 0xef],
+                quic::MIN_INITIAL_DATAGRAM,
+            )
+        } else {
+            // 24-byte benign RFC 5389 STUN Binding Indication / NTP-like keepalive decoy
+            vec![
+                0x00, 0x11, 0x00, 0x04, 0x21, 0x12, 0xa4, 0x42, 0x74, 0x68, 0x65, 0x64, 0x70, 0x69,
+                0x32, 0x36, 0x80, 0x28, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
+            ]
+        };
         let udp_len = 8 + fake_payload.len();
         let total_len = ihl + udp_len;
         let mut fake_pkt = Vec::with_capacity(total_len);

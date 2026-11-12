@@ -451,12 +451,12 @@ The DPI/
 
 | Paket | Sonuç (12.11.2026) |
 |---|---|
-| Rust birim ve entegrasyon testleri, x86_64 Linux | **90/90** ✅ (+4 benchmark/stres testi, `--ignored`) |
-| Aynı testler, Windows x64 ikilisi (MinGW + Wine) | **90/90** ✅ |
-| Aynı testler, ARM64 (aarch64 + QEMU) | **90/90** ✅ |
+| Rust birim ve entegrasyon testleri, x86_64 Linux | **91/91** ✅ (+4 benchmark/stres testi, `--ignored`) |
+| Aynı testler, Windows x64 ikilisi (MinGW + Wine) | **91/91** ✅ |
+| Aynı testler, ARM64 (aarch64 + QEMU) | **91/91** ✅ |
 | clippy `-D warnings`: Linux, Android aarch64, Windows MSVC, Windows GNU | 0 uyarı ✅ |
 | rustfmt | ✅ |
-| JVM/JNI (`-Xcheck:jni`): codec, hatalar, TLS sertifika/hostname/zaman aşımı, yerel HTTPS üzerinden gerçek DoH turu, sistem geneli görünüm, uçtan uca, eşzamanlılık, stres, metin katalogu, aktif DPI desync (`REALITY + mlkem768 + xtls-rprx-vision`) + yerel proxy + `ServerManager` + `TunBridge` (DoH DNS + Roblox/Discord UDP NAT + Discord TCP/TLS Desync) | **23/23** ✅ |
+| JVM/JNI (`-Xcheck:jni`): codec, hatalar, TLS sertifika/hostname/zaman aşımı, yerel HTTPS üzerinden gerçek DoH turu, sistem geneli görünüm, uçtan uca, eşzamanlılık, stres, metin katalogu, aktif DPI desync (`REALITY + mlkem768 + xtls-rprx-vision` + TLS Record-Layer Multi-Fragmentation) + yerel proxy + `ServerManager` + `TunBridge` (DoH DNS + Roblox RakNet / Discord Ses 74B UDP NAT + Discord TCP/TLS Desync + Wi-Fi/LTE Roaming Rebind) | **24/24** ✅ |
 | Android lint (uyarılar hata sayılıyor) | 0 bulgu ✅ |
 | Gerçek ağda CLI duman testi (example.com + NXDOMAIN hedefi + `--desync reality`) | Doğru teşhis, karar ve yerel Desync proxy ✅ |
 
@@ -601,4 +601,13 @@ Kullanıcının hem sunucusuz yerel DPI aşma modunda hem de kendi kişisel sunu
 ### 21.3 Windows Wintun Layer-3 Sanal Ağ Adaptörü Doğrulayıcısı (`sys::wintun`)
 
 * Kendi çekirdek sürücümüzü yazmak yerine Windows'ta kullanıcı alanı Layer-3 sanal ağ arayüzü için `sys::wintun::WintunAdapterConfig` (`THE DPI Tunnel`, `10.215.173.1/24`, `fd00:7468:6564:7069::1/64`, MTU `1420`, halka arabellek `4 MiB`), halka kapasitesi doğrulayıcısı (`valid_ring_capacity`: `128 KiB ..= 64 MiB`, 2'nin kuvveti) ve Layer-3 IPv4/IPv6 paket doğrulayıcısı (`valid_l3_packet`) eklendi.
+
+### 21.4 Kısıtlanmış Ağlar İçin Derin Paket ve Oturum Dayanıklılığı (TLS Kayıt Parçalama, Discord Ses & Roblox RakNet UDP Koruması, Wi-Fi/LTE Roaming)
+
+* **TLS Kayıt Katmanı Çoklu Parçalama (`desync::fragment_tls_client_hello_records`, RFC 5246 §6.2.1 / RFC 8446 §5.1):**
+  * TCP segmentlerini yeniden birleştiren (stateful TCP reassembly) fakat her `0x16` TLS kaydını tek başına inceleyen gelişmiş ISS DPI cihazlarını aşmak için tek bir `ClientHello` el sıkışması, SNI/ECH sınırlarından geçerli ≥3 ayrı TLS `Handshake` (`0x16 0x03 0x01`) kaydına bölünür ve ardından TCP düzeyinde desync uygulanır. Hedef TLS sunucusu kayıtları standartlara uygun biçimde birleştirirken (`reassemble_tls_records`), tek kayıt içi SNI arayan DPI kutuları engellenen alan adını göremez.
+* **Discord Ses (`PROTO_DISCORD_VOICE = 4`) ve Roblox RakNet (`PROTO_ROBLOX_RAKNET = 5`) UDP Koruması:**
+  * Discord RTC ses kanallarının 74/70 baytlık IP Discovery (`0x0001`, uzunluk `70`/`66`) ve STUN (`0x2112A442`) paketleri ile Roblox'un RakNet (`0x01`/`0x02`/`0x05`/`0x07` + 16 baytlık `RAKNET_OFFLINE_MAGIC`) bağlantı kurma datagramları `desync::inspect_l7` tarafından tespit edilir; gerçek paketten önce düşük TTL'li (`FakeAutoTtl`) şaşırtma UDP datagramı gönderilerek durum bilgili UDP DPI filtreleri yanıltılır.
+* **Android Wi-Fi ↔ Mobil Veri (LTE/5G) Kesintisiz Ağ Geçişi (`registerRoamingCallback` & `TunBridge.rebindActiveSessions`):**
+  * `TheDpiVpnService` üzerinde `ConnectivityManager.NetworkCallback` ile aktif ağ değişimleri dinlenir (`setUnderlyingNetworks`), ağ değiştiğinde `TunBridge.rebindActiveSessions()` çağrılarak eski arayüze bağlı UDP NAT soketleri temizlenir ve TUN oturumu kopmadan yeni ağ üzerinden devam eder.
 
