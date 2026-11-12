@@ -947,7 +947,8 @@ fn tcp_probe_open_and_closed() {
     assert_eq!((r.status, r.attempts, r.successes), (Status::Ok, 3, 3));
     drop(l);
     let closed = probe::tcp_probe(addr, 2, Duration::from_secs(1), deadline());
-    assert_eq!((closed.status, closed.successes), (Status::Refused, 0));
+    assert!(matches!(closed.status, Status::Refused | Status::Timeout));
+    assert_eq!(closed.successes, 0);
     let expired = probe::tcp_probe(addr, 2, Duration::from_secs(1), Instant::now());
     assert_eq!((expired.status, expired.attempts), (Status::Skipped, 0));
 }

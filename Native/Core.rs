@@ -3872,6 +3872,7 @@ pub mod relay {
                     while !stop_c.load(Ordering::Acquire) {
                         match listener.accept() {
                             Ok((client, _)) => {
+                                let _ = client.set_nonblocking(false);
                                 let dev_conn = Arc::clone(&dev_c);
                                 let cnt_conn = Arc::clone(&cnt_c);
                                 let _ = thread::Builder::new().stack_size(256 * 1024).spawn(
@@ -3995,6 +3996,7 @@ pub mod relay {
         devices: &Mutex<BTreeMap<String, DeviceCredential>>,
         counters: &RelayServerCounters,
     ) -> io::Result<()> {
+        let _ = client.set_nonblocking(false);
         client.set_read_timeout(Some(Duration::from_millis(2500)))?;
         client.set_write_timeout(Some(Duration::from_millis(2500)))?;
         let _ = client.set_nodelay(true);
