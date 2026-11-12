@@ -5468,7 +5468,7 @@ class MainActivity : Activity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             textSize = 11.5f
             setTextColor(Color.WHITE)
-            hint = "Örn: tor · socks5://127.0.0.1:9050 · https://k:s@sunucu:443"
+            hint = "Örn: tor · socks5://127.0.0.1:9050 · https://sunucu:443"
             setHintTextColor(Color.parseColor("#475569"))
             background = createCardShape("#070B14", borderColor = "#1E293B", cornerDp = 8f)
             setPadding(dp(10), dp(8), dp(10), dp(8))
