@@ -39,7 +39,52 @@ pub mod code {
     pub const INTERNAL: i32 = -11;
 }
 
-/// Field tags of every wire record. Mirrored 1:1 in Shared/Source/Main/Kotlin/Bridge.kt.
+// ---------------------------------------------------------------------------
+// ascii — architecture-specific Assembly (Core.s / Core.aarch64.s) with a std fallback
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(include_str!("Core.s"), options(att_syntax));
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(include_str!("Core.aarch64.s"));
+
+/// Fast ASCII lower-casing used on the DNS/target name-normalization path. The hot
+/// implementation is hand-written SIMD Assembly; every other target uses the standard
+/// library. Only bytes 'A'..'Z' (all < 0x80) are modified, so UTF-8 stays valid.
+pub mod ascii {
+    #[cfg(target_arch = "x86_64")]
+    unsafe extern "sysv64" {
+        fn the_dpi_ascii_lowercase(dst: *mut u8, src: *const u8, len: usize);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe extern "C" {
+        fn the_dpi_ascii_lowercase(dst: *mut u8, src: *const u8, len: usize);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub fn lowercase_in_place(buf: &mut [u8]) {
+        if !buf.is_empty() {
+            // SAFETY: `dst` and `src` are the same valid, writable buffer of `buf.len()`
+            // bytes; the routine only reads and writes those bytes in place.
+            unsafe { the_dpi_ascii_lowercase(buf.as_mut_ptr(), buf.as_ptr(), buf.len()) };
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn lowercase_in_place(buf: &mut [u8]) {
+        buf.make_ascii_lowercase();
+    }
+
+    /// Lower-cases ASCII letters, leaving every other byte (including UTF-8 multibyte
+    /// sequences) untouched; the result is always valid UTF-8.
+    pub fn lowercased(s: &str) -> String {
+        let mut v = s.as_bytes().to_vec();
+        lowercase_in_place(&mut v);
+        String::from_utf8(v).unwrap_or_else(|_| s.to_ascii_lowercase())
+    }
+}
+
+/// Field tags of every wire record. Mirrored 1:1 in each platform's Core.kt (`object Tags`).
 pub mod tags {
     pub const STATUS: u8 = 0;
     pub mod config {
@@ -744,7 +789,7 @@ pub mod dns {
     }
 
     fn normalize(q: &str) -> String {
-        q.strip_suffix('.').unwrap_or(q).to_ascii_lowercase()
+        crate::ascii::lowercased(q.strip_suffix('.').unwrap_or(q))
     }
 
     /// Parses and validates a response against the query it answers (ID, QR bit,
@@ -1429,7 +1474,7 @@ pub mod probe {
             Some((h, p)) => (h, p.parse::<u16>().ok().filter(|p| *p != 0)?),
             None => (s, 443),
         };
-        let h = h.strip_suffix('.').unwrap_or(h).to_ascii_lowercase();
+        let h = crate::ascii::lowercased(h.strip_suffix('.').unwrap_or(h));
         dns::is_valid_hostname(&h).then_some(Target {
             host: h,
             port,

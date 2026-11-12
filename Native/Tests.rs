@@ -402,6 +402,56 @@ fn dns_parser_fuzz_never_panics() {
     }
 }
 
+// ---------------------------------------------------------------- ascii (Assembly)
+
+#[test]
+fn asm_ascii_lowercase_matches_std_for_all_lengths() {
+    let mut rng = Lcg(0x0A5C11);
+    for len in 0..300usize {
+        let src: Vec<u8> = (0..len).map(|_| (rng.next() >> 56) as u8).collect();
+        let mut got = src.clone();
+        crate::ascii::lowercase_in_place(&mut got);
+        let mut want = src.clone();
+        want.make_ascii_lowercase();
+        assert_eq!(got, want, "len {len}");
+    }
+}
+
+#[test]
+fn asm_ascii_lowercase_full_byte_range_and_boundaries() {
+    // Every byte value, including 'A'-1='@', 'Z'+1='[', and all high bytes >= 0x80.
+    let mut got: Vec<u8> = (0u8..=255).collect();
+    let mut want = got.clone();
+    crate::ascii::lowercase_in_place(&mut got);
+    want.make_ascii_lowercase();
+    assert_eq!(got, want);
+    assert_eq!(got[b'@' as usize], b'@');
+    assert_eq!(got[b'A' as usize], b'a');
+    assert_eq!(got[b'Z' as usize], b'z');
+    assert_eq!(got[b'[' as usize], b'[');
+    assert_eq!(got[0xC7], 0xC7); // high byte unchanged
+}
+
+#[test]
+fn asm_ascii_lowercased_preserves_utf8() {
+    for s in [
+        "",
+        "A",
+        "Example.COM",
+        "WWW.Türkçe-ÇŞİ.Example.COM.",
+        &"ABCdef012-".repeat(40),
+    ] {
+        let mut want = s.as_bytes().to_vec();
+        want.make_ascii_lowercase();
+        assert_eq!(crate::ascii::lowercased(s).as_bytes(), &want[..], "{s}");
+    }
+    // The normalization path actually uses it.
+    assert_eq!(
+        probe::parse_target("WWW.Example.COM.").unwrap().host,
+        "www.example.com"
+    );
+}
+
 // ---------------------------------------------------------------- quic
 
 fn vn_packet(dcid: &[u8], scid: &[u8], versions: &[u32]) -> Vec<u8> {
@@ -1986,6 +2036,22 @@ fn rss_kib() -> u64 {
 #[test]
 #[ignore]
 fn bench_core_paths() {
+    let mut hostbuf = b"WWW.Example-SubDomain.Host-Name.Example.COM".to_vec();
+    hostbuf.resize(253, b'X');
+    bench(
+        "ascii::lowercase_in_place (253 B, Assembly)",
+        500_000,
+        || {
+            let mut b = std::hint::black_box(hostbuf.clone());
+            crate::ascii::lowercase_in_place(std::hint::black_box(&mut b));
+            std::hint::black_box(b);
+        },
+    );
+    bench("[..].make_ascii_lowercase (253 B, std)", 500_000, || {
+        let mut b = std::hint::black_box(hostbuf.clone());
+        b.make_ascii_lowercase();
+        std::hint::black_box(b);
+    });
     let q = dns::build_query(5, "svc.test", dns::TYPE_HTTPS, true).unwrap();
     let resp = make_response(
         &q,
