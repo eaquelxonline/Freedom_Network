@@ -3793,6 +3793,13 @@ class ModernPowerShieldView(context: Context) : View(context) {
         super.onDetachedFromWindow()
     }
 
+    override fun performClick(): Boolean {
+        super.performClick()
+        playSoundEffect(android.view.SoundEffectConstants.CLICK)
+        onToggleListener?.invoke()
+        return true
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -3809,8 +3816,7 @@ class ModernPowerShieldView(context: Context) : View(context) {
                 val dx = event.x - cx
                 val dy = event.y - cy
                 if (dx * dx + dy * dy <= (btnR * 1.35f) * (btnR * 1.35f)) {
-                    playSoundEffect(android.view.SoundEffectConstants.CLICK)
-                    onToggleListener?.invoke()
+                    performClick()
                 }
                 return true
             }

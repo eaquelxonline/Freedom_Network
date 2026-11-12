@@ -83,6 +83,7 @@ android {
             "ObsoleteSdkInt", // defensive version checks for backward compatibility patterns
             "DrawAllocation", // custom canvas cyber animations
             "ViewConstructor", // programmatic-only custom views
+            "ClickableViewAccessibility", // custom animated touch interactions
         )
     }
 }
