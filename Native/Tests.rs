@@ -3421,15 +3421,17 @@ fn dns_poisoning_detection_and_classification() {
     ));
     assert!(probe::is_poisoned_response("roblox.com", &[tt_v4], &[]));
 
-    let mut tr = probe::TargetReport::default();
-    tr.target = probe::parse_target("discord.com").unwrap();
-    tr.dns = probe::DnsResult {
-        status: Status::Blocked,
-        rcode: 0,
-        latency_us: 73000,
-        v4: vec![tt_v4],
-        v6: vec![tt_v6],
-        poisoned: true,
+    let tr = probe::TargetReport {
+        target: probe::parse_target("discord.com").unwrap(),
+        dns: probe::DnsResult {
+            status: Status::Blocked,
+            rcode: 0,
+            latency_us: 73000,
+            v4: vec![tt_v4],
+            v6: vec![tt_v6],
+            poisoned: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let run = probe::RunReport {
