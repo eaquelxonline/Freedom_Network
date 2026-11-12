@@ -225,6 +225,36 @@ pub mod tags {
         pub const SUBJECT: u8 = 2;
         pub const ARG: u8 = 3;
     }
+    /// System-wide connection snapshot (Windows, user mode, no driver).
+    pub mod sysnet {
+        pub const TOTAL: u8 = 1;
+        pub const ESTABLISHED: u8 = 2;
+        pub const LISTEN: u8 = 3;
+        pub const SYN_SENT: u8 = 4;
+        pub const TIME_WAIT: u8 = 5;
+        pub const CLOSE_WAIT: u8 = 6;
+        pub const UDP: u8 = 7;
+        pub const PROCESS: u8 = 8;
+        pub const FINDING: u8 = 9;
+        pub const EXPOSED: u8 = 10;
+        pub const OS_ERROR: u8 = 11;
+    }
+    pub mod process {
+        pub const PID: u8 = 1;
+        pub const NAME: u8 = 2;
+        pub const ESTABLISHED: u8 = 3;
+        pub const SYN_SENT: u8 = 4;
+        pub const LISTEN: u8 = 5;
+        pub const UDP: u8 = 6;
+        pub const REMOTES: u8 = 7;
+        pub const CLOSE_WAIT: u8 = 8;
+        pub const SAMPLE: u8 = 9;
+    }
+    pub mod finding {
+        pub const CODE: u8 = 1;
+        pub const SUBJECT: u8 = 2;
+        pub const ARG: u8 = 3;
+    }
     pub mod decision {
         pub const STATE: u8 = 1;
         pub const ACTION: u8 = 2;
@@ -1379,6 +1409,459 @@ pub mod sys {
             let build = reg_sz(&key, "CurrentBuildNumber")?.trim().parse().ok()?;
             Some((build, reg_sz(&key, "DisplayVersion").unwrap_or_default()))
         }
+
+        // ---- System-wide connection tables (IP Helper, user mode, no driver) -------------
+
+        #[link(name = "iphlpapi")]
+        unsafe extern "system" {
+            fn GetExtendedTcpTable(
+                table: *mut c_void,
+                size: *mut u32,
+                order: i32,
+                af: u32,
+                class: u32,
+                reserved: u32,
+            ) -> u32;
+            fn GetExtendedUdpTable(
+                table: *mut c_void,
+                size: *mut u32,
+                order: i32,
+                af: u32,
+                class: u32,
+                reserved: u32,
+            ) -> u32;
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn QueryFullProcessImageNameW(
+                process: *mut c_void,
+                flags: u32,
+                name: *mut u16,
+                size: *mut u32,
+            ) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+
+        const TCP_TABLE_OWNER_PID_ALL: u32 = 5;
+        const UDP_TABLE_OWNER_PID: u32 = 1;
+        const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+        const AF_INET6_FAMILY: u32 = 23;
+        const MAX_TABLE: u32 = 8 << 20;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+        /// Raw MIB_*TABLE_OWNER_PID buffers, parsed by the safe, cross-platform `sysnet` module.
+        #[derive(Debug, Clone, Default)]
+        pub struct RawTables {
+            pub tcp4: Vec<u8>,
+            pub tcp6: Vec<u8>,
+            pub udp4: Vec<u8>,
+            pub udp6: Vec<u8>,
+        }
+
+        fn fetch(tcp: bool, af: u32) -> Result<Vec<u8>, u32> {
+            let mut size: u32 = 64 * 1024;
+            for _ in 0..5 {
+                // u32 storage guarantees the DWORD alignment of the MIB rows.
+                let mut buf: Vec<u32> = vec![0; (size as usize).div_ceil(4)];
+                let mut len = (buf.len() * 4) as u32;
+                let class = if tcp {
+                    TCP_TABLE_OWNER_PID_ALL
+                } else {
+                    UDP_TABLE_OWNER_PID
+                };
+                // SAFETY: `buf` is writable for `len` bytes and 4-byte aligned; `len` is in/out.
+                let rc = unsafe {
+                    if tcp {
+                        GetExtendedTcpTable(buf.as_mut_ptr().cast(), &mut len, 0, af, class, 0)
+                    } else {
+                        GetExtendedUdpTable(buf.as_mut_ptr().cast(), &mut len, 0, af, class, 0)
+                    }
+                };
+                match rc {
+                    0 => return Ok(buf.iter().flat_map(|w| w.to_le_bytes()).collect()),
+                    ERROR_INSUFFICIENT_BUFFER if len <= MAX_TABLE => size = len + 4096,
+                    e => return Err(e),
+                }
+            }
+            Err(ERROR_INSUFFICIENT_BUFFER)
+        }
+
+        /// Snapshot of every TCP and UDP endpoint on the machine with its owning process.
+        /// IPv6 tables are optional (empty when the stack has no IPv6).
+        pub fn connection_tables() -> Result<RawTables, u32> {
+            Ok(RawTables {
+                tcp4: fetch(true, AF_INET as u32)?,
+                tcp6: fetch(true, AF_INET6_FAMILY).unwrap_or_default(),
+                udp4: fetch(false, AF_INET as u32)?,
+                udp6: fetch(false, AF_INET6_FAMILY).unwrap_or_default(),
+            })
+        }
+
+        /// Executable file name (no path, for privacy) of a process, if this user may query it.
+        pub fn process_name(pid: u32) -> Option<String> {
+            match pid {
+                0 => return Some("System Idle".to_owned()),
+                4 => return Some("System".to_owned()),
+                _ => {}
+            }
+            // SAFETY: no pointer arguments; a null return is handled.
+            let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if handle.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 1024];
+            let mut size = buf.len() as u32;
+            // SAFETY: `handle` is a live process handle; `buf` is writable for `size` units.
+            let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) };
+            // SAFETY: `handle` was returned by OpenProcess and is closed exactly once.
+            unsafe { CloseHandle(handle) };
+            if ok == 0 {
+                return None;
+            }
+            let path = String::from_utf16_lossy(&buf[..(size as usize).min(buf.len())]);
+            Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sysnet — system-wide connection intelligence (parsing is safe and cross-platform)
+// ---------------------------------------------------------------------------
+
+/// Parses the IP Helper owner-PID tables and turns them into per-process findings.
+/// The parser is pure Rust over byte slices (bounds-checked, never trusts the row
+/// count), so it is fully tested on every platform; only the table fetch is Windows FFI.
+pub mod sysnet {
+    use crate::wire::Record;
+    use crate::{code, tags};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    pub const PROTO_TCP: u8 = 6;
+    pub const PROTO_UDP: u8 = 17;
+    pub const MAX_ROWS: usize = 65_536;
+    pub const MAX_PROCESSES: usize = 64;
+    pub const SAMPLE: usize = 5;
+
+    /// MIB_TCP_STATE values.
+    pub mod state {
+        pub const LISTEN: u32 = 2;
+        pub const SYN_SENT: u32 = 3;
+        pub const ESTABLISHED: u32 = 5;
+        pub const CLOSE_WAIT: u32 = 8;
+        pub const TIME_WAIT: u32 = 11;
+    }
+
+    pub const F_STUCK_HANDSHAKES: i64 = 1;
+    pub const F_CLOSE_WAIT_LEAK: i64 = 2;
+    pub const F_TIME_WAIT_PRESSURE: i64 = 3;
+    pub const F_EXPOSED_LISTENERS: i64 = 4;
+    pub const F_NO_ACTIVITY: i64 = 5;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Connection {
+        pub proto: u8,
+        pub local: SocketAddr,
+        pub remote: Option<SocketAddr>,
+        pub state: u32,
+        pub pid: u32,
+    }
+
+    fn u32_at(b: &[u8], i: usize) -> Option<u32> {
+        b.get(i..i + 4)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .map(u32::from_le_bytes)
+    }
+    /// Ports are stored in network byte order in the low 16 bits of a DWORD.
+    fn port_at(b: &[u8], i: usize) -> Option<u16> {
+        b.get(i..i + 2).map(|s| u16::from_be_bytes([s[0], s[1]]))
+    }
+    fn v4_at(b: &[u8], i: usize) -> Option<Ipv4Addr> {
+        b.get(i..i + 4)
+            .map(|s| Ipv4Addr::new(s[0], s[1], s[2], s[3]))
+    }
+    fn v6_at(b: &[u8], i: usize) -> Option<Ipv6Addr> {
+        b.get(i..i + 16)
+            .and_then(|s| <[u8; 16]>::try_from(s).ok())
+            .map(Ipv6Addr::from)
+    }
+
+    /// Rows of a MIB table: DWORD count, then fixed-size rows. The count is clamped to
+    /// what the buffer actually holds.
+    fn rows(b: &[u8], row: usize) -> impl Iterator<Item = &[u8]> {
+        let n = u32_at(b, 0).unwrap_or(0) as usize;
+        let body = b.get(4..).unwrap_or(&[]);
+        body.chunks_exact(row).take(n.min(MAX_ROWS))
+    }
+
+    fn remote_of(state: u32, addr: SocketAddr) -> Option<SocketAddr> {
+        (state != state::LISTEN && !addr.ip().is_unspecified()).then_some(addr)
+    }
+
+    /// MIB_TCPROW_OWNER_PID (24 bytes).
+    pub fn parse_tcp4(b: &[u8]) -> Vec<Connection> {
+        rows(b, 24)
+            .filter_map(|r| {
+                let st = u32_at(r, 0)?;
+                let remote = SocketAddr::new(IpAddr::V4(v4_at(r, 12)?), port_at(r, 16)?);
+                Some(Connection {
+                    proto: PROTO_TCP,
+                    local: SocketAddr::new(IpAddr::V4(v4_at(r, 4)?), port_at(r, 8)?),
+                    remote: remote_of(st, remote),
+                    state: st,
+                    pid: u32_at(r, 20)?,
+                })
+            })
+            .collect()
+    }
+
+    /// MIB_TCP6ROW_OWNER_PID (56 bytes).
+    pub fn parse_tcp6(b: &[u8]) -> Vec<Connection> {
+        rows(b, 56)
+            .filter_map(|r| {
+                let st = u32_at(r, 48)?;
+                let remote = SocketAddr::new(IpAddr::V6(v6_at(r, 24)?), port_at(r, 44)?);
+                Some(Connection {
+                    proto: PROTO_TCP,
+                    local: SocketAddr::new(IpAddr::V6(v6_at(r, 0)?), port_at(r, 20)?),
+                    remote: remote_of(st, remote),
+                    state: st,
+                    pid: u32_at(r, 52)?,
+                })
+            })
+            .collect()
+    }
+
+    /// MIB_UDPROW_OWNER_PID (12 bytes).
+    pub fn parse_udp4(b: &[u8]) -> Vec<Connection> {
+        rows(b, 12)
+            .filter_map(|r| {
+                Some(Connection {
+                    proto: PROTO_UDP,
+                    local: SocketAddr::new(IpAddr::V4(v4_at(r, 0)?), port_at(r, 4)?),
+                    remote: None,
+                    state: 0,
+                    pid: u32_at(r, 8)?,
+                })
+            })
+            .collect()
+    }
+
+    /// MIB_UDP6ROW_OWNER_PID (28 bytes).
+    pub fn parse_udp6(b: &[u8]) -> Vec<Connection> {
+        rows(b, 28)
+            .filter_map(|r| {
+                Some(Connection {
+                    proto: PROTO_UDP,
+                    local: SocketAddr::new(IpAddr::V6(v6_at(r, 0)?), port_at(r, 20)?),
+                    remote: None,
+                    state: 0,
+                    pid: u32_at(r, 24)?,
+                })
+            })
+            .collect()
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ProcessSummary {
+        pub pid: u32,
+        pub name: String,
+        pub established: u32,
+        pub syn_sent: u32,
+        pub listen: u32,
+        pub close_wait: u32,
+        pub udp: u32,
+        pub remotes: u32,
+        pub sample: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Finding {
+        pub code: i64,
+        pub subject: String,
+        pub args: Vec<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct Summary {
+        pub total: u32,
+        pub established: u32,
+        pub listen: u32,
+        pub syn_sent: u32,
+        pub time_wait: u32,
+        pub close_wait: u32,
+        pub udp: u32,
+        pub exposed_listeners: u32,
+        pub processes: Vec<ProcessSummary>,
+        pub findings: Vec<Finding>,
+    }
+
+    /// Aggregates a connection snapshot per process and derives explainable findings.
+    /// Loopback peers are treated as local IPC and not counted as remote endpoints.
+    pub fn summarize(conns: &[Connection], name_of: impl Fn(u32) -> Option<String>) -> Summary {
+        let mut s = Summary::default();
+        let mut per: BTreeMap<u32, ProcessSummary> = BTreeMap::new();
+        let mut remotes: BTreeMap<u32, BTreeSet<SocketAddr>> = BTreeMap::new();
+        for c in conns.iter().take(MAX_ROWS * 4) {
+            s.total += 1;
+            let p = per.entry(c.pid).or_insert_with(|| ProcessSummary {
+                pid: c.pid,
+                ..ProcessSummary::default()
+            });
+            if c.proto == PROTO_UDP {
+                s.udp += 1;
+                p.udp += 1;
+                continue;
+            }
+            match c.state {
+                state::ESTABLISHED => {
+                    s.established += 1;
+                    p.established += 1;
+                }
+                state::LISTEN => {
+                    s.listen += 1;
+                    p.listen += 1;
+                    if c.local.ip().is_unspecified() {
+                        s.exposed_listeners += 1;
+                    }
+                }
+                state::SYN_SENT => {
+                    s.syn_sent += 1;
+                    p.syn_sent += 1;
+                }
+                state::CLOSE_WAIT => {
+                    s.close_wait += 1;
+                    p.close_wait += 1;
+                }
+                state::TIME_WAIT => s.time_wait += 1,
+                _ => {}
+            }
+            if let Some(r) = c.remote.filter(|r| !r.ip().is_loopback()) {
+                let set = remotes.entry(c.pid).or_default();
+                if set.len() < 1024 {
+                    set.insert(r);
+                }
+            }
+        }
+        for (pid, p) in per.iter_mut() {
+            p.name = name_of(*pid).unwrap_or_else(|| format!("pid {pid}"));
+            if let Some(set) = remotes.get(pid) {
+                p.remotes = set.len() as u32;
+                p.sample = set.iter().take(SAMPLE).map(ToString::to_string).collect();
+            }
+        }
+        let mut list: Vec<ProcessSummary> = per.into_values().collect();
+        list.sort_by(|a, b| {
+            b.syn_sent
+                .cmp(&a.syn_sent)
+                .then(b.established.cmp(&a.established))
+                .then(a.pid.cmp(&b.pid))
+        });
+        for p in &list {
+            if p.syn_sent >= 3 {
+                s.findings.push(Finding {
+                    code: F_STUCK_HANDSHAKES,
+                    subject: p.name.clone(),
+                    args: vec![i64::from(p.syn_sent), i64::from(p.pid)],
+                });
+            }
+            if p.close_wait >= 20 {
+                s.findings.push(Finding {
+                    code: F_CLOSE_WAIT_LEAK,
+                    subject: p.name.clone(),
+                    args: vec![i64::from(p.close_wait), i64::from(p.pid)],
+                });
+            }
+        }
+        if s.time_wait >= 2000 {
+            s.findings.push(Finding {
+                code: F_TIME_WAIT_PRESSURE,
+                subject: String::new(),
+                args: vec![i64::from(s.time_wait)],
+            });
+        }
+        if s.exposed_listeners > 0 {
+            s.findings.push(Finding {
+                code: F_EXPOSED_LISTENERS,
+                subject: String::new(),
+                args: vec![i64::from(s.exposed_listeners)],
+            });
+        }
+        if s.established == 0 && s.syn_sent == 0 {
+            s.findings.push(Finding {
+                code: F_NO_ACTIVITY,
+                subject: String::new(),
+                args: vec![],
+            });
+        }
+        list.truncate(MAX_PROCESSES);
+        s.processes = list;
+        s
+    }
+
+    pub fn encode(s: &Summary) -> Record {
+        use tags::sysnet as t;
+        let mut r = Record::with_status(code::OK);
+        r.int(t::TOTAL, i64::from(s.total))
+            .int(t::ESTABLISHED, i64::from(s.established))
+            .int(t::LISTEN, i64::from(s.listen))
+            .int(t::SYN_SENT, i64::from(s.syn_sent))
+            .int(t::TIME_WAIT, i64::from(s.time_wait))
+            .int(t::CLOSE_WAIT, i64::from(s.close_wait))
+            .int(t::UDP, i64::from(s.udp))
+            .int(t::EXPOSED, i64::from(s.exposed_listeners));
+        for p in &s.processes {
+            use tags::process as k;
+            let mut x = Record::new();
+            x.int(k::PID, i64::from(p.pid))
+                .text(k::NAME, &p.name)
+                .int(k::ESTABLISHED, i64::from(p.established))
+                .int(k::SYN_SENT, i64::from(p.syn_sent))
+                .int(k::LISTEN, i64::from(p.listen))
+                .int(k::CLOSE_WAIT, i64::from(p.close_wait))
+                .int(k::UDP, i64::from(p.udp))
+                .int(k::REMOTES, i64::from(p.remotes));
+            for e in &p.sample {
+                x.text(k::SAMPLE, e);
+            }
+            r.record(t::PROCESS, x);
+        }
+        for f in &s.findings {
+            let mut x = Record::new();
+            x.int(tags::finding::CODE, f.code)
+                .text(tags::finding::SUBJECT, &f.subject);
+            for a in &f.args {
+                x.int(tags::finding::ARG, *a);
+            }
+            r.record(t::FINDING, x);
+        }
+        r
+    }
+
+    /// Live snapshot of the whole machine (Windows). Other platforms: UNSUPPORTED.
+    #[cfg(windows)]
+    pub fn snapshot() -> Record {
+        match crate::sys::win::connection_tables() {
+            Ok(t) => {
+                let mut conns = parse_tcp4(&t.tcp4);
+                conns.extend(parse_tcp6(&t.tcp6));
+                conns.extend(parse_udp4(&t.udp4));
+                conns.extend(parse_udp6(&t.udp6));
+                encode(&summarize(&conns, crate::sys::win::process_name))
+            }
+            Err(e) => {
+                let mut r = Record::with_status(code::INTERNAL);
+                r.int(tags::sysnet::OS_ERROR, i64::from(e));
+                r
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn snapshot() -> Record {
+        Record::with_status(code::UNSUPPORTED)
     }
 }
 
@@ -4339,6 +4822,11 @@ pub mod api {
         }
     }
 
+    /// System-wide connection snapshot with per-process findings (Windows).
+    pub fn system_connections() -> Vec<u8> {
+        encode(&crate::sysnet::snapshot())
+    }
+
     /// Builds an RFC 8484 DoH query (DNS wire format, ID 0). No handle needed.
     pub fn doh_query(request: &[u8]) -> Vec<u8> {
         match decode(request) {
@@ -4679,6 +5167,19 @@ mod exports {
         // SAFETY: JVM-provided env.
         jni::guard(null_mut(), || unsafe {
             respond(env, &api::evaluate(handle))
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_thedpi_Native_systemConnections(
+        env: EnvPtr,
+        _class: JClass,
+    ) -> JByteArray {
+        // SAFETY: JVM-provided env.
+        jni::guard(null_mut(), || unsafe {
+            respond(env, &api::system_connections())
         })
     }
 

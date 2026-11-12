@@ -406,6 +406,21 @@ fun main() {
         }
     }
 
+    test("system-wide snapshot: JNI call, platform status and Turkish rendering") {
+        val snap = SystemSnapshot.capture()
+        val windows = System.getProperty("os.name").lowercase().contains("windows")
+        eq(snap.status, if (windows) Codes.OK else Codes.UNSUPPORTED, "status")
+        expect(Text.system(snap).isNotEmpty()) { "render" }
+        val synthetic = SystemSnapshot(
+            Codes.OK, 10, 3, 1, 4, 0, 0, 2, 1,
+            listOf(ProcessInfo(1200, "app.exe", 0, 4, 0, 0, 0, 4, listOf("203.0.113.1:443"))),
+            listOf(Observation(1, "app.exe", listOf(4, 1200)), Observation(4, "", listOf(1))),
+        )
+        val text = Text.system(synthetic)
+        expect("el sıkışmada takılı" in text && "app.exe" in text && "203.0.113.1:443" in text) { text }
+        for (c in 1..Text.KNOWN_SYSTEM_FINDINGS) expect(!Text.systemFinding(Observation(c, "x", listOf(1, 2))).startsWith("Bulgu")) { "finding $c" }
+    }
+
     test("concurrent use of one session is safe") {
         DiagnosticSession(fastConfig).use { s ->
             s.setEnvironment(env("127.0.0.1:9"))

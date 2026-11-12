@@ -1921,6 +1921,274 @@ fn engine_accepts_platform_doh_results() {
     api::destroy(h);
 }
 
+// ---------------------------------------------------------------- system-wide connections
+
+fn dword(v: u32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+fn port_dword(p: u16) -> [u8; 4] {
+    let b = p.to_be_bytes();
+    [b[0], b[1], 0, 0]
+}
+
+type Tcp4Row = (u32, [u8; 4], u16, [u8; 4], u16, u32);
+type Tcp6Row = (u32, Ipv6Addr, u16, Ipv6Addr, u16, u32);
+
+fn mib_tcp4(rows: &[Tcp4Row]) -> Vec<u8> {
+    let mut v = dword(rows.len() as u32).to_vec();
+    for (st, l, lp, r, rp, pid) in rows {
+        v.extend(dword(*st));
+        v.extend(l);
+        v.extend(port_dword(*lp));
+        v.extend(r);
+        v.extend(port_dword(*rp));
+        v.extend(dword(*pid));
+    }
+    v
+}
+
+fn mib_tcp6(rows: &[Tcp6Row]) -> Vec<u8> {
+    let mut v = dword(rows.len() as u32).to_vec();
+    for (st, l, lp, r, rp, pid) in rows {
+        v.extend(l.octets());
+        v.extend(dword(0));
+        v.extend(port_dword(*lp));
+        v.extend(r.octets());
+        v.extend(dword(0));
+        v.extend(port_dword(*rp));
+        v.extend(dword(*st));
+        v.extend(dword(*pid));
+    }
+    v
+}
+
+fn mib_udp4(rows: &[([u8; 4], u16, u32)]) -> Vec<u8> {
+    let mut v = dword(rows.len() as u32).to_vec();
+    for (l, lp, pid) in rows {
+        v.extend(l);
+        v.extend(port_dword(*lp));
+        v.extend(dword(*pid));
+    }
+    v
+}
+
+#[test]
+fn sysnet_parses_owner_pid_tables() {
+    use crate::sysnet::{self, state};
+    let t4 = mib_tcp4(&[
+        (
+            state::ESTABLISHED,
+            [10, 0, 0, 2],
+            50_000,
+            [93, 184, 216, 34],
+            443,
+            1200,
+        ),
+        (state::LISTEN, [0, 0, 0, 0], 445, [0, 0, 0, 0], 0, 4),
+    ]);
+    let c = sysnet::parse_tcp4(&t4);
+    assert_eq!(c.len(), 2);
+    assert_eq!(c[0].local, "10.0.0.2:50000".parse().unwrap());
+    assert_eq!(c[0].remote, Some("93.184.216.34:443".parse().unwrap()));
+    assert_eq!(
+        (c[0].state, c[0].pid, c[0].proto),
+        (state::ESTABLISHED, 1200, sysnet::PROTO_TCP)
+    );
+    assert_eq!(c[1].remote, None, "listeners have no peer");
+    let peer6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let t6 = mib_tcp6(&[(state::SYN_SENT, Ipv6Addr::LOCALHOST, 60_000, peer6, 443, 77)]);
+    let c6 = sysnet::parse_tcp6(&t6);
+    assert_eq!(c6[0].remote, Some(SocketAddr::new(IpAddr::V6(peer6), 443)));
+    assert_eq!((c6[0].state, c6[0].pid), (state::SYN_SENT, 77));
+    let u = sysnet::parse_udp4(&mib_udp4(&[([0, 0, 0, 0], 5353, 900)]));
+    assert_eq!(
+        (u[0].proto, u[0].local.port(), u[0].pid),
+        (sysnet::PROTO_UDP, 5353, 900)
+    );
+}
+
+#[test]
+fn sysnet_never_trusts_the_row_count() {
+    use crate::sysnet;
+    let mut t4 = mib_tcp4(&[(5, [1, 1, 1, 1], 1, [2, 2, 2, 2], 2, 3)]);
+    t4[..4].copy_from_slice(&u32::MAX.to_le_bytes()); // claims 4 billion rows
+    assert_eq!(sysnet::parse_tcp4(&t4).len(), 1);
+    for cut in 0..t4.len() {
+        let _ = sysnet::parse_tcp4(&t4[..cut]);
+        let _ = sysnet::parse_tcp6(&t4[..cut]);
+        let _ = sysnet::parse_udp4(&t4[..cut]);
+        let _ = sysnet::parse_udp6(&t4[..cut]);
+    }
+    let mut rng = Lcg(0x5E7);
+    for _ in 0..2000 {
+        let n = (rng.next() % 200) as usize;
+        let b = rng.bytes(n);
+        let _ = sysnet::parse_tcp6(&b);
+        let _ = sysnet::parse_udp6(&b);
+    }
+}
+
+#[test]
+fn sysnet_summary_and_findings() {
+    use crate::sysnet::{self, state};
+    let peer = |i: u8| [203, 0, 113, i];
+    let mut rows = vec![
+        (state::LISTEN, [0, 0, 0, 0], 3389, [0, 0, 0, 0], 0, 900),
+        (
+            state::ESTABLISHED,
+            [127, 0, 0, 1],
+            5000,
+            [127, 0, 0, 1],
+            5001,
+            500,
+        ), // loopback IPC
+    ];
+    for i in 0..4 {
+        rows.push((
+            state::SYN_SENT,
+            [10, 0, 0, 2],
+            40_000 + u16::from(i),
+            peer(i),
+            443,
+            1200,
+        ));
+    }
+    for i in 0..3 {
+        rows.push((
+            state::ESTABLISHED,
+            [10, 0, 0, 2],
+            41_000 + u16::from(i),
+            peer(10 + i),
+            443,
+            1300,
+        ));
+    }
+    for i in 0..25u16 {
+        rows.push((
+            state::CLOSE_WAIT,
+            [10, 0, 0, 2],
+            42_000 + i,
+            peer(50),
+            80,
+            1400,
+        ));
+    }
+    let mut conns = sysnet::parse_tcp4(&mib_tcp4(&rows));
+    conns.extend(sysnet::parse_udp4(&mib_udp4(&[([0, 0, 0, 0], 53, 1300)])));
+    let names = |pid: u32| match pid {
+        1200 => Some("blocked-app.exe".to_string()),
+        1300 => Some("browser.exe".to_string()),
+        _ => None,
+    };
+    let s = sysnet::summarize(&conns, names);
+    assert_eq!(
+        (
+            s.total,
+            s.established,
+            s.listen,
+            s.syn_sent,
+            s.close_wait,
+            s.udp,
+            s.exposed_listeners
+        ),
+        (35, 4, 1, 4, 25, 1, 1)
+    );
+    assert_eq!(
+        s.processes[0].name, "blocked-app.exe",
+        "stuck handshakes sort first"
+    );
+    assert_eq!(s.processes[0].remotes, 4);
+    let browser = s.processes.iter().find(|p| p.pid == 1300).unwrap();
+    assert_eq!(
+        (
+            browser.established,
+            browser.udp,
+            browser.remotes,
+            browser.sample.len()
+        ),
+        (3, 1, 3, 3)
+    );
+    let ipc = s.processes.iter().find(|p| p.pid == 500).unwrap();
+    assert_eq!(
+        (ipc.name.as_str(), ipc.remotes),
+        ("pid 500", 0),
+        "loopback is not a remote endpoint"
+    );
+    let codes: Vec<i64> = s.findings.iter().map(|f| f.code).collect();
+    assert!(
+        codes.contains(&sysnet::F_STUCK_HANDSHAKES)
+            && codes.contains(&sysnet::F_CLOSE_WAIT_LEAK)
+            && codes.contains(&sysnet::F_EXPOSED_LISTENERS)
+    );
+    let stuck = s
+        .findings
+        .iter()
+        .find(|f| f.code == sysnet::F_STUCK_HANDSHAKES)
+        .unwrap();
+    assert_eq!(
+        (stuck.subject.as_str(), stuck.args.clone()),
+        ("blocked-app.exe", vec![4, 1200])
+    );
+    let quiet = sysnet::summarize(&[], |_| None);
+    assert_eq!(quiet.findings[0].code, sysnet::F_NO_ACTIVITY);
+    let rec = wire::decode(&wire::encode(&sysnet::encode(&s)).unwrap()).unwrap();
+    assert_eq!(rec.get_int(tags::sysnet::SYN_SENT), Some(4));
+    assert_eq!(rec.records(tags::sysnet::FINDING).count(), 3);
+}
+
+#[test]
+fn sysnet_live_snapshot() {
+    #[cfg(not(windows))]
+    assert_eq!(
+        wire::decode(&api::system_connections()).unwrap().status(),
+        Some(i64::from(code::UNSUPPORTED))
+    );
+    #[cfg(windows)]
+    {
+        // Open real sockets in this process and find them in the machine-wide table.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let _c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let _a = l.accept().unwrap();
+        let rec = wire::decode(&api::system_connections()).unwrap();
+        assert_eq!(rec.status(), Some(0), "{rec:?}");
+        assert!(rec.get_int(tags::sysnet::LISTEN).unwrap() >= 1);
+        assert!(rec.get_int(tags::sysnet::ESTABLISHED).unwrap() >= 2);
+        // FFI + row layout: our exact sockets are decoded from the live table.
+        let raw = crate::sys::win::connection_tables().unwrap();
+        let rows = crate::sysnet::parse_tcp4(&raw.tcp4);
+        let ours: Vec<_> = rows
+            .iter()
+            .filter(|c| c.local.port() == port || c.remote.map(|r| r.port()) == Some(port))
+            .collect();
+        assert!(
+            ours.iter()
+                .any(|c| c.state == crate::sysnet::state::LISTEN && c.remote.is_none())
+        );
+        assert_eq!(
+            ours.iter()
+                .filter(|c| c.state == crate::sysnet::state::ESTABLISHED)
+                .count(),
+            2
+        );
+        // Owner attribution: required whenever the OS reports owners at all (real Windows;
+        // some emulators report PID 0 for every row).
+        if rows.iter().any(|c| c.pid != 0) {
+            let me = std::process::id();
+            assert!(ours.iter().all(|c| c.pid == me), "{ours:?}");
+            let mine = rec
+                .records(tags::sysnet::PROCESS)
+                .find(|p| p.get_int(tags::process::PID) == Some(i64::from(me)))
+                .expect("own process listed");
+            assert!(
+                mine.get_text(tags::process::NAME)
+                    .unwrap()
+                    .ends_with(".exe")
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------- engine + api
 
 fn config_bytes(f: impl FnOnce(&mut Record)) -> Vec<u8> {

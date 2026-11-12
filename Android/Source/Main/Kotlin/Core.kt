@@ -97,6 +97,7 @@ object Native {
     @JvmStatic external fun networkChanged(handle: Long): Int
     @JvmStatic external fun markApplied(handle: Long, action: Int): Int
     @JvmStatic external fun dohQuery(request: ByteArray): ByteArray?
+    @JvmStatic external fun systemConnections(): ByteArray?
     @JvmStatic external fun submitEncrypted(handle: Long, results: ByteArray): Int
 }
 
@@ -308,6 +309,15 @@ object Tags {
         const val QUERY_NAME = 5; const val QTYPE = 6; const val RESPONSE = 7; const val STATUS = 8; const val ANSWERS = 9
     }
     object DohQuery { const val NAME = 1; const val QTYPE = 2; const val QUERY = 1 }
+    object Sysnet {
+        const val TOTAL = 1; const val ESTABLISHED = 2; const val LISTEN = 3; const val SYN_SENT = 4; const val TIME_WAIT = 5
+        const val CLOSE_WAIT = 6; const val UDP = 7; const val PROCESS = 8; const val FINDING = 9; const val EXPOSED = 10; const val OS_ERROR = 11
+    }
+    object Process {
+        const val PID = 1; const val NAME = 2; const val ESTABLISHED = 3; const val SYN_SENT = 4; const val LISTEN = 5
+        const val UDP = 6; const val REMOTES = 7; const val CLOSE_WAIT = 8; const val SAMPLE = 9
+    }
+    object Finding { const val CODE = 1; const val SUBJECT = 2; const val ARG = 3 }
 
     object Tls {
         const val HOST = 1; const val PORT = 2; const val STATUS = 3; const val HANDSHAKE_US = 4
@@ -602,6 +612,40 @@ object Doh {
     }
 }
 
+data class ProcessInfo(
+    val pid: Long, val name: String, val established: Int, val synSent: Int, val listen: Int,
+    val closeWait: Int, val udp: Int, val remotes: Int, val sample: List<String>,
+)
+
+data class SystemSnapshot(
+    val status: Int, val total: Int, val established: Int, val listen: Int, val synSent: Int, val timeWait: Int,
+    val closeWait: Int, val udp: Int, val exposed: Int, val processes: List<ProcessInfo>, val findings: List<Observation>,
+) {
+    companion object {
+        /** Machine-wide connections per process (Windows user mode; other platforms: UNSUPPORTED). */
+        fun capture(): SystemSnapshot {
+            val r = Wire.decode(Native.systemConnections() ?: throw WireException("null result"))
+            fun i(rec: Record, tag: Int) = (rec.getInt(tag) ?: 0L).toInt()
+            return SystemSnapshot(
+                status = (r.status ?: Codes.INTERNAL.toLong()).toInt(),
+                total = i(r, Tags.Sysnet.TOTAL), established = i(r, Tags.Sysnet.ESTABLISHED), listen = i(r, Tags.Sysnet.LISTEN),
+                synSent = i(r, Tags.Sysnet.SYN_SENT), timeWait = i(r, Tags.Sysnet.TIME_WAIT), closeWait = i(r, Tags.Sysnet.CLOSE_WAIT),
+                udp = i(r, Tags.Sysnet.UDP), exposed = i(r, Tags.Sysnet.EXPOSED),
+                processes = r.records(Tags.Sysnet.PROCESS).map { p ->
+                    ProcessInfo(
+                        p.getInt(Tags.Process.PID) ?: 0, p.getText(Tags.Process.NAME) ?: "", i(p, Tags.Process.ESTABLISHED),
+                        i(p, Tags.Process.SYN_SENT), i(p, Tags.Process.LISTEN), i(p, Tags.Process.CLOSE_WAIT), i(p, Tags.Process.UDP),
+                        i(p, Tags.Process.REMOTES), p.texts(Tags.Process.SAMPLE),
+                    )
+                },
+                findings = r.records(Tags.Sysnet.FINDING).map { f ->
+                    Observation(i(f, Tags.Finding.CODE), f.getText(Tags.Finding.SUBJECT) ?: "", f.ints(Tags.Finding.ARG))
+                },
+            )
+        }
+    }
+}
+
 data class Report(val run: RunResult, val evaluation: Evaluation?, val tls: List<TlsResult>, val encrypted: List<EncryptedResult> = emptyList())
 
 /** Owns one native engine handle; all calls are thread-safe and the handle is never reused. */
@@ -861,6 +905,48 @@ object Text {
     }
 
     private fun tri(v: Int) = when (v) { YES -> "evet"; NO -> "hayır"; else -> "bilinmiyor" }
+
+    fun systemFinding(o: Observation): String {
+        fun a(i: Int) = o.args.getOrNull(i)?.toString() ?: "?"
+        return when (o.code) {
+            1 -> "${o.subject} (PID ${a(1)}): ${a(0)} bağlantı el sıkışmada takılı (SYN_SENT) — uzak uç erişilemez veya yol filtreleniyor olabilir"
+            2 -> "${o.subject} (PID ${a(1)}): ${a(0)} bağlantı kapatılmayı bekliyor (CLOSE_WAIT) — uygulama soketleri kapatmıyor olabilir"
+            3 -> "Sistemde ${a(0)} TIME_WAIT bağlantısı: kısa ömürlü bağlantı yoğunluğu, kaynak port tükenmesi riski"
+            4 -> "${a(0)} servis tüm arayüzlerde dinliyor (0.0.0.0/::): güvenlik duvarı izin verirse ağdan erişilebilir"
+            5 -> "Etkin TCP bağlantısı yok"
+            else -> "Bulgu ${o.code} ${o.subject} ${o.args}"
+        }
+    }
+
+    const val KNOWN_SYSTEM_FINDINGS = 5
+
+    fun system(s: SystemSnapshot): String = buildString {
+        if (s.status != Codes.OK) {
+            appendLine("Sistem geneli bağlantı görünümü: ${code(s.status)}")
+            return@buildString
+        }
+        appendLine("SİSTEM GENELİ BAĞLANTILAR (yalnızca bu cihazda gösterilir, kaydedilmez)")
+        appendLine("  Toplam ${s.total} · kurulu ${s.established} · dinleyen ${s.listen} · el sıkışmada ${s.synSent} · TIME_WAIT ${s.timeWait} · CLOSE_WAIT ${s.closeWait} · UDP ${s.udp}")
+        if (s.findings.isNotEmpty()) {
+            appendLine()
+            appendLine("BULGULAR")
+            s.findings.forEach { appendLine("  • ${systemFinding(it)}") }
+        }
+        appendLine()
+        appendLine("İŞLEMLER (en fazla 64)")
+        for (p in s.processes) {
+            val parts = buildList {
+                if (p.established > 0) add("kurulu ${p.established}")
+                if (p.synSent > 0) add("el sıkışmada ${p.synSent}")
+                if (p.listen > 0) add("dinleyen ${p.listen}")
+                if (p.closeWait > 0) add("CLOSE_WAIT ${p.closeWait}")
+                if (p.udp > 0) add("UDP ${p.udp}")
+                if (p.remotes > 0) add("uzak uç ${p.remotes}")
+            }
+            appendLine("  ${p.name} (PID ${p.pid}): ${parts.joinToString(", ")}")
+            if (p.sample.isNotEmpty()) appendLine("      → ${p.sample.joinToString(", ")}")
+        }
+    }
 
     fun environment(e: EnvironmentInfo): String = buildString {
         appendLine("ORTAM")
