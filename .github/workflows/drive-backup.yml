@@ -1,0 +1,35 @@
+name: Drive Yedekle
+
+on:
+  push:
+    branches: [ The_DPI_Beta ]
+  workflow_dispatch:
+
+concurrency:
+  group: drive-backup-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apps Script Webhook Cagir
+        env:
+          HOOK_URL: ${{ secrets.DRIVE_HOOK_URL }}
+        run: |
+          if [ -z "$HOOK_URL" ]; then
+            echo "::warning::DRIVE_HOOK_URL secret'i tanimli degil, yedekleme adimi atlandi."
+            exit 0
+          fi
+          echo "Apps Script cagriliyor..."
+          YANIT=$(curl -sSL --max-time 120 --retry 3 "$HOOK_URL")
+          echo "Yanit: $YANIT"
+          case "$YANIT" in
+            OK*|ZATEN_GUNCEL*)
+              echo "Yedekleme basarili: $YANIT"
+              ;;
+            *)
+              echo "::error::Yedekleme basarisiz oldu: $YANIT"
+              exit 1
+              ;;
+          esac

@@ -22,6 +22,7 @@ import android.net.http.HttpEngine
 import android.content.Context
 import android.content.Intent
 import android.app.Activity
+import android.app.Application
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import java.io.FileInputStream
@@ -99,6 +100,8 @@ object Native {
         e
     } catch (e: SecurityException) {
         e
+    } catch (t: Throwable) {
+        t
     }
 
     val available: Boolean get() = loadError == null
@@ -2813,6 +2816,200 @@ class TunBridge(
 // ANDROID PLATFORM SECTION
 // ==================================================================================
 
+/**
+ * CrashLogger & Dahili Debugger:
+ * Uygulamanın Android 11–17 cihazlardaki tüm adımlarını, çökmelerini ve hata yığınlarını
+ * doğrudan yerel depolama dizinine (`/Android/data/com.the.dpi/files/`) kaydeder.
+ *
+ * Scoped Storage kuralları gereğince getExternalFilesDir(null) dizini (`/Android/data/com.the.dpi/files`)
+ * için herhangi bir özel çalışma zamanı izni (READ/WRITE_EXTERNAL_STORAGE) gerekmez.
+ * Kullanıcı telefonundaki Dosya Yöneticisi ile doğrudan bu klasöre girip logları inceleyebilir.
+ */
+object CrashLogger {
+    private const val TAG = "TheDpiCrashLogger"
+    private const val CRASH_FILE_NAME = "thedpi_crash.log"
+    private const val DEBUG_FILE_NAME = "thedpi_debug.log"
+    private const val MAX_DEBUG_LOG_BYTES = 1024 * 1024 // 1 MB döner günlük
+
+    @Volatile private var appContext: Context? = null
+    @Volatile private var isInitialized = false
+    private val logLock = Any()
+    private val dateFormat = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US).apply {
+        timeZone = java.util.TimeZone.getDefault()
+    }
+
+    fun init(app: Application) {
+        if (isInitialized) return
+        appContext = app.applicationContext
+        isInitialized = true
+
+        val oldHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                handleUncaughtException(thread, throwable)
+            } catch (t: Throwable) {
+                android.util.Log.e(TAG, "CrashLogger kendi içinde hata yakaladı: ${t.message}", t)
+            } finally {
+                oldHandler?.uncaughtException(thread, throwable)
+            }
+        }
+
+        log("SYSTEM", "CrashLogger & Dahili Debugger başlatıldı.")
+        log("SYSTEM", "Paket: ${app.packageName} · Ver: 1.0.0 (1)")
+        log("SYSTEM", "Kayıt Yolu: ${getDebugLogPath()}")
+    }
+
+    fun log(component: String, message: String, throwable: Throwable? = null) {
+        val nowStr = synchronized(dateFormat) { dateFormat.format(java.util.Date()) }
+        val threadName = Thread.currentThread().name
+        val line = "[$nowStr] [$threadName] [$component] $message"
+
+        if (throwable != null) {
+            android.util.Log.e(component, message, throwable)
+        } else {
+            android.util.Log.i(component, message)
+        }
+
+        val ctx = appContext ?: return
+        try {
+            val targetDir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+            if (!targetDir.exists()) targetDir.mkdirs()
+            val debugFile = java.io.File(targetDir, DEBUG_FILE_NAME)
+            synchronized(logLock) {
+                if (debugFile.exists() && debugFile.length() > MAX_DEBUG_LOG_BYTES) {
+                    val bakFile = java.io.File(targetDir, "$DEBUG_FILE_NAME.old")
+                    if (bakFile.exists()) bakFile.delete()
+                    debugFile.renameTo(bakFile)
+                }
+                java.io.FileOutputStream(debugFile, true).use { fos ->
+                    fos.write(line.toByteArray(Charsets.UTF_8))
+                    fos.write('\n'.code)
+                    if (throwable != null) {
+                        val sw = java.io.StringWriter()
+                        throwable.printStackTrace(java.io.PrintWriter(sw))
+                        fos.write(sw.toString().toByteArray(Charsets.UTF_8))
+                    }
+                    fos.flush()
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun handleUncaughtException(thread: Thread, throwable: Throwable) {
+        val nowStr = synchronized(dateFormat) { dateFormat.format(java.util.Date()) }
+        val ctx = appContext
+        val sb = java.lang.StringBuilder()
+        sb.append("================================================================================\n")
+        sb.append("THE DPI (com.the.dpi) — ÇÖKME / HATA RAPORU (CRASH DUMP)\n")
+        sb.append("Zaman          : $nowStr\n")
+        sb.append("Cihaz          : ${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})\n")
+        sb.append("Donanım        : Board=${Build.BOARD}, Hardware=${Build.HARDWARE}\n")
+        sb.append("Android Sürüm  : ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}, Build ${Build.DISPLAY})\n")
+        sb.append("Desteklenen ABI: ${Build.SUPPORTED_ABIS.joinToString(", ")}\n")
+        sb.append("Native Motor   : ${if (Native.available) "Yüklendi (v${try { Native.engineVersion() } catch (_: Throwable) { "?" }})" else "YÜKLENEMEDİ: ${Native.loadError?.message}"}\n")
+        sb.append("Tetikleyen Hat : Thread[${thread.name}, id=${thread.id}, prio=${thread.priority}]\n")
+        val rt = Runtime.getRuntime()
+        sb.append("Bellek (RAM)   : Boş=${rt.freeMemory() / 1024} KB, Toplam=${rt.totalMemory() / 1024} KB, Maks=${rt.maxMemory() / 1024} KB\n")
+        sb.append("--------------------------------------------------------------------------------\n")
+        sb.append("ÇÖKME DETAYI / HATA YIĞINI:\n")
+        val sw = java.io.StringWriter()
+        val pw = java.io.PrintWriter(sw)
+        throwable.printStackTrace(pw)
+        sb.append(sw.toString())
+        sb.append("--------------------------------------------------------------------------------\n")
+        sb.append("TÜM ÇALIŞAN THREAD'LER:\n")
+        try {
+            val allStacks = Thread.getAllStackTraces()
+            for ((t, stack) in allStacks) {
+                sb.append("Thread [${t.name}] (id=${t.id}, state=${t.state}, daemon=${t.isDaemon}):\n")
+                for (el in stack) {
+                    sb.append("    at $el\n")
+                }
+            }
+        } catch (_: Throwable) {}
+        sb.append("================================================================================\n\n")
+
+        val report = sb.toString()
+        android.util.Log.e(TAG, report)
+
+        // 1. Harici /Android/data/com.the.dpi/files/thedpi_crash.log
+        try {
+            val extDir = ctx?.getExternalFilesDir(null)
+            if (extDir != null) {
+                if (!extDir.exists()) extDir.mkdirs()
+                val f = java.io.File(extDir, CRASH_FILE_NAME)
+                java.io.FileOutputStream(f, true).use { fos ->
+                    fos.write(report.toByteArray(Charsets.UTF_8))
+                    fos.flush()
+                    try { fos.fd.sync() } catch (_: Throwable) {}
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // 2. Dahili context.filesDir/thedpi_crash.log
+        try {
+            val intDir = ctx?.filesDir
+            if (intDir != null) {
+                if (!intDir.exists()) intDir.mkdirs()
+                val f = java.io.File(intDir, CRASH_FILE_NAME)
+                java.io.FileOutputStream(f, true).use { fos ->
+                    fos.write(report.toByteArray(Charsets.UTF_8))
+                    fos.flush()
+                    try { fos.fd.sync() } catch (_: Throwable) {}
+                }
+            }
+        } catch (_: Throwable) {}
+
+        log("CRASH", "KRİTİK HATA! $CRASH_FILE_NAME dosyasına yazıldı.", throwable)
+    }
+
+    fun getCrashLogContent(): String? {
+        val ctx = appContext ?: return null
+        val ext = ctx.getExternalFilesDir(null)?.let { java.io.File(it, CRASH_FILE_NAME) }
+        if (ext?.exists() == true && ext.length() > 0) {
+            return runCatching { ext.readText(Charsets.UTF_8) }.getOrNull()
+        }
+        val intF = java.io.File(ctx.filesDir, CRASH_FILE_NAME)
+        if (intF.exists() && intF.length() > 0) {
+            return runCatching { intF.readText(Charsets.UTF_8) }.getOrNull()
+        }
+        return null
+    }
+
+    fun getDebugLogPath(): String {
+        val ctx = appContext
+        val dir = ctx?.getExternalFilesDir(null) ?: ctx?.filesDir
+        return dir?.let { java.io.File(it, DEBUG_FILE_NAME).absolutePath } ?: "Bilinmiyor"
+    }
+
+    fun getCrashLogPath(): String {
+        val ctx = appContext
+        val dir = ctx?.getExternalFilesDir(null) ?: ctx?.filesDir
+        return dir?.let { java.io.File(it, CRASH_FILE_NAME).absolutePath } ?: "Bilinmiyor"
+    }
+}
+
+/** Android Application sınıfı: Uygulama ayağa kalktığında ilk çalışan giriş noktası. */
+class TheDpiApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        CrashLogger.init(this)
+        CrashLogger.log("TheDpiApp", "==================================================")
+        CrashLogger.log("TheDpiApp", "The DPI (com.the.dpi) v1.0.0 Başlatıldı")
+        CrashLogger.log("TheDpiApp", "Cihaz: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, SDK ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.joinToString(", ")})")
+        if (Native.available) {
+            try {
+                CrashLogger.log("TheDpiApp", "Native Rust motoru yüklendi: v${Native.engineVersion()} (API ${Native.apiVersion()})")
+            } catch (t: Throwable) {
+                CrashLogger.log("TheDpiApp", "Native motor sürüm sorgusunda hata: ${t.message}", t)
+            }
+        } else {
+            CrashLogger.log("TheDpiApp", "UYARI: Native Rust motoru yüklenemedi: ${Native.loadError?.message}", Native.loadError)
+        }
+        CrashLogger.log("TheDpiApp", "==================================================")
+    }
+}
+
 /** Android platform services: ConnectivityManager facts and network-bound platform TLS. */
 object AndroidPlatform {
     fun environment(cm: ConnectivityManager): EnvironmentInfo {
@@ -3119,7 +3316,13 @@ class TheDpiVpnService : VpnService() {
     @Volatile private var roamingCallback: ConnectivityManager.NetworkCallback? = null
     private val running = AtomicBoolean(false)
 
+    override fun onCreate() {
+        super.onCreate()
+        CrashLogger.log("TheDpiVpnService", "onCreate çağrıldı")
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        CrashLogger.log("TheDpiVpnService", "onStartCommand çağrıldı (action=${intent?.action})")
         if (intent?.action == ACTION_STOP) {
             stopTunnel()
             stopSelf()
@@ -3134,6 +3337,7 @@ class TheDpiVpnService : VpnService() {
     }
 
     private fun startTunnel(customDoh: List<String>, customDns: List<String>) {
+        CrashLogger.log("TheDpiVpnService", "startTunnel başlatılıyor... (doh=${customDoh.size}, dns=${customDns.size})")
         try {
             val s = DiagnosticSession()
             session = s
@@ -3155,6 +3359,7 @@ class TheDpiVpnService : VpnService() {
             val pfd = builder.EstablishSafe()
             tun = pfd
             if (pfd != null) {
+                CrashLogger.log("TheDpiVpnService", "TUN arabirimi başarıyla açıldı (fd=${pfd.fd})")
                 // Sockets inside DirectDohClient and TunBridge are explicitly protected with protect(),
                 // allowing MainActivity's diagnostic tests to run through the VPN tunnel without loops.
                 val doh = DirectDohClient(
@@ -3181,15 +3386,18 @@ class TheDpiVpnService : VpnService() {
                 ActiveBridgeHolder.current = b
                 isRunning.set(true)
                 b.start()
+                CrashLogger.log("TheDpiVpnService", "TunBridge döngüsü başlatıldı.")
                 val cm = getSystemService(ConnectivityManager::class.java)
                 cm?.activeNetwork?.let { activeNet ->
                     runCatching { setUnderlyingNetworks(arrayOf(activeNet)) }
                 }
                 registerRoamingCallback()
             } else {
+                CrashLogger.log("TheDpiVpnService", "TUN arabirimi açılamadı (pfd == null)!")
                 stopTunnel()
             }
-        } catch (_: Exception) {
+        } catch (e: Throwable) {
+            CrashLogger.log("TheDpiVpnService", "startTunnel kritik hata: ${e.message}", e)
             stopTunnel()
         }
     }
@@ -3211,9 +3419,15 @@ class TheDpiVpnService : VpnService() {
     }
 
     private fun Builder.EstablishSafe(): ParcelFileDescriptor? =
-        try { establish() } catch (_: Exception) { null }
+        try {
+            establish()
+        } catch (t: Throwable) {
+            CrashLogger.log("TheDpiVpnService", "Builder.establish() başarısız: ${t.message}", t)
+            null
+        }
 
     private fun stopTunnel() {
+        CrashLogger.log("TheDpiVpnService", "stopTunnel çağrıldı.")
         running.set(false)
         isRunning.set(false)
         ActiveBridgeHolder.current = null
@@ -3231,19 +3445,21 @@ class TheDpiVpnService : VpnService() {
     }
 
     override fun onRevoke() {
+        CrashLogger.log("TheDpiVpnService", "VPN izni kullanıcı veya sistem tarafından geri çekildi (onRevoke).")
         stopTunnel()
         super.onRevoke()
     }
 
     override fun onDestroy() {
+        CrashLogger.log("TheDpiVpnService", "onDestroy çağrıldı.")
         stopTunnel()
         super.onDestroy()
     }
 
     companion object {
-        const val ACTION_STOP = "com.eaquelxonline.thedpi.STOP_TUNNEL"
-        const val EXTRA_DOH = "com.eaquelxonline.thedpi.EXTRA_DOH"
-        const val EXTRA_DNS = "com.eaquelxonline.thedpi.EXTRA_DNS"
+        const val ACTION_STOP = "com.the.dpi.STOP_TUNNEL"
+        const val EXTRA_DOH = "com.the.dpi.EXTRA_DOH"
+        const val EXTRA_DNS = "com.the.dpi.EXTRA_DNS"
         val isRunning = AtomicBoolean(false)
     }
 }
@@ -3300,42 +3516,48 @@ class RadarPulseView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val cx = width / 2f
-        val cy = height / 2f
-        val maxR = minOf(cx, cy) * 0.92f
-        if (maxR <= 0f) return
-        val baseColor = if (isActive) Color.parseColor("#00E676") else Color.parseColor("#00B0FF")
-        val r = Color.red(baseColor)
-        val g = Color.green(baseColor)
-        val b = Color.blue(baseColor)
+        try {
+            val cx = width / 2f
+            val cy = height / 2f
+            val maxR = minOf(cx, cy) * 0.92f
+            if (maxR <= 0f) return
+            val baseColor = if (isActive) Color.parseColor("#00E676") else Color.parseColor("#00B0FF")
+            val r = Color.red(baseColor)
+            val g = Color.green(baseColor)
+            val b = Color.blue(baseColor)
 
-        // Draw 3 expanding concentric animated radar wave rings
-        for (i in 0 until 3) {
-            val phase = (animFraction + i * 0.333f) % 1f
-            val ringR = maxR * phase
-            val alpha = ((1f - phase) * 180).toInt().coerceIn(0, 255)
-            ringPaint.color = Color.argb(alpha, r, g, b)
-            canvas.drawCircle(cx, cy, ringR, ringPaint)
-        }
+            // Draw 3 expanding concentric animated radar wave rings
+            for (i in 0 until 3) {
+                val phase = (animFraction + i * 0.333f) % 1f
+                val ringR = maxR * phase
+                if (ringR > 0f) {
+                    val alpha = ((1f - phase) * 180).toInt().coerceIn(0, 255)
+                    ringPaint.color = Color.argb(alpha, r, g, b)
+                    canvas.drawCircle(cx, cy, ringR, ringPaint)
+                }
+            }
 
-        // Center glowing badge orb
-        val centerR = maxR * 0.42f
-        glowPaint.color = Color.argb(if (isActive) 55 else 32, r, g, b)
-        canvas.drawCircle(cx, cy, centerR * 1.25f, glowPaint)
+            // Center glowing badge orb
+            val centerR = maxR * 0.42f
+            if (centerR > 0f) {
+                glowPaint.color = Color.argb(if (isActive) 55 else 32, r, g, b)
+                canvas.drawCircle(cx, cy, centerR * 1.25f, glowPaint)
 
-        glowPaint.color = Color.parseColor(if (isActive) "#064E3B" else "#0C2340")
-        canvas.drawCircle(cx, cy, centerR, glowPaint)
+                glowPaint.color = Color.parseColor(if (isActive) "#064E3B" else "#0C2340")
+                canvas.drawCircle(cx, cy, centerR, glowPaint)
 
-        ringPaint.color = Color.argb(240, r, g, b)
-        ringPaint.strokeWidth = 2f * resources.displayMetrics.density
-        canvas.drawCircle(cx, cy, centerR, ringPaint)
+                ringPaint.color = Color.argb(240, r, g, b)
+                ringPaint.strokeWidth = 2f * resources.displayMetrics.density
+                canvas.drawCircle(cx, cy, centerR, ringPaint)
 
-        // Status text in center orb
-        textPaint.color = Color.parseColor(if (isActive) "#00E676" else "#38BDF8")
-        val statusStr = if (isActive) "ENGELSİZ AKTİF" else "BEKLEMEDE"
-        val subStr = if (isActive) "DPI AŞMA & DOH TUNEL" else "SİSTEM GENELİ KORUMA"
-        canvas.drawText(statusStr, cx, cy - 2f * resources.displayMetrics.density, textPaint)
-        canvas.drawText(subStr, cx, cy + 14f * resources.displayMetrics.density, subTextPaint)
+                // Status text in center orb
+                textPaint.color = Color.parseColor(if (isActive) "#00E676" else "#38BDF8")
+                val statusStr = if (isActive) "ENGELSİZ AKTİF" else "BEKLEMEDE"
+                val subStr = if (isActive) "DPI AŞMA & DOH TUNEL" else "SİSTEM GENELİ KORUMA"
+                canvas.drawText(statusStr, cx, cy - 2f * resources.displayMetrics.density, textPaint)
+                canvas.drawText(subStr, cx, cy + 14f * resources.displayMetrics.density, subTextPaint)
+            }
+        } catch (_: Throwable) {}
     }
 }
 
@@ -3383,17 +3605,30 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        cm = getSystemService(ConnectivityManager::class.java)
-        setContentView(buildUi(savedInstanceState))
+        CrashLogger.log("MainActivity", "onCreate başladı")
+        try {
+            cm = getSystemService(ConnectivityManager::class.java)
+            setContentView(buildUi(savedInstanceState))
+        } catch (t: Throwable) {
+            CrashLogger.log("MainActivity", "setContentView / buildUi hatası!", t)
+            throw t
+        }
+
         worker.execute {
             try {
+                CrashLogger.log("MainActivity", "DiagnosticSession oluşturuluyor...")
                 session = DiagnosticSession()
+                CrashLogger.log("MainActivity", "DiagnosticSession hazır: v${Native.engineVersion()}")
                 ui {
                     status.text = "Motor ${Native.engineVersion()} hazır · 2026–2027 Hibrit Ağ Motoru"
                     runButton.isEnabled = true
                 }
             } catch (e: NativeException) {
+                CrashLogger.log("MainActivity", "NativeException: ${e.message}", e)
                 ui { status.text = "Yerel motor başlatılamadı: ${e.message}" }
+            } catch (t: Throwable) {
+                CrashLogger.log("MainActivity", "DiagnosticSession başlatma hatası: ${t.message}", t)
+                ui { status.text = "Yerel motor hatası: ${t.message}" }
             }
         }
     }
@@ -3641,6 +3876,14 @@ class MainActivity : Activity() {
         }
         column.addView(output)
 
+        val logInfo = TextView(this).apply {
+            text = "📁 Dahili Debugger & Günlük:\n/Android/data/com.the.dpi/files/thedpi_debug.log\n(Çökmeler: thedpi_crash.log dosyasına kaydedilir)"
+            textSize = 10f
+            setTextColor(Color.parseColor("#64748B"))
+            setPadding(0, dp(10), 0, dp(12))
+        }
+        column.addView(logInfo)
+
         val scroll = ScrollView(this).apply {
             setBackgroundColor(Color.parseColor("#0A0E17"))
             addView(column)
@@ -3796,38 +4039,50 @@ class MainActivity : Activity() {
     }
 
     private fun toggleDesync() {
-        val s = session ?: return
+        val s = session ?: run {
+            CrashLogger.log("MainActivity", "toggleDesync: session null!")
+            return
+        }
         val vpnActive = TheDpiVpnService.isRunning.get()
         val proxyActive = s.proxyStats().active
+        CrashLogger.log("MainActivity", "toggleDesync tıklandı: vpnActive=$vpnActive, proxyActive=$proxyActive")
         if (vpnActive || proxyActive) {
             runCatching {
                 startService(Intent(this, TheDpiVpnService::class.java).setAction(TheDpiVpnService.ACTION_STOP))
             }
             worker.execute {
-                s.stopProxy()
-                val next = s.proxyStats()
-                val text = Text.vpnStatus(false, next)
-                ui {
-                    output.text = text + "\n" + output.text.toString()
-                    desyncButton.text = "⚡ ENGELSİZ MODU BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
-                    desyncButton.setTextColor(Color.parseColor("#0A0E17"))
-                    desyncButton.background = createCardShape("#00E676", cornerDp = 14f)
-                    radarView.isActive = false
-                    status.text = "Engelsiz Mod durduruldu"
+                try {
+                    s.stopProxy()
+                    val next = s.proxyStats()
+                    val text = Text.vpnStatus(false, next)
+                    ui {
+                        output.text = text + "\n" + output.text.toString()
+                        desyncButton.text = "⚡ ENGELSİZ MODU BAŞLAT (Sistem Geneli VPN + DPI Aşma)"
+                        desyncButton.setTextColor(Color.parseColor("#0A0E17"))
+                        desyncButton.background = createCardShape("#00E676", cornerDp = 14f)
+                        radarView.isActive = false
+                        status.text = "Engelsiz Mod durduruldu"
+                    }
+                    CrashLogger.log("MainActivity", "Engelsiz Mod durduruldu.")
+                } catch (t: Throwable) {
+                    CrashLogger.log("MainActivity", "stopProxy hatası", t)
                 }
             }
             return
         }
         val prepIntent = try {
             VpnService.prepare(this)
-        } catch (_: Exception) {
+        } catch (t: Throwable) {
+            CrashLogger.log("MainActivity", "VpnService.prepare hatası: ${t.message}", t)
             null
         }
         if (prepIntent != null) {
+            CrashLogger.log("MainActivity", "VPN hazırlık intent'i başlatılıyor...")
             status.text = "Sistem geneli DPI aşma için VPN izni bekleniyor…"
             @Suppress("DEPRECATION")
             startActivityForResult(prepIntent, REQ_VPN)
         } else {
+            CrashLogger.log("MainActivity", "VPN hazırlık intent'i null (izin zaten var).")
             activateEngelsizMod(vpnGranted = true)
         }
     }
@@ -3836,13 +4091,18 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
+        CrashLogger.log("MainActivity", "onActivityResult: requestCode=$requestCode, resultCode=$resultCode")
         if (requestCode == REQ_VPN) {
             activateEngelsizMod(vpnGranted = (resultCode == RESULT_OK))
         }
     }
 
     private fun activateEngelsizMod(vpnGranted: Boolean) {
-        val s = session ?: return
+        val s = session ?: run {
+            CrashLogger.log("MainActivity", "activateEngelsizMod: session null!")
+            return
+        }
+        CrashLogger.log("MainActivity", "activateEngelsizMod çağrıldı (vpnGranted=$vpnGranted)")
         val dohList = ArrayList(split(dohEndpoints.text.toString()))
         val dnsList = ArrayList(split(altDns.text.toString()))
         if (vpnGranted) {
@@ -3851,40 +4111,48 @@ class MainActivity : Activity() {
                     .putStringArrayListExtra(TheDpiVpnService.EXTRA_DOH, dohList)
                     .putStringArrayListExtra(TheDpiVpnService.EXTRA_DNS, dnsList)
                 startService(vpnIntent)
+                CrashLogger.log("MainActivity", "TheDpiVpnService startService çağrıldı")
+            }.onFailure {
+                CrashLogger.log("MainActivity", "TheDpiVpnService başlatılamadı!", it)
             }
         }
         worker.execute {
-            val next = s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
-            val b = ActiveBridgeHolder.current
-            val text = Text.vpnStatus(
-                vpnActive = vpnGranted,
-                p = next,
-                tcpFlows = b?.tcpFlows?.get() ?: 0,
-                udpFlows = b?.udpFlows?.get() ?: 0,
-                dnsQueries = b?.dnsQueries?.get() ?: 0,
-                dohResolved = b?.dohResolved?.get() ?: 0,
-                desyncedFlows = b?.desyncedFlows?.get() ?: 0,
-                visionSplicedFlows = b?.visionSplicedFlows?.get() ?: 0,
-                poisonedBlocked = b?.poisonedDnsBlocked?.get() ?: 0,
-                quicFallbacks = b?.quicFallbacks?.get() ?: 0,
-                tlsFragmented = b?.tlsRecordFragmented?.get() ?: 0,
-                bytesUp = b?.bytesUp?.get() ?: 0L,
-                bytesDown = b?.bytesDown?.get() ?: 0L,
-            )
-            ui {
-                output.text = text + "\n" + output.text.toString()
-                radarView.isActive = true
-                if (vpnGranted) {
-                    desyncButton.text = "🛡️ ENGELSİZ MOD ETKİN (Sistem Geneli VPN + 127.0.0.1:${next.port})"
-                    desyncButton.setTextColor(Color.WHITE)
-                    desyncButton.background = createCardShape("#DC2626", cornerDp = 14f)
-                    status.text = "Engelsiz Mod etkin: Sistem Geneli VPN (Discord/Roblox TCP+UDP+DoH) + 127.0.0.1:${next.port}"
-                } else {
-                    desyncButton.text = "🛡️ YEREL PROXY ETKİN (127.0.0.1:${next.port})"
-                    desyncButton.setTextColor(Color.WHITE)
-                    desyncButton.background = createCardShape("#D97706", cornerDp = 14f)
-                    status.text = "VPN izni verilmedi; yalnızca yerel proxy etkin (127.0.0.1:${next.port})"
+            try {
+                val next = s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
+                CrashLogger.log("MainActivity", "startProxy tamamlandı: active=${next.active}, listenPort=${next.listenPort}")
+                val b = ActiveBridgeHolder.current
+                val text = Text.vpnStatus(
+                    vpnActive = vpnGranted,
+                    p = next,
+                    tcpFlows = b?.tcpFlows?.get() ?: 0,
+                    udpFlows = b?.udpFlows?.get() ?: 0,
+                    dnsQueries = b?.dnsQueries?.get() ?: 0,
+                    dohResolved = b?.dohResolved?.get() ?: 0,
+                    desyncedFlows = b?.desyncedFlows?.get() ?: 0,
+                    visionSplicedFlows = b?.visionSplicedFlows?.get() ?: 0,
+                    poisonedBlocked = b?.poisonedDnsBlocked?.get() ?: 0,
+                    quicFallbacks = b?.quicFallbacks?.get() ?: 0,
+                    tlsFragmented = b?.tlsRecordFragmented?.get() ?: 0,
+                    bytesUp = b?.bytesUp?.get() ?: 0L,
+                    bytesDown = b?.bytesDown?.get() ?: 0L,
+                )
+                ui {
+                    output.text = text + "\n" + output.text.toString()
+                    radarView.isActive = true
+                    if (vpnGranted) {
+                        desyncButton.text = "🛡️ ENGELSİZ MOD ETKİN (Sistem Geneli VPN + 127.0.0.1:${next.port})"
+                        desyncButton.setTextColor(Color.WHITE)
+                        desyncButton.background = createCardShape("#DC2626", cornerDp = 14f)
+                        status.text = "Engelsiz Mod etkin: Sistem Geneli VPN (Discord/Roblox TCP+UDP+DoH) + 127.0.0.1:${next.port}"
+                    } else {
+                        desyncButton.text = "🛡️ YEREL PROXY ETKİN (127.0.0.1:${next.port})"
+                        desyncButton.setTextColor(Color.WHITE)
+                        desyncButton.background = createCardShape("#D97706", cornerDp = 14f)
+                        status.text = "VPN izni verilmedi; yalnızca yerel proxy etkin (127.0.0.1:${next.port})"
+                    }
                 }
+            } catch (t: Throwable) {
+                CrashLogger.log("MainActivity", "activateEngelsizMod worker hatası", t)
             }
         }
     }

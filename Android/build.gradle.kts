@@ -9,12 +9,12 @@ val nativeDir: Directory = rootProject.layout.projectDirectory.dir("Native")
 val jniOut = layout.buildDirectory.dir("generated/jniLibs")
 
 android {
-    namespace = "com.eaquelxonline.thedpi"
+    namespace = "com.the.dpi"
     compileSdk = 37
     ndkVersion = "30.0.16248370"
 
     defaultConfig {
-        applicationId = "com.eaquelxonline.thedpi"
+        applicationId = "com.the.dpi"
         minSdk = 30
         targetSdk = 37
         versionCode = 1

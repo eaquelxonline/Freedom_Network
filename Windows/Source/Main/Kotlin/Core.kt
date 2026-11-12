@@ -97,6 +97,8 @@ object Native {
         e
     } catch (e: SecurityException) {
         e
+    } catch (t: Throwable) {
+        t
     }
 
     val available: Boolean get() = loadError == null
