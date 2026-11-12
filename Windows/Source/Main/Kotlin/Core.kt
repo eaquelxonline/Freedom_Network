@@ -7,6 +7,14 @@
 
 package thedpi
 
+import java.time.Duration
+import java.net.http.HttpTimeoutException
+import java.net.http.HttpResponse
+import java.net.http.HttpRequest
+import java.net.http.HttpClient
+import java.net.URI
+import java.net.ProxySelector
+import java.net.ConnectException
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.Font
@@ -89,6 +97,8 @@ object Native {
     @JvmStatic external fun evaluate(handle: Long): ByteArray?
     @JvmStatic external fun networkChanged(handle: Long): Int
     @JvmStatic external fun markApplied(handle: Long, action: Int): Int
+    @JvmStatic external fun dohQuery(request: ByteArray): ByteArray?
+    @JvmStatic external fun submitEncrypted(handle: Long, results: ByteArray): Int
 }
 
 object Codes {
@@ -116,6 +126,10 @@ class Record {
     data class IntValue(val v: Long) : Value
     data class TextValue(val v: String) : Value
     data class RecordValue(val v: Record) : Value
+    class BytesValue(val v: ByteArray) : Value {
+        override fun equals(other: Any?) = other is BytesValue && other.v.contentEquals(v)
+        override fun hashCode() = v.contentHashCode()
+    }
 
     val fields = ArrayList<Pair<Int, Value>>()
 
@@ -123,6 +137,8 @@ class Record {
     fun int(tag: Int, v: Int) = int(tag, v.toLong())
     fun text(tag: Int, v: String) = apply { fields += tag to TextValue(Wire.truncateUtf8(v, Wire.MAX_TEXT)) }
     fun record(tag: Int, r: Record) = apply { fields += tag to RecordValue(r) }
+    fun bytes(tag: Int, v: ByteArray) = apply { fields += tag to BytesValue(v.copyOf(minOf(v.size, Wire.MAX_BYTES))) }
+    fun getBytes(tag: Int): ByteArray? = fields.firstOrNull { it.first == tag && it.second is BytesValue }?.let { (it.second as BytesValue).v }
 
     fun ints(tag: Int): List<Long> = fields.filter { it.first == tag }.mapNotNull { (it.second as? IntValue)?.v }
     fun texts(tag: Int): List<String> = fields.filter { it.first == tag }.mapNotNull { (it.second as? TextValue)?.v }
@@ -146,6 +162,8 @@ object Wire {
     private const val KIND_INT = 1
     private const val KIND_TEXT = 2
     private const val KIND_RECORD = 3
+    private const val KIND_BYTES = 4
+    const val MAX_BYTES = 16 * 1024
 
     fun truncateUtf8(s: String, max: Int): String {
         val bytes = s.toByteArray(Charsets.UTF_8)
@@ -183,6 +201,10 @@ object Wire {
                     val b = v.v.toByteArray(Charsets.UTF_8)
                     header(out, tag, KIND_TEXT, b.size)
                     out.write(b)
+                }
+                is Record.BytesValue -> {
+                    header(out, tag, KIND_BYTES, v.v.size)
+                    out.write(v.v)
                 }
                 is Record.RecordValue -> {
                     val inner = ByteArrayOutputStream()
@@ -232,6 +254,10 @@ object Wire {
                     }
                 }
                 KIND_RECORD -> Record.RecordValue(decodeFields(payload, depth + 1, count))
+                KIND_BYTES -> {
+                    if (len > MAX_BYTES) throw WireException("bytes too long")
+                    Record.BytesValue(ByteArray(len.toInt()).also { payload.get(it) })
+                }
                 else -> throw WireException("bad kind $kind")
             }
             rec.fields += tag to value
@@ -258,7 +284,7 @@ object Tags {
 
     object Request { const val TARGET = 1; const val ALT_DNS = 2 }
 
-    object Run { const val GENERATION = 1; const val DURATION_US = 2; const val RESOLVER = 3; const val TARGET = 4; const val INVALID = 5 }
+    object Run { const val GENERATION = 1; const val DURATION_US = 2; const val RESOLVER = 3; const val TARGET = 4; const val INVALID = 5; const val ENCRYPTED = 6 }
 
     object Resolver {
         const val SERVER = 1; const val ALTERNATE = 2; const val SENT = 3; const val RECEIVED = 4
@@ -277,6 +303,12 @@ object Tags {
     }
 
     object TlsSubmit { const val RESULT = 1 }
+    object EncSubmit { const val RESULT = 1 }
+    object Enc {
+        const val ENDPOINT = 1; const val PROTOCOL = 2; const val TRANSPORT = 3; const val RTT_US = 4
+        const val QUERY_NAME = 5; const val QTYPE = 6; const val RESPONSE = 7; const val STATUS = 8; const val ANSWERS = 9
+    }
+    object DohQuery { const val NAME = 1; const val QTYPE = 2; const val QUERY = 1 }
 
     object Tls {
         const val HOST = 1; const val PORT = 2; const val STATUS = 3; const val HANDSHAKE_US = 4
@@ -534,7 +566,44 @@ class TlsProber(
 
 // ------------------------------------------------------------------ session
 
-data class Report(val run: RunResult, val evaluation: Evaluation?, val tls: List<TlsResult>)
+/** Encrypted-DNS protocol identifiers (mirror of probe::ENC_* in Native/Core.rs). */
+object EncProtocol {
+    const val UNKNOWN = 0
+    const val DOH = 1 // DNS over HTTPS, HTTP/2 (RFC 8484)
+    const val DOH3 = 2 // DNS over HTTPS, HTTP/3 over QUIC (RFC 8484 + RFC 9114)
+    const val DOT = 3 // DNS over TLS (RFC 7858)
+    const val DOQ = 4 // DNS over dedicated QUIC (RFC 9250)
+}
+
+/** Result of one HTTPS exchange performed by the platform's own TLS/QUIC stack. */
+data class DohResponse(val transport: Int, val rttUs: Long, val protocol: Int, val body: ByteArray?)
+
+/**
+ * Platform transport for RFC 8484 DoH: POST application/dns-message over the platform's
+ * HTTPS client (HTTP/3 where the platform offers it, HTTP/2 otherwise). Certificate
+ * validation is the platform's and is never relaxed.
+ */
+fun interface DohClient {
+    fun post(url: String, body: ByteArray, timeoutMs: Int): DohResponse
+}
+
+data class EncryptedResult(val endpoint: String, val name: String, val protocol: Int, val transport: Int, val rttUs: Long, val status: Int = 0)
+
+object Doh {
+    const val MAX_ENDPOINTS = 4
+
+    /** Only absolute https:// URLs are accepted: DoH is never sent in clear text. */
+    fun validEndpoint(url: String): Boolean =
+        url.length <= 256 && url.startsWith("https://") && runCatching { java.net.URI(url).host?.isNotEmpty() == true }.getOrDefault(false)
+
+    /** RFC 8484 query bytes built by the native DNS codec (ID 0). */
+    fun query(name: String, qtype: Int = 1): ByteArray? {
+        val r = Wire.decode(Native.dohQuery(Wire.encode(Record().text(Tags.DohQuery.NAME, name).int(Tags.DohQuery.QTYPE, qtype))) ?: return null)
+        return if (r.status?.toInt() == Codes.OK) r.getBytes(Tags.DohQuery.QUERY) else null
+    }
+}
+
+data class Report(val run: RunResult, val evaluation: Evaluation?, val tls: List<TlsResult>, val encrypted: List<EncryptedResult> = emptyList())
 
 /** Owns one native engine handle; all calls are thread-safe and the handle is never reused. */
 class DiagnosticSession(val config: EngineConfig = EngineConfig()) : AutoCloseable {
@@ -574,7 +643,25 @@ class DiagnosticSession(val config: EngineConfig = EngineConfig()) : AutoCloseab
     fun markApplied(action: Int): Int = Native.markApplied(live(), action)
 
     /** Full pipeline: native probes → platform TLS on reachable targets → evaluation. */
-    fun run(targets: List<String>, alternateDns: List<String>, tls: TlsProber?): Report {
+    /** Measures user-authorized encrypted resolvers and submits them for validation. */
+    fun measureEncrypted(run: RunResult, endpoints: List<String>, client: DohClient): List<EncryptedResult> {
+        val name = run.targets.firstOrNull { !it.literal }?.host ?: return emptyList()
+        val query = Doh.query(name) ?: return emptyList()
+        val results = ArrayList<EncryptedResult>()
+        val submission = Record()
+        for (url in endpoints.filter(Doh::validEndpoint).distinct().take(Doh.MAX_ENDPOINTS)) {
+            val r = client.post(url, query, config.timeoutMs)
+            val rec = Record().text(Tags.Enc.ENDPOINT, url).int(Tags.Enc.PROTOCOL, r.protocol).int(Tags.Enc.TRANSPORT, r.transport)
+                .int(Tags.Enc.RTT_US, r.rttUs).text(Tags.Enc.QUERY_NAME, name).int(Tags.Enc.QTYPE, 1)
+            r.body?.let { rec.bytes(Tags.Enc.RESPONSE, it) }
+            submission.record(Tags.EncSubmit.RESULT, rec)
+            results += EncryptedResult(url, name, r.protocol, r.transport, r.rttUs)
+        }
+        if (results.isNotEmpty()) Native.submitEncrypted(live(), Wire.encode(submission))
+        return results
+    }
+
+    fun run(targets: List<String>, alternateDns: List<String>, tls: TlsProber?, doh: DohClient? = null, dohEndpoints: List<String> = emptyList()): Report {
         val run = diagnose(targets, alternateDns)
         if (run.status != Codes.OK) return Report(run, null, emptyList())
         val tlsResults = if (tls == null) emptyList() else run.targets.filter { it.tcpOk }.map { tls.probe(it.host, it.port, config.timeoutMs) }
@@ -587,7 +674,10 @@ class DiagnosticSession(val config: EngineConfig = EngineConfig()) : AutoCloseab
                 } ?: t
             },
         )
-        return Report(merged, evaluate(), tlsResults)
+        val encrypted = if (doh != null && dohEndpoints.isNotEmpty()) measureEncrypted(run, dohEndpoints, doh) else emptyList()
+        val evaluation = evaluate()
+        // Status of each encrypted resolver as validated natively (parser verdict), for display.
+        return Report(merged, evaluation, tlsResults, encrypted)
     }
 
     @Synchronized
@@ -742,12 +832,25 @@ object Text {
             36 -> "Arka plan veri kısıtlaması (Veri Tasarrufu) etkin"
             37 -> "Özel DNS (DNS over TLS) etkin${if (s.isNotEmpty()) ": $s" else ""}"
             38 -> "Sistem DNS sunucusu bilgisi alınamadı"
+            40 -> "Şifreli DNS ${Text.encProtocol(o.args.getOrNull(1)?.toInt() ?: 0)} ($s) yanıtladı (${a(0)} ms)"
+            41 -> "Şifreli DNS kullanılabilir: ${Text.encProtocol(o.args.getOrNull(1)?.toInt() ?: 0)} $s ${a(0)} ms (sistem DNS: ${a(2)} ms). Gizlilik için sistemde şifreli DNS'i etkinleştirmeyi değerlendirin"
+            42 -> "Şifreli DNS $s yanıt vermedi (${status(o.args.getOrNull(0)?.toInt() ?: 5)}); uç nokta veya ağ politikası olabilir"
+            43 -> "$s: sistem DNS'i alan adı yok diyor, bağımsız şifreli DNS (${Text.encProtocol(o.args.getOrNull(0)?.toInt() ?: 0)}) çözüyor — çözümleyici düzeyinde tutarsızlık"
+            44 -> "$s: şifreli DNS de alan adının olmadığını doğruluyor"
             39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; THE DPI bu izni istemez). Bu bir ağ arızası değildir."
             else -> "Gözlem ${o.code} $s ${o.args}"
         }
     }
 
-    const val KNOWN_OBSERVATIONS = 39
+    const val KNOWN_OBSERVATIONS = 44
+
+    fun encProtocol(p: Int): String = when (p) {
+        EncProtocol.DOH -> "DoH (HTTP/2)"
+        EncProtocol.DOH3 -> "DoH3 (HTTP/3)"
+        EncProtocol.DOT -> "DoT"
+        EncProtocol.DOQ -> "DoQ"
+        else -> "şifreli DNS"
+    }
     const val KNOWN_CATEGORIES = 17
     const val KNOWN_ACTIONS = 13
 
@@ -790,6 +893,12 @@ object Text {
             if (t.quicStatus != 11) appendLine("    QUIC  : ${status(t.quicStatus)}${if (t.quicVersions.isNotEmpty()) " sürümler " + t.quicVersions.joinToString(",") { "0x" + it.toString(16) } else ""}")
             if (t.mtuStatus == 1) appendLine("    MTU   : yol ${t.pathMtu}/${t.mtuCeiling} bayt (${t.mtuProbes} prob)")
         }
+        if (r.encrypted.isNotEmpty()) {
+            appendLine("  Şifreli DNS (sorgu: ${r.encrypted.first().name})")
+            for (x in r.encrypted) {
+                appendLine("    ${x.endpoint}: ${encProtocol(x.protocol)}, aktarım ${status(x.transport)}, ${ms(x.rttUs)}")
+            }
+        }
         val e = r.evaluation ?: return@buildString
         appendLine()
         val stability = if (e.evaluations >= 2) ", kararlılık ${e.stability}/1000" else ""
@@ -821,7 +930,7 @@ object WindowsPlatform {
      * TLS trust anchors from the Windows certificate store via the JDK SunMSCAPI provider
      * ("Windows-ROOT"). Falls back to the JDK trust store when unavailable (non-Windows test host).
      */
-    val trust: Pair<SSLSocketFactory, String> by lazy {
+    val trustContext: Pair<SSLContext, String> by lazy {
         try {
             val ks = KeyStore.getInstance("Windows-ROOT")
             ks.load(null, null)
@@ -829,11 +938,15 @@ object WindowsPlatform {
             tmf.init(ks)
             val ctx = SSLContext.getInstance("TLS")
             ctx.init(null, tmf.trustManagers, null)
-            ctx.socketFactory to "Windows sertifika deposu"
+            ctx to "Windows sertifika deposu"
         } catch (e: Exception) {
-            SSLContext.getDefault().socketFactory to "JDK güven deposu"
+            SSLContext.getDefault() to "JDK güven deposu"
         }
     }
+
+    val trust: Pair<SSLSocketFactory, String> get() = trustContext.first.socketFactory to trustContext.second
+
+    fun dohClient(): DohClient = JdkDohClient(trustContext.first)
 
     fun prober(): TlsProber = TlsProber(trust.first, { host, port, timeout ->
         Socket().apply { connect(InetSocketAddress(host, port), timeout) }
@@ -869,17 +982,77 @@ object WindowsPlatform {
 private fun splitList(s: String): List<String> =
     s.split('\n', ',', ' ', ';').map { it.trim() }.filter { it.isNotEmpty() }
 
+/**
+ * RFC 8484 DoH over the JDK HTTP client with the Windows trust store. HTTP/3 is requested
+ * when the running JDK provides it (JEP 517); the protocol actually negotiated is reported,
+ * so DoH3 is never claimed when HTTP/2 was used. Redirects are refused (a DoH endpoint
+ * that redirects is treated as a failure, never followed into a login page).
+ */
+class JdkDohClient(private val ssl: SSLContext) : DohClient {
+    private val client: HttpClient by lazy {
+        HttpClient.newBuilder()
+            .sslContext(ssl)
+            .version(PREFERRED)
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .proxy(ProxySelector.getDefault())
+            .connectTimeout(Duration.ofSeconds(5))
+            .build()
+    }
+
+    override fun post(url: String, body: ByteArray, timeoutMs: Int): DohResponse {
+        val attempted = if (PREFERRED.name == "HTTP_3") EncProtocol.DOH3 else EncProtocol.DOH
+        val start = System.nanoTime()
+        fun rtt() = (System.nanoTime() - start) / 1000
+        return try {
+            val req = HttpRequest.newBuilder(URI(url))
+                .timeout(Duration.ofMillis(timeoutMs.toLong()))
+                .header("Content-Type", "application/dns-message")
+                .header("Accept", "application/dns-message")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                .build()
+            val resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray())
+            val proto = if (resp.version().name == "HTTP_3") EncProtocol.DOH3 else EncProtocol.DOH
+            val type = resp.headers().firstValue("content-type").orElse("")
+            if (resp.statusCode() == 200 && type.startsWith("application/dns-message")) {
+                val b = resp.body()
+                DohResponse(1, rtt(), proto, if (b.size > Wire.MAX_BYTES) b.copyOf(Wire.MAX_BYTES) else b)
+            } else {
+                DohResponse(6, rtt(), proto, null) // not a DNS answer (e.g. login page or error)
+            }
+        } catch (e: HttpTimeoutException) {
+            DohResponse(2, rtt(), attempted, null)
+        } catch (e: ConnectException) {
+            DohResponse(4, rtt(), attempted, null)
+        } catch (e: IOException) {
+            DohResponse(5, rtt(), attempted, null)
+        } catch (e: IllegalArgumentException) {
+            DohResponse(6, rtt(), attempted, null)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            DohResponse(5, rtt(), attempted, null)
+        }
+    }
+
+    companion object {
+        /** HTTP/3 when the running JDK supports it, otherwise HTTP/2 (feature detection, no reflection on internals). */
+        val PREFERRED: HttpClient.Version =
+            runCatching { HttpClient.Version.valueOf("HTTP_3") }.getOrDefault(HttpClient.Version.HTTP_2)
+    }
+}
+
 /** Headless mode: `TheDPI --cli example.com [--dns 1.1.1.1] [--alt 9.9.9.9]`. */
 fun runCli(args: List<String>): Int {
     val targets = ArrayList<String>()
     val dns = ArrayList<String>()
     val alt = ArrayList<String>()
+    val doh = ArrayList<String>()
     var i = 0
     while (i < args.size) {
         when (args[i]) {
             "--cli" -> {}
             "--dns" -> dns += args.getOrNull(++i) ?: ""
             "--alt" -> alt += args.getOrNull(++i) ?: ""
+            "--doh" -> doh += args.getOrNull(++i) ?: ""
             else -> targets += args[i]
         }
         i++
@@ -891,7 +1064,11 @@ fun runCli(args: List<String>): Int {
             println("THE DPI ${Native.engineVersion()} · TLS güveni: ${WindowsPlatform.trust.second}")
             print(Text.environment(env))
             println()
-            print(Text.report(session.run(targets, alt.filter { it.isNotEmpty() }, WindowsPlatform.prober())))
+            val report = session.run(
+                targets, alt.filter { it.isNotEmpty() }, WindowsPlatform.prober(),
+                WindowsPlatform.dohClient(), doh.filter { it.isNotEmpty() },
+            )
+            print(Text.report(report))
             0
         }
     } catch (e: NativeException) {
@@ -904,6 +1081,9 @@ class MainWindow {
     private val frame = JFrame("THE DPI")
     private val targets = JTextArea("example.com", 3, 40)
     private val altDns = JTextField(30)
+    private val dohEndpoints = JTextField(30).apply {
+        toolTipText = "Örnek: https://dns.example/dns-query — yalnızca https:// adresleri; DoH3 (HTTP/3) desteklenirse kullanılır"
+    }
     private val runButton = JButton("Tanıla")
     private val appliedButton = JButton("Öneriyi uyguladım — doğrula").apply { isEnabled = false }
     private val auto = JCheckBox("Ağ değişince yeniden tanıla", false)
@@ -936,8 +1116,9 @@ class MainWindow {
         c.gridx = 0; c.gridy = 0; c.gridwidth = 2; form.add(disclosure, c); c.gridwidth = 1
         row(1, "Test hedefleri:", JScrollPane(targets))
         row(2, "Karşılaştırılacak DNS (isteğe bağlı):", altDns)
+        row(3, "Şifreli DNS — DoH3/DoH adresleri (isteğe bağlı):", dohEndpoints)
         val buttons = JPanel().apply { add(runButton); add(appliedButton); add(auto) }
-        c.gridx = 0; c.gridy = 3; c.gridwidth = 2; form.add(buttons, c)
+        c.gridx = 0; c.gridy = 4; c.gridwidth = 2; form.add(buttons, c)
 
         frame.layout = BorderLayout()
         frame.add(form, BorderLayout.NORTH)
@@ -971,6 +1152,7 @@ class MainWindow {
         if (!busy.compareAndSet(false, true)) return
         val targetList = splitList(targets.text)
         val altList = splitList(altDns.text)
+        val dohList = splitList(dohEndpoints.text)
         runButton.isEnabled = false
         appliedButton.isEnabled = false
         status.text = "Tanılanıyor…"
@@ -980,7 +1162,7 @@ class MainWindow {
                 var text = ""
                 while (remaining-- > 0) {
                     val env = refreshEnvironment(s)
-                    val report = s.run(targetList, altList, WindowsPlatform.prober())
+                    val report = s.run(targetList, altList, WindowsPlatform.prober(), WindowsPlatform.dohClient(), dohList)
                     lastDecision = report.evaluation?.decision
                     text = Text.environment(env) + "\n" + Text.report(report)
                 }

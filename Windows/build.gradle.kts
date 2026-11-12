@@ -60,7 +60,7 @@ val generateTestKeystore = tasks.register<Exec>("generateTestKeystore") {
     }
     commandLine(
         keytool, "-genkeypair", "-alias", "svc", "-keyalg", "EC", "-groupname", "secp256r1", "-validity", "2",
-        "-dname", "CN=svc.test", "-ext", "SAN=dns:svc.test", "-storetype", "PKCS12",
+        "-dname", "CN=svc.test", "-ext", "SAN=dns:svc.test,ip:127.0.0.1", "-storetype", "PKCS12",
         "-keystore", ks.absolutePath, "-storepass", testKeystorePassword, "-keypass", testKeystorePassword,
     )
 }

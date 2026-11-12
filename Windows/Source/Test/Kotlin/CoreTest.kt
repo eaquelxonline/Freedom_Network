@@ -6,6 +6,8 @@
 
 package thedpi
 
+import com.sun.net.httpserver.HttpsConfigurator
+import com.sun.net.httpserver.HttpsServer
 import java.io.File
 import java.io.FileInputStream
 import java.net.DatagramPacket
@@ -152,6 +154,20 @@ private fun env(dns: String) = EnvironmentInfo(
     networkType = NetworkType.ETHERNET, interfaceName = "test0", dnsServers = listOf(dns),
     mtu = 1500, hasIpv4 = YES, hasIpv6 = NO, connected = YES, validated = YES,
 )
+
+/** Minimal DoH answer for a native-built query: echo ID/question, one A record, no EDNS. */
+private fun dnsAnswer(q: ByteArray, addr: ByteArray): ByteArray {
+    var i = 12
+    while (q[i].toInt() != 0) i += (q[i].toInt() and 0xFF) + 1
+    val question = q.copyOfRange(12, i + 5)
+    val out = java.io.ByteArrayOutputStream()
+    out.write(q, 0, 2)
+    out.write(byteArrayOf(0x81.toByte(), 0x80.toByte(), 0, 1, 0, 1, 0, 0, 0, 0))
+    out.write(question)
+    out.write(byteArrayOf(0xC0.toByte(), 0x0C, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4))
+    out.write(addr)
+    return out.toByteArray()
+}
 
 private val fastConfig = EngineConfig(timeoutMs = 600, dnsSamples = 2, tcpSamples = 2, mtu = false, cooldownMs = 0)
 
@@ -323,6 +339,70 @@ fun main() {
                     eq(s.evaluate().status, Codes.NO_DATA, "stale results discarded")
                 }
             }
+        }
+    }
+
+    test("wire codec Bytes kind roundtrip (Kotlin) and limits") {
+        val r = Record().bytes(1, byteArrayOf(0, 1, -1, -128)).bytes(1, byteArrayOf()).text(2, "x")
+        val back = Wire.decode(Wire.encode(r))
+        eq(back, r, "roundtrip")
+        expect(back.getBytes(1)!!.contentEquals(byteArrayOf(0, 1, -1, -128))) { "bytes" }
+        eq(Record().bytes(1, ByteArray(Wire.MAX_BYTES + 10)).getBytes(1)!!.size, Wire.MAX_BYTES, "truncated")
+    }
+
+    test("DoH query is built natively (RFC 8484, ID 0) and endpoints must be https") {
+        val q = Doh.query("Svc.Test")!!
+        expect(q[0].toInt() == 0 && q[1].toInt() == 0) { "ID must be 0" }
+        eq(Doh.query("exa mple"), null, "invalid name")
+        expect(Doh.validEndpoint("https://dns.example/dns-query")) { "https ok" }
+        expect(!Doh.validEndpoint("http://dns.example/dns-query")) { "cleartext rejected" }
+        expect(!Doh.validEndpoint("https://")) { "no host rejected" }
+    }
+
+    test("DoH end-to-end: JDK HTTP client over local HTTPS, native validation, classification") {
+        val (ks, pw) = testKeystore()
+        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply { init(ks, pw) }
+        val serverCtx = SSLContext.getInstance("TLS").apply { init(kmf.keyManagers, null, null) }
+        var mode = "ok"
+        val https = HttpsServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0)
+        https.httpsConfigurator = HttpsConfigurator(serverCtx)
+        https.createContext("/dns-query") { ex ->
+            val q = ex.requestBody.readAllBytes()
+            val (body, type) = if (mode == "ok") dnsAnswer(q, byteArrayOf(192.toByte(), 0, 2, 1)) to "application/dns-message"
+            else "<html>login</html>".toByteArray() to "text/html"
+            ex.responseHeaders.add("Content-Type", type)
+            ex.sendResponseHeaders(200, body.size.toLong())
+            ex.responseBody.use { it.write(body) }
+        }
+        https.start()
+        try {
+            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(ks) }
+            val clientCtx = SSLContext.getInstance("TLS").apply { init(null, tmf.trustManagers, null) }
+            val client = JdkDohClient(clientCtx)
+            val endpoint = "https://127.0.0.1:${https.address.port}/dns-query"
+            FakeDns().use { dns ->
+                TlsServer(ks, pw).use { srv ->
+                    DiagnosticSession(fastConfig).use { s ->
+                        s.setEnvironment(env(dns.address))
+                        val target = listOf("svc.test:${srv.port}")
+                        val r1 = s.run(target, emptyList(), null, client, listOf(endpoint, "http://cleartext.invalid/dns-query"))
+                        val e1 = r1.encrypted.single()
+                        eq(e1.transport, 1, "transport ok")
+                        expect(e1.protocol == EncProtocol.DOH || e1.protocol == EncProtocol.DOH3) { "protocol ${e1.protocol}" }
+                        val obs1 = r1.evaluation!!.diagnoses.flatMap { it.observations }.map { it.code }
+                        expect(41 in obs1) { "encrypted DNS available advisory expected, got $obs1" }
+                        expect("Şifreli DNS" in Text.report(r1)) { "report section" }
+                        // A login page answering 200 text/html must never count as DNS.
+                        mode = "html"
+                        val r2 = s.run(target, emptyList(), null, client, listOf(endpoint))
+                        eq(r2.encrypted.single().transport, 6, "non-DNS content")
+                        val obs2 = r2.evaluation!!.diagnoses.flatMap { it.observations }.map { it.code }
+                        expect(42 in obs2 && 41 !in obs2) { "failure advisory expected, got $obs2" }
+                    }
+                }
+            }
+        } finally {
+            https.stop(0)
         }
     }
 

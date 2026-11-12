@@ -1069,6 +1069,7 @@ fn run_of(targets: Vec<TargetReport>, resolvers: Vec<probe::ResolverStats>) -> R
         resolvers,
         targets,
         duration_us: 1_000_000,
+        ..RunReport::default()
     }
 }
 
@@ -1665,6 +1666,259 @@ fn score_bounds_and_ordering() {
     assert!(s_bad >= 0);
     assert_eq!(engine::score(&RunReport::default()), None);
     assert_eq!(engine::score(&good), Some(s_good));
+}
+
+// ---------------------------------------------------------------- encrypted DNS (DoH3/DoH)
+
+#[test]
+fn wire_bytes_roundtrip_and_limits() {
+    let mut r = Record::new();
+    r.bytes(1, &[0, 1, 2, 0xFF, 0x80])
+        .bytes(1, &[])
+        .text(2, "x");
+    let back = wire::decode(&wire::encode(&r).unwrap()).unwrap();
+    assert_eq!(back, r);
+    assert_eq!(back.get_bytes(1), Some(&[0u8, 1, 2, 0xFF, 0x80][..]));
+    let mut big = Record::new();
+    big.bytes(1, &vec![7u8; wire::MAX_BYTES + 100]);
+    assert_eq!(
+        big.get_bytes(1).unwrap().len(),
+        wire::MAX_BYTES,
+        "truncated on build"
+    );
+    let mut raw = b"DP\x01\x01\x04".to_vec();
+    raw.extend_from_slice(&((wire::MAX_BYTES + 1) as u32).to_be_bytes());
+    raw.extend(std::iter::repeat_n(0u8, wire::MAX_BYTES + 1));
+    assert_eq!(wire::decode(&raw), Err(WireError::BadLength));
+}
+
+fn doh_request(name: &str, qtype: u16) -> Vec<u8> {
+    let mut r = Record::new();
+    r.text(tags::doh_query::NAME, name)
+        .int(tags::doh_query::QTYPE, i64::from(qtype));
+    wire::encode(&r).unwrap()
+}
+
+#[test]
+fn doh_query_is_rfc8484_wire_format_with_id_zero() {
+    let out = wire::decode(&api::doh_query(&doh_request("Svc.Test", dns::TYPE_AAAA))).unwrap();
+    assert_eq!(out.status(), Some(0));
+    let q = out.get_bytes(tags::doh_query::QUERY).unwrap();
+    assert_eq!(&q[..2], &[0, 0], "RFC 8484 §4.1: ID 0");
+    assert_eq!(
+        q,
+        &dns::build_query(0, "Svc.Test", dns::TYPE_AAAA, true).unwrap()[..]
+    );
+    let bad = wire::decode(&api::doh_query(&doh_request("exa mple", 1))).unwrap();
+    assert_eq!(bad.status(), Some(i64::from(code::INVALID_ARGUMENT)));
+    assert_eq!(
+        wire::decode(&api::doh_query(b"junk")).unwrap().status(),
+        Some(i64::from(code::WIRE))
+    );
+}
+
+#[test]
+fn encrypted_answers_are_validated_by_the_hardened_parser() {
+    let q = dns::build_query(0, "svc.test", dns::TYPE_A, true).unwrap();
+    let ok = make_response(
+        &q,
+        0x8180,
+        &[
+            (dns::TYPE_A, vec![192, 0, 2, 7]),
+            (dns::TYPE_A, vec![192, 0, 2, 8]),
+        ],
+    );
+    assert_eq!(
+        engine::validate_encrypted_answer(&ok, "svc.test", dns::TYPE_A),
+        (Status::Ok, 2)
+    );
+    let nx = make_response(&q, 0x8183, &[]);
+    assert_eq!(
+        engine::validate_encrypted_answer(&nx, "svc.test", dns::TYPE_A),
+        (Status::NameError, 0)
+    );
+    let empty = make_response(&q, 0x8180, &[]);
+    assert_eq!(
+        engine::validate_encrypted_answer(&empty, "svc.test", dns::TYPE_A),
+        (Status::NoData, 0)
+    );
+    // A captive portal returning HTML with HTTP 200 must never count as a DNS answer.
+    let html = b"<html><body>Please log in</body></html>";
+    assert_eq!(
+        engine::validate_encrypted_answer(html, "svc.test", dns::TYPE_A).0,
+        Status::Invalid
+    );
+    // Wrong ID (non-zero) or another name are rejected too.
+    let mut wrong_id = ok.clone();
+    wrong_id[1] = 9;
+    assert_eq!(
+        engine::validate_encrypted_answer(&wrong_id, "svc.test", dns::TYPE_A).0,
+        Status::Invalid
+    );
+    assert_eq!(
+        engine::validate_encrypted_answer(&ok, "other.test", dns::TYPE_A).0,
+        Status::Invalid
+    );
+}
+
+fn enc(name: &str, status: Status, protocol: i64) -> probe::EncryptedResolver {
+    probe::EncryptedResolver {
+        endpoint: "https://doh.example/dns-query".into(),
+        name: name.into(),
+        protocol,
+        status,
+        rtt_us: 25_000,
+        answers: u32::from(status == Status::Ok),
+    }
+}
+
+#[test]
+fn classify_with_encrypted_resolvers() {
+    let env = env_with(|_| {});
+    // 1) System DNS silent, DoH3 works: DNS diagnosis strengthened, recommendation = encrypted DNS.
+    let mut t = healthy_target("a.test");
+    t.dns.status = Status::Timeout;
+    let mut run = run_of(vec![t], vec![resolver(false, false)]);
+    run.encrypted
+        .push(enc("a.test", Status::Ok, probe::ENC_DOH3));
+    let d = intel::classify(Some(&env), &run);
+    assert_eq!(top(&d), Category::DnsTimeout);
+    assert_eq!(d[0].confidence, 90);
+    assert!(
+        d[0].observations
+            .iter()
+            .any(|o| o.code == Obs::EncryptedDnsResolved && o.args == vec![25, probe::ENC_DOH3])
+    );
+    assert_eq!(decide::action_for_diagnosis(&d[0]), Action::UseAlternateDns);
+
+    // 2) Healthy network, no system encryption: privacy advisory only, no problem claimed.
+    let mut run2 = run_of(vec![healthy_target("a.test")], vec![resolver(true, false)]);
+    run2.encrypted
+        .push(enc("a.test", Status::Ok, probe::ENC_DOH));
+    let d2 = intel::classify(Some(&env), &run2);
+    assert_eq!(top(&d2), Category::NoProblemDetected);
+    assert!(
+        has(&d2, Category::Advisory)
+            .unwrap()
+            .observations
+            .iter()
+            .any(|o| o.code == Obs::EncryptedDnsAvailable)
+    );
+    // ...but not when the platform already uses encrypted DNS.
+    let d2b = intel::classify(Some(&env_with(|e| e.private_dns = intel::YES)), &run2);
+    assert!(
+        !d2b.iter()
+            .flat_map(|x| &x.observations)
+            .any(|o| o.code == Obs::EncryptedDnsAvailable)
+    );
+
+    // 3) System resolver says NXDOMAIN, independent encrypted resolver answers: discrepancy.
+    let mut nx = healthy_target("blocked-name.test");
+    nx.dns.status = Status::NameError;
+    let mut run3 = run_of(
+        vec![nx.clone(), healthy_target("ok.test")],
+        vec![resolver(true, false)],
+    );
+    run3.encrypted
+        .push(enc("blocked-name.test", Status::Ok, probe::ENC_DOH3));
+    let d3 = intel::classify(Some(&env), &run3);
+    let dd = has(&d3, Category::DnsResolutionFailure).unwrap();
+    assert!(
+        dd.observations
+            .iter()
+            .any(|o| o.code == Obs::ResolverDiscrepancy)
+    );
+    assert_eq!(decide::action_for_diagnosis(dd), Action::UseAlternateDns);
+
+    // 4) Both say NXDOMAIN: corroborated name error -> check the name, not the resolver.
+    let mut run4 = run_of(
+        vec![nx, healthy_target("ok.test")],
+        vec![resolver(true, false)],
+    );
+    run4.encrypted
+        .push(enc("blocked-name.test", Status::NameError, probe::ENC_DOH));
+    let d4 = intel::classify(Some(&env), &run4);
+    let dd4 = has(&d4, Category::DnsResolutionFailure).unwrap();
+    assert!(
+        dd4.observations
+            .iter()
+            .any(|o| o.code == Obs::EncryptedDnsConfirmsNxdomain)
+    );
+    assert_eq!(decide::action_for_diagnosis(dd4), Action::CheckTargetName);
+
+    // 5) Encrypted resolver unreachable: informational only, never a network failure.
+    let mut run5 = run_of(vec![healthy_target("a.test")], vec![resolver(true, false)]);
+    run5.encrypted
+        .push(enc("a.test", Status::Timeout, probe::ENC_DOH3));
+    let d5 = intel::classify(Some(&env), &run5);
+    assert_eq!(top(&d5), Category::NoProblemDetected);
+    assert!(
+        has(&d5, Category::Advisory)
+            .unwrap()
+            .observations
+            .iter()
+            .any(|o| o.code == Obs::EncryptedDnsFailed)
+    );
+}
+
+#[test]
+fn engine_accepts_platform_doh_results() {
+    let _g = registry_guard();
+    let srv = fake_dns(DnsMode::Normal);
+    let (port, _sink) = tcp_sink();
+    let h = api::create(Some(&config_bytes(|r| {
+        r.int(tags::config::QUIC, 0);
+    })));
+    api::set_environment(h, &env_bytes(&srv.addr.to_string()));
+    assert_eq!(
+        api::submit_encrypted(h, &wire::encode(&Record::new()).unwrap()),
+        code::NO_DATA,
+        "needs a run first"
+    );
+    let run = wire::decode(&api::diagnose(h, &request(&[format!("svc.test:{port}")]))).unwrap();
+    assert_eq!(run.status(), Some(0));
+    // Platform layer: build query natively, "send" over HTTPS, get the DoH answer back.
+    let q = wire::decode(&api::doh_query(&doh_request("svc.test", dns::TYPE_A))).unwrap();
+    let answer = make_response(
+        q.get_bytes(tags::doh_query::QUERY).unwrap(),
+        0x8180,
+        &[(dns::TYPE_A, vec![192, 0, 2, 1])],
+    );
+    let mut res = Record::new();
+    res.text(tags::enc::ENDPOINT, "https://doh.example/dns-query")
+        .int(tags::enc::PROTOCOL, probe::ENC_DOH3)
+        .int(tags::enc::TRANSPORT, Status::Ok.code())
+        .int(tags::enc::RTT_US, 18_000)
+        .text(tags::enc::QUERY_NAME, "svc.test")
+        .int(tags::enc::QTYPE, i64::from(dns::TYPE_A))
+        .bytes(tags::enc::RESPONSE, &answer);
+    let mut sub = Record::new();
+    sub.record(tags::enc_submit::RESULT, res);
+    assert_eq!(
+        api::submit_encrypted(h, &wire::encode(&sub).unwrap()),
+        code::OK
+    );
+    let e = wire::decode(&api::evaluate(h)).unwrap();
+    let advisory = e
+        .records(tags::eval::DIAGNOSIS)
+        .find(|d| d.get_int(tags::diagnosis::CATEGORY) == Some(Category::Advisory as i64))
+        .expect("advisory");
+    assert!(
+        advisory
+            .records(tags::diagnosis::OBSERVATION)
+            .any(|o| o.get_int(tags::observation::CODE) == Some(Obs::EncryptedDnsAvailable as i64))
+    );
+    let mut missing = Record::new();
+    missing.record(tags::enc_submit::RESULT, Record::new());
+    assert_eq!(
+        api::submit_encrypted(h, &wire::encode(&missing).unwrap()),
+        code::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        api::submit_encrypted(-5, &wire::encode(&sub).unwrap()),
+        code::INVALID_HANDLE
+    );
+    api::destroy(h);
 }
 
 // ---------------------------------------------------------------- engine + api

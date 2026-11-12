@@ -128,6 +128,7 @@ pub mod tags {
         pub const RESOLVER: u8 = 3;
         pub const TARGET: u8 = 4;
         pub const INVALID: u8 = 5;
+        pub const ENCRYPTED: u8 = 6;
     }
     pub mod resolver {
         pub const SERVER: u8 = 1;
@@ -175,6 +176,26 @@ pub mod tags {
     }
     pub mod tls_submit {
         pub const RESULT: u8 = 1;
+    }
+    pub mod enc_submit {
+        pub const RESULT: u8 = 1;
+    }
+    /// Encrypted-resolver (DoH3/DoH/DoT/DoQ) measurement performed over platform HTTPS/TLS.
+    pub mod enc {
+        pub const ENDPOINT: u8 = 1;
+        pub const PROTOCOL: u8 = 2;
+        pub const TRANSPORT: u8 = 3;
+        pub const RTT_US: u8 = 4;
+        pub const QUERY_NAME: u8 = 5;
+        pub const QTYPE: u8 = 6;
+        pub const RESPONSE: u8 = 7;
+        pub const STATUS: u8 = 8;
+        pub const ANSWERS: u8 = 9;
+    }
+    pub mod doh_query {
+        pub const NAME: u8 = 1;
+        pub const QTYPE: u8 = 2;
+        pub const QUERY: u8 = 1;
     }
     pub mod tls {
         pub const HOST: u8 = 1;
@@ -229,9 +250,11 @@ pub mod wire {
     pub const MAX_DEPTH: usize = 4;
     pub const MAX_FIELDS: usize = 8192;
     pub const MAX_TEXT: usize = 4096;
+    pub const MAX_BYTES: usize = 16 * 1024;
     const KIND_INT: u8 = 1;
     const KIND_TEXT: u8 = 2;
     const KIND_RECORD: u8 = 3;
+    const KIND_BYTES: u8 = 4;
     const FIELD_HEADER: usize = 6;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +262,7 @@ pub mod wire {
         Int(i64),
         Text(String),
         Record(Record),
+        Bytes(Vec<u8>),
     }
 
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -267,6 +291,18 @@ pub mod wire {
         pub fn record(&mut self, tag: u8, r: Record) -> &mut Self {
             self.fields.push((tag, Value::Record(r)));
             self
+        }
+        /// Raw binary payload (e.g. a DNS wire message), truncated to `MAX_BYTES`.
+        pub fn bytes(&mut self, tag: u8, v: &[u8]) -> &mut Self {
+            self.fields
+                .push((tag, Value::Bytes(v[..v.len().min(MAX_BYTES)].to_vec())));
+            self
+        }
+        pub fn get_bytes(&self, tag: u8) -> Option<&[u8]> {
+            self.fields.iter().find_map(|(t, v)| match v {
+                Value::Bytes(b) if *t == tag => Some(b.as_slice()),
+                _ => None,
+            })
         }
         pub fn fields(&self) -> &[(u8, Value)] {
             &self.fields
@@ -364,6 +400,10 @@ pub mod wire {
                     header(out, *tag, KIND_TEXT, s.len())?;
                     out.extend_from_slice(s.as_bytes());
                 }
+                Value::Bytes(b) => {
+                    header(out, *tag, KIND_BYTES, b.len())?;
+                    out.extend_from_slice(b);
+                }
                 Value::Record(inner) => {
                     let at = out.len();
                     header(out, *tag, KIND_RECORD, 0)?;
@@ -434,6 +474,12 @@ pub mod wire {
                     )
                 }
                 KIND_RECORD => Value::Record(decode_fields(payload, depth + 1, count)?),
+                KIND_BYTES => {
+                    if len > MAX_BYTES {
+                        return Err(WireError::BadLength);
+                    }
+                    Value::Bytes(payload.to_vec())
+                }
                 _ => return Err(WireError::BadKind),
             };
             rec.fields.push((tag, value));
@@ -2056,6 +2102,31 @@ pub mod probe {
         pub resolvers: Vec<ResolverStats>,
         pub targets: Vec<TargetReport>,
         pub duration_us: u64,
+        /// Encrypted resolvers measured by the platform layer (submitted after the run).
+        pub encrypted: Vec<EncryptedResolver>,
+    }
+
+    pub const ENC_UNKNOWN: i64 = 0;
+    /// DNS over HTTPS on HTTP/2 (RFC 8484).
+    pub const ENC_DOH: i64 = 1;
+    /// DNS over HTTPS on HTTP/3 / QUIC (RFC 8484 + RFC 9114).
+    pub const ENC_DOH3: i64 = 2;
+    /// DNS over TLS (RFC 7858).
+    pub const ENC_DOT: i64 = 3;
+    /// DNS over dedicated QUIC (RFC 9250).
+    pub const ENC_DOQ: i64 = 4;
+
+    /// One encrypted-DNS measurement. The transport (TLS/QUIC) is the platform's; this
+    /// core only built the query and validated the answer with the hardened parser.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct EncryptedResolver {
+        pub endpoint: String,
+        /// The name that was queried (lower-case), for cross-checking the system resolver.
+        pub name: String,
+        pub protocol: i64,
+        pub status: Status,
+        pub rtt_us: u64,
+        pub answers: u32,
     }
 
     pub fn probe_target(
@@ -2441,6 +2512,11 @@ pub mod intel {
         PrivateDnsActive = 37,
         NoDnsServers = 38,
         PlatformBlocked = 39,
+        EncryptedDnsResolved = 40,
+        EncryptedDnsAvailable = 41,
+        EncryptedDnsFailed = 42,
+        ResolverDiscrepancy = 43,
+        EncryptedDnsConfirmsNxdomain = 44,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2893,6 +2969,94 @@ pub mod intel {
             }
         }
 
+        // Encrypted resolvers (DoH3/DoH/DoT/DoQ) measured over the platform's TLS/QUIC stack.
+        for t in &run.targets {
+            if t.dns.status != Status::NameError {
+                continue;
+            }
+            let h = t.target.host.as_str();
+            for e in run.encrypted.iter().filter(|e| e.name == h) {
+                match e.status {
+                    // The system resolver denies a name that an independent encrypted resolver
+                    // answers: a resolver-level discrepancy, not a typo.
+                    Status::Ok => b.add(
+                        Category::DnsResolutionFailure,
+                        80,
+                        vec![obs(Obs::ResolverDiscrepancy, h, &[e.protocol])],
+                    ),
+                    Status::NameError => b.add(
+                        Category::DnsResolutionFailure,
+                        85,
+                        vec![obs(Obs::EncryptedDnsConfirmsNxdomain, h, &[e.protocol])],
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        let dns_problem = b.diags.iter().any(|d| {
+            matches!(
+                d.category,
+                Category::DnsResolutionFailure
+                    | Category::DnsTimeout
+                    | Category::UdpAvailabilityIssue
+            ) && d.confidence >= 50
+        });
+        if let Some(e) = run
+            .encrypted
+            .iter()
+            .filter(|e| e.status == Status::Ok)
+            .min_by_key(|e| e.rtt_us)
+        {
+            let resolved = obs(
+                Obs::EncryptedDnsResolved,
+                &e.endpoint,
+                &[ms(e.rtt_us), e.protocol],
+            );
+            if dns_problem {
+                for d in &mut b.diags {
+                    if matches!(
+                        d.category,
+                        Category::DnsTimeout | Category::UdpAvailabilityIssue
+                    ) || d
+                        .observations
+                        .iter()
+                        .any(|o| o.code == Obs::ResolverDiscrepancy)
+                    {
+                        d.confidence = (d.confidence + 10).min(95);
+                        if d.observations.len() < MAX_OBSERVATIONS {
+                            d.observations.push(resolved.clone());
+                        }
+                    }
+                }
+            } else if env.is_none_or(|x| x.private_dns != YES) {
+                let system = best_primary.map_or(-1, |p| ms(p.1));
+                b.add(
+                    Category::Advisory,
+                    100,
+                    vec![obs(
+                        Obs::EncryptedDnsAvailable,
+                        &e.endpoint,
+                        &[ms(e.rtt_us), e.protocol, system],
+                    )],
+                );
+            }
+        }
+        for e in run
+            .encrypted
+            .iter()
+            .filter(|e| !matches!(e.status, Status::Ok | Status::NameError))
+        {
+            b.add(
+                Category::Advisory,
+                100,
+                vec![obs(
+                    Obs::EncryptedDnsFailed,
+                    &e.endpoint,
+                    &[e.status.code(), e.protocol],
+                )],
+            );
+        }
+
         if !b.has_problem() {
             let healthy: Vec<Observation> = run
                 .targets
@@ -2996,10 +3160,14 @@ pub mod decide {
     /// Evidence-aware mapping: a resolution failure whose only evidence is NXDOMAIN means
     /// the name does not exist, so changing the resolver would not help.
     pub fn action_for_diagnosis(d: &Diagnosis) -> Action {
+        use crate::intel::Obs;
         let only_nxdomain = !d.observations.is_empty()
-            && d.observations
-                .iter()
-                .all(|o| o.code == crate::intel::Obs::DnsNameError);
+            && d.observations.iter().all(|o| {
+                matches!(
+                    o.code,
+                    Obs::DnsNameError | Obs::EncryptedDnsConfirmsNxdomain
+                )
+            });
         if d.category == Category::DnsResolutionFailure && only_nxdomain {
             return Action::CheckTargetName;
         }
@@ -3539,6 +3707,58 @@ pub mod engine {
             }
         }
 
+        /// Encrypted-DNS results measured by the platform layer. The raw DoH/DoT answer is
+        /// validated here with the hardened DNS parser (ID 0 per RFC 8484 §4.1, question
+        /// echo), so a captive-portal HTML page or a truncated body never counts as success.
+        pub fn submit_encrypted(&self, r: &Record) -> i32 {
+            use tags::enc as t;
+            let mut st = self.lock();
+            let Some(last) = st.last.as_mut() else {
+                return code::NO_DATA;
+            };
+            let mut added = 0;
+            for o in r.records(tags::enc_submit::RESULT).take(probe::MAX_SERVERS) {
+                let Some(endpoint) = o.get_text(t::ENDPOINT) else {
+                    return code::INVALID_ARGUMENT;
+                };
+                let protocol = o
+                    .get_int(t::PROTOCOL)
+                    .filter(|p| (probe::ENC_DOH..=probe::ENC_DOQ).contains(p))
+                    .unwrap_or(probe::ENC_UNKNOWN);
+                let transport = status_from_code(o.get_int(t::TRANSPORT).unwrap_or(0));
+                let rtt_us = o
+                    .get_int(t::RTT_US)
+                    .and_then(|v| u64::try_from(v).ok())
+                    .unwrap_or(0);
+                let (status, answers) = match (transport, o.get_bytes(t::RESPONSE)) {
+                    (Status::Ok, Some(resp)) => {
+                        let name = o.get_text(t::QUERY_NAME).unwrap_or("");
+                        let qtype = o
+                            .get_int(t::QTYPE)
+                            .and_then(|q| u16::try_from(q).ok())
+                            .unwrap_or(crate::dns::TYPE_A);
+                        validate_encrypted_answer(resp, name, qtype)
+                    }
+                    (Status::Ok, None) => (Status::NoData, 0),
+                    (other, _) => (other, 0),
+                };
+                last.encrypted.push(probe::EncryptedResolver {
+                    endpoint: crate::wire::truncate_utf8(endpoint, 256).to_owned(),
+                    name: crate::ascii::lowercased(
+                        o.get_text(t::QUERY_NAME)
+                            .unwrap_or("")
+                            .trim_end_matches('.'),
+                    ),
+                    protocol,
+                    status,
+                    rtt_us,
+                    answers,
+                });
+                added += 1;
+            }
+            if added == 0 { code::NO_DATA } else { code::OK }
+        }
+
         pub fn evaluate(&self) -> Record {
             let now = u64::try_from(self.anchor.elapsed().as_millis()).unwrap_or(u64::MAX);
             self.evaluate_at(now)
@@ -3590,6 +3810,71 @@ pub mod engine {
             } else {
                 code::NO_DATA
             }
+        }
+    }
+
+    /// Maps a probe::Status code received from the platform layer back to the enum.
+    pub fn status_from_code(c: i64) -> Status {
+        match c {
+            1 => Status::Ok,
+            2 => Status::Timeout,
+            3 => Status::Refused,
+            4 => Status::Unreachable,
+            6 => Status::Invalid,
+            7 => Status::NoData,
+            8 => Status::NameError,
+            9 => Status::ServerFailure,
+            10 => Status::Unsupported,
+            11 => Status::Skipped,
+            12 => Status::LocalLimit,
+            13 => Status::Blocked,
+            0 => Status::NotRun,
+            _ => Status::Error,
+        }
+    }
+
+    /// Validates an encrypted-resolver answer: (status, number of address records).
+    pub fn validate_encrypted_answer(resp: &[u8], name: &str, qtype: u16) -> (Status, u32) {
+        match crate::dns::parse_response(resp, 0, name, qtype) {
+            Ok(r) => match r.header.rcode() {
+                crate::dns::RCODE_NOERROR => {
+                    let n = r
+                        .answers
+                        .iter()
+                        .filter(|a| {
+                            matches!(a.data, crate::dns::RData::A(_) | crate::dns::RData::Aaaa(_))
+                        })
+                        .count() as u32;
+                    (if n > 0 { Status::Ok } else { Status::NoData }, n)
+                }
+                crate::dns::RCODE_NXDOMAIN => (Status::NameError, 0),
+                _ => (Status::ServerFailure, 0),
+            },
+            Err(_) => (Status::Invalid, 0),
+        }
+    }
+
+    /// RFC 8484 DoH query for `name`/`qtype`: DNS wire format with ID 0 (cache friendly).
+    pub fn doh_query(r: &Record) -> Record {
+        let Some(name) = r.get_text(tags::doh_query::NAME) else {
+            return Record::with_status(code::INVALID_ARGUMENT);
+        };
+        let qtype = r
+            .get_int(tags::doh_query::QTYPE)
+            .and_then(|q| u16::try_from(q).ok())
+            .unwrap_or(crate::dns::TYPE_A);
+        if !crate::dns::is_valid_hostname(name) {
+            let mut e = Record::with_status(code::INVALID_ARGUMENT);
+            e.text(tags::run::INVALID, name);
+            return e;
+        }
+        match crate::dns::build_query(0, name, qtype, true) {
+            Ok(q) => {
+                let mut out = Record::with_status(code::OK);
+                out.bytes(tags::doh_query::QUERY, &q);
+                out
+            }
+            Err(_) => Record::with_status(code::INVALID_ARGUMENT),
         }
     }
 
@@ -3694,6 +3979,16 @@ pub mod engine {
                 .int(t::STATUS, s.status.code())
                 .int(t::TCP_STATUS, s.tcp_status.code());
             r.record(tags::run::RESOLVER, x);
+        }
+        for e in &run.encrypted {
+            use tags::enc as t;
+            let mut x = Record::new();
+            x.text(t::ENDPOINT, &e.endpoint)
+                .int(t::PROTOCOL, e.protocol)
+                .int(t::STATUS, e.status.code())
+                .int(t::RTT_US, sat(e.rtt_us))
+                .int(t::ANSWERS, i64::from(e.answers));
+            r.record(tags::run::ENCRYPTED, x);
         }
         for tr in &run.targets {
             use tags::target as t;
@@ -4044,6 +4339,24 @@ pub mod api {
         }
     }
 
+    /// Builds an RFC 8484 DoH query (DNS wire format, ID 0). No handle needed.
+    pub fn doh_query(request: &[u8]) -> Vec<u8> {
+        match decode(request) {
+            Ok(r) => encode(&engine::doh_query(&r)),
+            Err(c) => status_only(c),
+        }
+    }
+
+    pub fn submit_encrypted(handle: i64, results: &[u8]) -> i32 {
+        let Some(e) = registry::get(handle) else {
+            return code::INVALID_HANDLE;
+        };
+        match decode(results) {
+            Ok(r) => e.submit_encrypted(&r),
+            Err(c) => c,
+        }
+    }
+
     pub fn evaluate(handle: i64) -> Vec<u8> {
         match registry::get(handle) {
             Some(e) => encode(&e.evaluate()),
@@ -4366,6 +4679,43 @@ mod exports {
         // SAFETY: JVM-provided env.
         jni::guard(null_mut(), || unsafe {
             respond(env, &api::evaluate(handle))
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_thedpi_Native_dohQuery(
+        env: EnvPtr,
+        _class: JClass,
+        data: JByteArray,
+    ) -> JByteArray {
+        jni::guard(null_mut(), || {
+            // SAFETY: JVM-provided env and array.
+            let out = match unsafe { input(env, data) } {
+                Ok(b) => api::doh_query(&b),
+                Err(c) => api::status_only(c),
+            };
+            // SAFETY: JVM-provided env.
+            unsafe { respond(env, &out) }
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_thedpi_Native_submitEncrypted(
+        env: EnvPtr,
+        _class: JClass,
+        handle: JLong,
+        data: JByteArray,
+    ) -> JInt {
+        jni::guard(code::PANIC, || {
+            // SAFETY: JVM-provided env and array.
+            match unsafe { input(env, data) } {
+                Ok(b) => api::submit_encrypted(handle, &b),
+                Err(c) => c,
+            }
         })
     }
 

@@ -7,6 +7,19 @@
 
 package thedpi
 
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.CountDownLatch
+import java.net.UnknownHostException
+import java.net.URL
+import java.net.ConnectException
+import android.net.http.UrlResponseInfo
+import android.net.http.UrlRequest
+import android.net.http.UploadDataSink
+import android.net.http.UploadDataProvider
+import android.net.http.NetworkException
+import android.net.http.HttpException
+import android.net.http.HttpEngine
+import android.content.Context
 import android.app.Activity
 import android.graphics.Typeface
 import android.net.ConnectivityManager
@@ -83,6 +96,8 @@ object Native {
     @JvmStatic external fun evaluate(handle: Long): ByteArray?
     @JvmStatic external fun networkChanged(handle: Long): Int
     @JvmStatic external fun markApplied(handle: Long, action: Int): Int
+    @JvmStatic external fun dohQuery(request: ByteArray): ByteArray?
+    @JvmStatic external fun submitEncrypted(handle: Long, results: ByteArray): Int
 }
 
 object Codes {
@@ -110,6 +125,10 @@ class Record {
     data class IntValue(val v: Long) : Value
     data class TextValue(val v: String) : Value
     data class RecordValue(val v: Record) : Value
+    class BytesValue(val v: ByteArray) : Value {
+        override fun equals(other: Any?) = other is BytesValue && other.v.contentEquals(v)
+        override fun hashCode() = v.contentHashCode()
+    }
 
     val fields = ArrayList<Pair<Int, Value>>()
 
@@ -117,6 +136,8 @@ class Record {
     fun int(tag: Int, v: Int) = int(tag, v.toLong())
     fun text(tag: Int, v: String) = apply { fields += tag to TextValue(Wire.truncateUtf8(v, Wire.MAX_TEXT)) }
     fun record(tag: Int, r: Record) = apply { fields += tag to RecordValue(r) }
+    fun bytes(tag: Int, v: ByteArray) = apply { fields += tag to BytesValue(v.copyOf(minOf(v.size, Wire.MAX_BYTES))) }
+    fun getBytes(tag: Int): ByteArray? = fields.firstOrNull { it.first == tag && it.second is BytesValue }?.let { (it.second as BytesValue).v }
 
     fun ints(tag: Int): List<Long> = fields.filter { it.first == tag }.mapNotNull { (it.second as? IntValue)?.v }
     fun texts(tag: Int): List<String> = fields.filter { it.first == tag }.mapNotNull { (it.second as? TextValue)?.v }
@@ -140,6 +161,8 @@ object Wire {
     private const val KIND_INT = 1
     private const val KIND_TEXT = 2
     private const val KIND_RECORD = 3
+    private const val KIND_BYTES = 4
+    const val MAX_BYTES = 16 * 1024
 
     fun truncateUtf8(s: String, max: Int): String {
         val bytes = s.toByteArray(Charsets.UTF_8)
@@ -177,6 +200,10 @@ object Wire {
                     val b = v.v.toByteArray(Charsets.UTF_8)
                     header(out, tag, KIND_TEXT, b.size)
                     out.write(b)
+                }
+                is Record.BytesValue -> {
+                    header(out, tag, KIND_BYTES, v.v.size)
+                    out.write(v.v)
                 }
                 is Record.RecordValue -> {
                     val inner = ByteArrayOutputStream()
@@ -226,6 +253,10 @@ object Wire {
                     }
                 }
                 KIND_RECORD -> Record.RecordValue(decodeFields(payload, depth + 1, count))
+                KIND_BYTES -> {
+                    if (len > MAX_BYTES) throw WireException("bytes too long")
+                    Record.BytesValue(ByteArray(len.toInt()).also { payload.get(it) })
+                }
                 else -> throw WireException("bad kind $kind")
             }
             rec.fields += tag to value
@@ -252,7 +283,7 @@ object Tags {
 
     object Request { const val TARGET = 1; const val ALT_DNS = 2 }
 
-    object Run { const val GENERATION = 1; const val DURATION_US = 2; const val RESOLVER = 3; const val TARGET = 4; const val INVALID = 5 }
+    object Run { const val GENERATION = 1; const val DURATION_US = 2; const val RESOLVER = 3; const val TARGET = 4; const val INVALID = 5; const val ENCRYPTED = 6 }
 
     object Resolver {
         const val SERVER = 1; const val ALTERNATE = 2; const val SENT = 3; const val RECEIVED = 4
@@ -271,6 +302,12 @@ object Tags {
     }
 
     object TlsSubmit { const val RESULT = 1 }
+    object EncSubmit { const val RESULT = 1 }
+    object Enc {
+        const val ENDPOINT = 1; const val PROTOCOL = 2; const val TRANSPORT = 3; const val RTT_US = 4
+        const val QUERY_NAME = 5; const val QTYPE = 6; const val RESPONSE = 7; const val STATUS = 8; const val ANSWERS = 9
+    }
+    object DohQuery { const val NAME = 1; const val QTYPE = 2; const val QUERY = 1 }
 
     object Tls {
         const val HOST = 1; const val PORT = 2; const val STATUS = 3; const val HANDSHAKE_US = 4
@@ -528,7 +565,44 @@ class TlsProber(
 
 // ------------------------------------------------------------------ session
 
-data class Report(val run: RunResult, val evaluation: Evaluation?, val tls: List<TlsResult>)
+/** Encrypted-DNS protocol identifiers (mirror of probe::ENC_* in Native/Core.rs). */
+object EncProtocol {
+    const val UNKNOWN = 0
+    const val DOH = 1 // DNS over HTTPS, HTTP/2 (RFC 8484)
+    const val DOH3 = 2 // DNS over HTTPS, HTTP/3 over QUIC (RFC 8484 + RFC 9114)
+    const val DOT = 3 // DNS over TLS (RFC 7858)
+    const val DOQ = 4 // DNS over dedicated QUIC (RFC 9250)
+}
+
+/** Result of one HTTPS exchange performed by the platform's own TLS/QUIC stack. */
+data class DohResponse(val transport: Int, val rttUs: Long, val protocol: Int, val body: ByteArray?)
+
+/**
+ * Platform transport for RFC 8484 DoH: POST application/dns-message over the platform's
+ * HTTPS client (HTTP/3 where the platform offers it, HTTP/2 otherwise). Certificate
+ * validation is the platform's and is never relaxed.
+ */
+fun interface DohClient {
+    fun post(url: String, body: ByteArray, timeoutMs: Int): DohResponse
+}
+
+data class EncryptedResult(val endpoint: String, val name: String, val protocol: Int, val transport: Int, val rttUs: Long, val status: Int = 0)
+
+object Doh {
+    const val MAX_ENDPOINTS = 4
+
+    /** Only absolute https:// URLs are accepted: DoH is never sent in clear text. */
+    fun validEndpoint(url: String): Boolean =
+        url.length <= 256 && url.startsWith("https://") && runCatching { java.net.URI(url).host?.isNotEmpty() == true }.getOrDefault(false)
+
+    /** RFC 8484 query bytes built by the native DNS codec (ID 0). */
+    fun query(name: String, qtype: Int = 1): ByteArray? {
+        val r = Wire.decode(Native.dohQuery(Wire.encode(Record().text(Tags.DohQuery.NAME, name).int(Tags.DohQuery.QTYPE, qtype))) ?: return null)
+        return if (r.status?.toInt() == Codes.OK) r.getBytes(Tags.DohQuery.QUERY) else null
+    }
+}
+
+data class Report(val run: RunResult, val evaluation: Evaluation?, val tls: List<TlsResult>, val encrypted: List<EncryptedResult> = emptyList())
 
 /** Owns one native engine handle; all calls are thread-safe and the handle is never reused. */
 class DiagnosticSession(val config: EngineConfig = EngineConfig()) : AutoCloseable {
@@ -568,7 +642,25 @@ class DiagnosticSession(val config: EngineConfig = EngineConfig()) : AutoCloseab
     fun markApplied(action: Int): Int = Native.markApplied(live(), action)
 
     /** Full pipeline: native probes → platform TLS on reachable targets → evaluation. */
-    fun run(targets: List<String>, alternateDns: List<String>, tls: TlsProber?): Report {
+    /** Measures user-authorized encrypted resolvers and submits them for validation. */
+    fun measureEncrypted(run: RunResult, endpoints: List<String>, client: DohClient): List<EncryptedResult> {
+        val name = run.targets.firstOrNull { !it.literal }?.host ?: return emptyList()
+        val query = Doh.query(name) ?: return emptyList()
+        val results = ArrayList<EncryptedResult>()
+        val submission = Record()
+        for (url in endpoints.filter(Doh::validEndpoint).distinct().take(Doh.MAX_ENDPOINTS)) {
+            val r = client.post(url, query, config.timeoutMs)
+            val rec = Record().text(Tags.Enc.ENDPOINT, url).int(Tags.Enc.PROTOCOL, r.protocol).int(Tags.Enc.TRANSPORT, r.transport)
+                .int(Tags.Enc.RTT_US, r.rttUs).text(Tags.Enc.QUERY_NAME, name).int(Tags.Enc.QTYPE, 1)
+            r.body?.let { rec.bytes(Tags.Enc.RESPONSE, it) }
+            submission.record(Tags.EncSubmit.RESULT, rec)
+            results += EncryptedResult(url, name, r.protocol, r.transport, r.rttUs)
+        }
+        if (results.isNotEmpty()) Native.submitEncrypted(live(), Wire.encode(submission))
+        return results
+    }
+
+    fun run(targets: List<String>, alternateDns: List<String>, tls: TlsProber?, doh: DohClient? = null, dohEndpoints: List<String> = emptyList()): Report {
         val run = diagnose(targets, alternateDns)
         if (run.status != Codes.OK) return Report(run, null, emptyList())
         val tlsResults = if (tls == null) emptyList() else run.targets.filter { it.tcpOk }.map { tls.probe(it.host, it.port, config.timeoutMs) }
@@ -581,7 +673,10 @@ class DiagnosticSession(val config: EngineConfig = EngineConfig()) : AutoCloseab
                 } ?: t
             },
         )
-        return Report(merged, evaluate(), tlsResults)
+        val encrypted = if (doh != null && dohEndpoints.isNotEmpty()) measureEncrypted(run, dohEndpoints, doh) else emptyList()
+        val evaluation = evaluate()
+        // Status of each encrypted resolver as validated natively (parser verdict), for display.
+        return Report(merged, evaluation, tlsResults, encrypted)
     }
 
     @Synchronized
@@ -736,12 +831,25 @@ object Text {
             36 -> "Arka plan veri kısıtlaması (Veri Tasarrufu) etkin"
             37 -> "Özel DNS (DNS over TLS) etkin${if (s.isNotEmpty()) ": $s" else ""}"
             38 -> "Sistem DNS sunucusu bilgisi alınamadı"
+            40 -> "Şifreli DNS ${Text.encProtocol(o.args.getOrNull(1)?.toInt() ?: 0)} ($s) yanıtladı (${a(0)} ms)"
+            41 -> "Şifreli DNS kullanılabilir: ${Text.encProtocol(o.args.getOrNull(1)?.toInt() ?: 0)} $s ${a(0)} ms (sistem DNS: ${a(2)} ms). Gizlilik için sistemde şifreli DNS'i etkinleştirmeyi değerlendirin"
+            42 -> "Şifreli DNS $s yanıt vermedi (${status(o.args.getOrNull(0)?.toInt() ?: 5)}); uç nokta veya ağ politikası olabilir"
+            43 -> "$s: sistem DNS'i alan adı yok diyor, bağımsız şifreli DNS (${Text.encProtocol(o.args.getOrNull(0)?.toInt() ?: 0)}) çözüyor — çözümleyici düzeyinde tutarsızlık"
+            44 -> "$s: şifreli DNS de alan adının olmadığını doğruluyor"
             39 -> "$s: işletim sistemi bağlantıya izin vermedi (Android 17+: yerel ağ adresleri ACCESS_LOCAL_NETWORK izni gerektirir; THE DPI bu izni istemez). Bu bir ağ arızası değildir."
             else -> "Gözlem ${o.code} $s ${o.args}"
         }
     }
 
-    const val KNOWN_OBSERVATIONS = 39
+    const val KNOWN_OBSERVATIONS = 44
+
+    fun encProtocol(p: Int): String = when (p) {
+        EncProtocol.DOH -> "DoH (HTTP/2)"
+        EncProtocol.DOH3 -> "DoH3 (HTTP/3)"
+        EncProtocol.DOT -> "DoT"
+        EncProtocol.DOQ -> "DoQ"
+        else -> "şifreli DNS"
+    }
     const val KNOWN_CATEGORIES = 17
     const val KNOWN_ACTIONS = 13
 
@@ -783,6 +891,12 @@ object Text {
             if (t.tlsStatus != 0) appendLine("    TLS   : ${tls(t.tlsStatus)} ${ms(t.tlsUs)} ${t.tlsVersion} ${t.tlsAlpn} ${t.tlsCipher}".trimEnd())
             if (t.quicStatus != 11) appendLine("    QUIC  : ${status(t.quicStatus)}${if (t.quicVersions.isNotEmpty()) " sürümler " + t.quicVersions.joinToString(",") { "0x" + it.toString(16) } else ""}")
             if (t.mtuStatus == 1) appendLine("    MTU   : yol ${t.pathMtu}/${t.mtuCeiling} bayt (${t.mtuProbes} prob)")
+        }
+        if (r.encrypted.isNotEmpty()) {
+            appendLine("  Şifreli DNS (sorgu: ${r.encrypted.first().name})")
+            for (x in r.encrypted) {
+                appendLine("    ${x.endpoint}: ${encProtocol(x.protocol)}, aktarım ${status(x.transport)}, ${ms(x.rttUs)}")
+            }
         }
         val e = r.evaluation ?: return@buildString
         appendLine()
@@ -880,6 +994,162 @@ object AndroidPlatform {
     )
 }
 
+/**
+ * RFC 8484 DoH through the platform's own HTTP stacks, bound to the active network.
+ * Android 14+ (API 34): android.net.http.HttpEngine with QUIC enabled (DoH3 over HTTP/3,
+ * falling back to HTTP/2); the negotiated protocol is reported, never assumed.
+ * Android 11–13: HttpsURLConnection from Network.openConnection (DoH over HTTP/1.1/2).
+ * Certificate validation is the platform's; redirects are refused.
+ */
+class AndroidDohClient(private val context: Context, private val network: Network?) : DohClient {
+    override fun post(url: String, body: ByteArray, timeoutMs: Int): DohResponse = postEngine(url, body, timeoutMs)
+
+    /** Reads at most [max] bytes (InputStream.readNBytes needs API 33; this path serves API 30+). */
+    private fun readBounded(input: java.io.InputStream, max: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(4096)
+        while (out.size() < max) {
+            val n = input.read(buf, 0, minOf(buf.size, max - out.size()))
+            if (n < 0) break
+            out.write(buf, 0, n)
+        }
+        return out.toByteArray()
+    }
+
+    private fun postLegacy(url: String, body: ByteArray, timeoutMs: Int): DohResponse {
+        val start = System.nanoTime()
+        fun rtt() = (System.nanoTime() - start) / 1000
+        var conn: HttpsURLConnection? = null
+        return try {
+            val u = URL(url)
+            conn = ((network?.openConnection(u) ?: u.openConnection()) as HttpsURLConnection).apply {
+                requestMethod = "POST"
+                instanceFollowRedirects = false
+                connectTimeout = timeoutMs
+                readTimeout = timeoutMs
+                doOutput = true
+                setRequestProperty("Content-Type", "application/dns-message")
+                setRequestProperty("Accept", "application/dns-message")
+            }
+            conn.outputStream.use { it.write(body) }
+            val code = conn.responseCode
+            val type = conn.contentType ?: ""
+            if (code == 200 && type.startsWith("application/dns-message")) {
+                val b = conn.inputStream.use { readBounded(it, Wire.MAX_BYTES) }
+                DohResponse(1, rtt(), EncProtocol.DOH, b)
+            } else {
+                DohResponse(6, rtt(), EncProtocol.DOH, null)
+            }
+        } catch (e: SocketTimeoutException) {
+            DohResponse(2, rtt(), EncProtocol.DOH, null)
+        } catch (e: UnknownHostException) {
+            DohResponse(4, rtt(), EncProtocol.DOH, null)
+        } catch (e: ConnectException) {
+            DohResponse(4, rtt(), EncProtocol.DOH, null)
+        } catch (e: IOException) {
+            DohResponse(5, rtt(), EncProtocol.DOH, null)
+        } catch (e: RuntimeException) {
+            DohResponse(6, rtt(), EncProtocol.DOH, null)
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun postEngine(url: String, body: ByteArray, timeoutMs: Int): DohResponse {
+        // HttpEngine (QUIC/HTTP3) is a platform API from Android 14 (API 34).
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return postLegacy(url, body, timeoutMs)
+        val host = runCatching { URL(url).host }.getOrNull() ?: return DohResponse(6, 0, EncProtocol.UNKNOWN, null)
+        val engine = HttpEngine.Builder(context)
+            .setEnableQuic(true)
+            .setEnableHttp2(true)
+            .addQuicHint(host, 443, 443)
+            .build()
+        network?.let { engine.bindToNetwork(it) }
+        val executor = Executors.newSingleThreadExecutor()
+        val done = CountDownLatch(1)
+        val received = java.io.ByteArrayOutputStream()
+        var status = 0
+        var protocol = ""
+        var contentType = ""
+        var failure = 0
+        val start = System.nanoTime()
+        val callback = object : UrlRequest.Callback {
+            override fun onRedirectReceived(request: UrlRequest, info: UrlResponseInfo, newLocationUrl: String) {
+                failure = 6
+                request.cancel()
+            }
+            override fun onResponseStarted(request: UrlRequest, info: UrlResponseInfo) {
+                status = info.httpStatusCode
+                protocol = info.negotiatedProtocol
+                contentType = info.headers.asMap["content-type"]?.firstOrNull()
+                    ?: info.headers.asMap["Content-Type"]?.firstOrNull() ?: ""
+                request.read(ByteBuffer.allocateDirect(Wire.MAX_BYTES))
+            }
+            override fun onReadCompleted(request: UrlRequest, info: UrlResponseInfo, byteBuffer: ByteBuffer) {
+                byteBuffer.flip()
+                val chunk = ByteArray(byteBuffer.remaining())
+                byteBuffer.get(chunk)
+                if (received.size() + chunk.size <= Wire.MAX_BYTES) received.write(chunk) else failure = 6
+                byteBuffer.clear()
+                if (failure == 0) request.read(byteBuffer) else request.cancel()
+            }
+            override fun onSucceeded(request: UrlRequest, info: UrlResponseInfo) = done.countDown()
+            override fun onFailed(request: UrlRequest, info: UrlResponseInfo?, error: HttpException) {
+                failure = when ((error as? NetworkException)?.errorCode) {
+                    NetworkException.ERROR_TIMED_OUT, NetworkException.ERROR_CONNECTION_TIMED_OUT -> 2
+                    NetworkException.ERROR_CONNECTION_REFUSED -> 3
+                    NetworkException.ERROR_HOSTNAME_NOT_RESOLVED, NetworkException.ERROR_ADDRESS_UNREACHABLE,
+                    NetworkException.ERROR_INTERNET_DISCONNECTED -> 4
+                    else -> 5
+                }
+                done.countDown()
+            }
+            override fun onCanceled(request: UrlRequest, info: UrlResponseInfo?) {
+                if (failure == 0) failure = 2
+                done.countDown()
+            }
+        }
+        val upload = object : UploadDataProvider() {
+            private var pos = 0
+            override fun getLength(): Long = body.size.toLong()
+            override fun read(sink: UploadDataSink, buffer: ByteBuffer) {
+                val n = minOf(buffer.remaining(), body.size - pos)
+                buffer.put(body, pos, n)
+                pos += n
+                sink.onReadSucceeded(false)
+            }
+            override fun rewind(sink: UploadDataSink) {
+                pos = 0
+                sink.onRewindSucceeded()
+            }
+        }
+        val request = engine.newUrlRequestBuilder(url, executor, callback)
+            .setHttpMethod("POST")
+            .addHeader("Content-Type", "application/dns-message")
+            .addHeader("Accept", "application/dns-message")
+            .setUploadDataProvider(upload, executor)
+            .build()
+        try {
+            request.start()
+            if (!done.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)) {
+                request.cancel()
+                done.await(1, TimeUnit.SECONDS)
+                failure = 2
+            }
+        } finally {
+            executor.shutdown()
+            engine.shutdown()
+        }
+        val rtt = (System.nanoTime() - start) / 1000
+        val proto = if (protocol.startsWith("h3") || protocol.contains("quic")) EncProtocol.DOH3 else EncProtocol.DOH
+        return when {
+            failure != 0 -> DohResponse(failure, rtt, proto, null)
+            status == 200 && contentType.startsWith("application/dns-message") -> DohResponse(1, rtt, proto, received.toByteArray())
+            else -> DohResponse(6, rtt, proto, null)
+        }
+    }
+}
+
 class MainActivity : Activity() {
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "thedpi-worker").apply { isDaemon = true } }
     private val main = Handler(Looper.getMainLooper())
@@ -891,6 +1161,7 @@ class MainActivity : Activity() {
     private lateinit var cm: ConnectivityManager
     private lateinit var targets: EditText
     private lateinit var altDns: EditText
+    private lateinit var dohEndpoints: EditText
     private lateinit var runButton: Button
     private lateinit var appliedButton: Button
     private lateinit var auto: CheckBox
@@ -951,6 +1222,13 @@ class MainActivity : Activity() {
             hint = "örn. 192.0.2.53"
         }
         column.addView(altDns)
+        column.addView(label("Şifreli DNS — DoH3/DoH adresleri (isteğe bağlı, https://):"))
+        dohEndpoints = EditText(this).apply {
+            setText(state?.getString(KEY_DOH) ?: "")
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            hint = "örn. https://dns.example/dns-query"
+        }
+        column.addView(dohEndpoints)
         runButton = Button(this).apply {
             text = "Tanıla"
             isEnabled = false
@@ -1013,6 +1291,7 @@ class MainActivity : Activity() {
         super.onSaveInstanceState(outState)
         outState.putString(KEY_TARGETS, targets.text.toString())
         outState.putString(KEY_ALT, altDns.text.toString())
+        outState.putString(KEY_DOH, dohEndpoints.text.toString())
         outState.putBoolean(KEY_AUTO, auto.isChecked)
         outState.putString(KEY_OUTPUT, output.text.toString().take(64 * 1024))
     }
@@ -1054,6 +1333,7 @@ class MainActivity : Activity() {
         if (!busy.compareAndSet(false, true)) return
         val targetList = split(targets.text.toString())
         val altList = split(altDns.text.toString())
+        val dohList = split(dohEndpoints.text.toString())
         runButton.isEnabled = false
         appliedButton.isEnabled = false
         status.text = "Tanılanıyor…"
@@ -1067,7 +1347,11 @@ class MainActivity : Activity() {
                     if (lastFingerprint != null && lastFingerprint != fp) s.networkChanged()
                     lastFingerprint = fp
                     s.setEnvironment(env)
-                    val report = s.run(targetList, altList, cm.activeNetwork?.let { AndroidPlatform.prober(it) })
+                    val net = cm.activeNetwork
+                    val report = s.run(
+                        targetList, altList, net?.let { AndroidPlatform.prober(it) },
+                        AndroidDohClient(applicationContext, net), dohList,
+                    )
                     lastDecision = report.evaluation?.decision
                     text = Text.environment(env) + "\n" + Text.report(report)
                 }
@@ -1108,6 +1392,7 @@ class MainActivity : Activity() {
     private companion object {
         const val KEY_TARGETS = "targets"
         const val KEY_ALT = "alt"
+        const val KEY_DOH = "doh"
         const val KEY_AUTO = "auto"
         const val KEY_OUTPUT = "output"
         const val DISCLOSURE =
