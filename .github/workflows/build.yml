@@ -84,10 +84,17 @@ jobs:
       - name: Smoke-test FreedomNetwork.exe --cli on real Windows
         shell: pwsh
         run: |
-          $exe = "Windows/build/package/image/FreedomNetwork/FreedomNetwork.exe"
+          $exe = (Resolve-Path "Windows/build/package/image/FreedomNetwork/FreedomNetwork.exe").Path
           if (-not (Test-Path $exe)) { throw "Missing $exe" }
-          & $exe --cli --help
-          if ($LASTEXITCODE -ne 0) { throw "FreedomNetwork.exe --cli --help failed with $LASTEXITCODE" }
+          $outFile = Join-Path $env:RUNNER_TEMP "freedom-cli-out.txt"
+          $errFile = Join-Path $env:RUNNER_TEMP "freedom-cli-err.txt"
+          $proc = Start-Process -FilePath $exe -ArgumentList @("--cli", "--help") -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+          $out = if (Test-Path $outFile) { Get-Content $outFile -Raw } else { "" }
+          $err = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
+          if ($out) { Write-Host $out }
+          if ($err) { Write-Host $err }
+          if ($proc.ExitCode -ne 0) { throw "FreedomNetwork.exe --cli --help failed with $($proc.ExitCode)" }
+          if ($out -notmatch "Freedom Network CLI") { throw "FreedomNetwork.exe --cli --help did not print expected banner" }
 
       - name: Zip app image
         shell: pwsh
