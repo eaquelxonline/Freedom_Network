@@ -182,3 +182,89 @@ jobs:
             exit 1
           fi
           echo "Android Emulator smoke test PASSED (PID=$PID)"
+
+  publish:
+    name: Publish Release & Sync Drive
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+
+      - name: Prepare clean release binaries
+        shell: bash
+        run: |
+          mkdir -p release-files
+          WIN_ZIP=$(find dist/FreedomNetwork-Windows-x64 -name "*.zip" | head -n 1 || true)
+          if [ -n "$WIN_ZIP" ] && [ -f "$WIN_ZIP" ]; then
+            cp "$WIN_ZIP" release-files/FreedomNetwork-Windows-x64.zip
+          fi
+          DBG_APK=$(find dist/FreedomNetwork-Android -name "*debug*.apk" | head -n 1 || true)
+          if [ -n "$DBG_APK" ] && [ -f "$DBG_APK" ]; then
+            cp "$DBG_APK" release-files/FreedomNetwork-Android-debug.apk
+          fi
+          REL_APK=$(find dist/FreedomNetwork-Android -name "*release*.apk" | head -n 1 || true)
+          if [ -n "$REL_APK" ] && [ -f "$REL_APK" ]; then
+            cp "$REL_APK" release-files/FreedomNetwork-Android-release.apk
+          fi
+          ls -lh release-files/
+          if [ -z "$(ls -A release-files)" ]; then
+            echo "No release files found!" >&2
+            exit 1
+          fi
+
+      - name: Publish rolling prerelease (latest-beta)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          NOTES="Otomatik CI derlemesi (${GITHUB_REF_NAME} @ ${SHORT_SHA}) — Windows x64 + Android arm64-v8a"
+          if gh release view latest-beta -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit latest-beta -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Freedom Network Latest Beta (${SHORT_SHA})" \
+              --notes "$NOTES"
+            gh release upload latest-beta -R "$GITHUB_REPOSITORY" release-files/* --clobber
+          else
+            gh release create latest-beta release-files/* -R "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "Freedom Network Latest Beta (${SHORT_SHA})" \
+              --notes "$NOTES"
+          fi
+
+      - name: Sync built APK & Windows EXE to Google Drive
+        env:
+          HOOK_URL: ${{ secrets.DRIVE_HOOK_URL }}
+        run: |
+          if [ -z "$HOOK_URL" ]; then
+            echo "::warning::DRIVE_HOOK_URL secret'i tanimli degil, Drive ikili dosya yuklemesi atlandi."
+            exit 0
+          fi
+          SEP='?'
+          case "$HOOK_URL" in
+            *\?*) SEP='&' ;;
+          esac
+          TARGET_URL="${HOOK_URL}${SEP}mode=binaries&repo=${GITHUB_REPOSITORY}&branch=${GITHUB_REF_NAME}&sha=${GITHUB_SHA}&run_id=${GITHUB_RUN_ID}"
+          YANIT=""
+          for attempt in 1 2 3; do
+            echo "Drive Son_Surum senkronizasyonu (deneme $attempt)..."
+            YANIT=$(curl -sSL --max-time 300 "$TARGET_URL" || true)
+            echo "Yanit: $YANIT"
+            case "$YANIT" in
+              OK*|ZATEN_GUNCEL*)
+                echo "Drive ikili dosya yuklemesi basarili: $YANIT"
+                exit 0
+                ;;
+            esac
+            sleep 15
+          done
+          echo "::error::Drive ikili dosya yuklemesi basarisiz: $YANIT"
+          exit 1

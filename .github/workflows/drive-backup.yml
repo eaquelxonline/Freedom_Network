@@ -13,7 +13,7 @@ jobs:
   backup:
     runs-on: ubuntu-latest
     steps:
-      - name: Apps Script Webhook Cagir
+      - name: Apps Script Webhook Cagir (Kaynak Kodu -> Proje_Yedek)
         env:
           HOOK_URL: ${{ secrets.DRIVE_HOOK_URL }}
         run: |
@@ -21,15 +21,24 @@ jobs:
             echo "::warning::DRIVE_HOOK_URL secret'i tanimli degil, yedekleme adimi atlandi."
             exit 0
           fi
-          echo "Apps Script cagriliyor..."
-          YANIT=$(curl -sSL --max-time 120 --retry 3 "$HOOK_URL")
-          echo "Yanit: $YANIT"
-          case "$YANIT" in
-            OK*|ZATEN_GUNCEL*)
-              echo "Yedekleme basarili: $YANIT"
-              ;;
-            *)
-              echo "::error::Yedekleme basarisiz oldu: $YANIT"
-              exit 1
-              ;;
+          SEP='?'
+          case "$HOOK_URL" in
+            *\?*) SEP='&' ;;
           esac
+          TARGET_URL="${HOOK_URL}${SEP}mode=source&repo=${GITHUB_REPOSITORY}&branch=${GITHUB_REF_NAME}&sha=${GITHUB_SHA}"
+          sleep 8
+          YANIT=""
+          for attempt in 1 2 3; do
+            echo "Apps Script cagriliyor (deneme $attempt)..."
+            YANIT=$(curl -sSL --max-time 180 "$TARGET_URL" || true)
+            echo "Yanit: $YANIT"
+            case "$YANIT" in
+              OK*|ZATEN_GUNCEL*)
+                echo "Yedekleme basarili: $YANIT"
+                exit 0
+                ;;
+            esac
+            sleep 15
+          done
+          echo "::error::Yedekleme basarisiz oldu: $YANIT"
+          exit 1
