@@ -4563,7 +4563,7 @@ fun runCli(args: List<String>): Int {
                 println("Freedom Network CLI ${runCatching { Native.engineVersion() }.getOrElse { "native" }}")
                 println("Kullanım: FreedomNetwork --cli [hedef ...] [--dns IP] [--alt IP] [--doh URL]")
                 println("          [--desync reality|split|disorder|badsum|ttl|quic|adaptive] [--proxy PORT]")
-                println("          [--persona iphone19|android19|ios20|off] [--no-trackers] [--no-strip] [--system]")
+                println("          [--persona iphone19|android19|pixel14|off] [--no-trackers] [--no-strip] [--system]")
                 return 0
             }
             "--cli" -> {}
@@ -4578,7 +4578,7 @@ fun runCli(args: List<String>): Int {
                 personaId = when (p) {
                     "off", "0", "none" -> ""
                     "android", "android19" -> DevicePersona.ANDROID_19_QUANTUM.id
-                    "ios", "ios20" -> DevicePersona.IOS_20_DEV.id
+                    "pixel", "pixel14" -> DevicePersona.PIXEL_14_FUTURE.id
                     else -> DevicePersona.IPHONE_19_BETA.id
                 }
             }

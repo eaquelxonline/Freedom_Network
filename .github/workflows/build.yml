@@ -114,9 +114,9 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - name: Rust toolchain (x86_64-linux-android)
+      - name: Rust toolchain (x86_64-linux-android + toolchain targets)
         run: |
-          rustup toolchain install 1.99.1 --profile minimal -c clippy,rustfmt -t x86_64-linux-android -t aarch64-linux-android
+          rustup toolchain install 1.99.1 --profile minimal -c clippy,rustfmt -t aarch64-linux-android -t x86_64-linux-android -t x86_64-pc-windows-msvc -t x86_64-pc-windows-gnu
 
       - name: Android SDK platform 37.0 and NDK 30
         run: |

@@ -123,7 +123,7 @@ val copyAndroidNative = tasks.register<Copy>("copyAndroidNative") {
 val cargoBuildAndroidX86_64 = tasks.register<Exec>("cargoBuildAndroidX86_64") {
     group = "build"
     description = "Builds libfreedom.so for x86_64-linux-android (emulator)."
-    mustRunAfter(":nativeFormatCheck", ":nativeLint", ":nativeTest", ":nativeBuildHost")
+    mustRunAfter(":nativeFormatCheck", ":nativeLint", ":nativeTest", ":nativeBuildHost", cargoBuildAndroid)
     val windowsHost = System.getProperty("os.name").startsWith("Windows")
     val hostTag = if (windowsHost) "windows-x86_64" else "linux-x86_64"
     val linker = androidComponents.sdkComponents.ndkDirectory.map {
