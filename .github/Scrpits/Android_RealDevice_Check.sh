@@ -34,7 +34,7 @@ adb logcat -c
 adb shell am start -n "$PKG/.MainActivity"
 sleep 4
 
-echo "[5/5] Checking for crashes..."
+echo "[5/5] Checking for crashes and process liveness..."
 CRASHES=$(adb logcat -d -s AndroidRuntime:E | grep -E "FATAL EXCEPTION|$PKG" || true)
 if [ -n "$CRASHES" ]; then
   echo "CRASH DETECTED:"
@@ -42,4 +42,11 @@ if [ -n "$CRASHES" ]; then
   exit 1
 fi
 
-echo "PASS: $PKG launched cleanly with zero crashes on SDK=$SDK ($ABI)."
+PID=$(adb shell pidof "$PKG" 2>/dev/null | tr -d '\r' || true)
+if [ -z "$PID" ]; then
+  echo "ERROR: $PKG process did not remain running!"
+  adb logcat -d | tail -n 60
+  exit 1
+fi
+
+echo "PASS: $PKG launched cleanly (PID=$PID) with zero crashes on SDK=$SDK ($ABI)."

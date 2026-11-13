@@ -8,6 +8,8 @@ plugins {
 val nativeDir: Directory = rootProject.layout.projectDirectory.dir("Native")
 val jniOut = layout.buildDirectory.dir("generated/jniLibs")
 
+val includeX86_64Arch = providers.gradleProperty("freedom.includeX86_64").orNull == "true"
+
 android {
     namespace = "com.freedom.network"
     compileSdk = 37
@@ -19,7 +21,10 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "1.0.0"
-        ndk { abiFilters += "arm64-v8a" }
+        ndk {
+            abiFilters += "arm64-v8a"
+            if (includeX86_64Arch) abiFilters += "x86_64"
+        }
     }
 
     sourceSets {
@@ -115,8 +120,6 @@ val copyAndroidNative = tasks.register<Copy>("copyAndroidNative") {
     into(jniOut.map { it.dir("arm64-v8a") })
 }
 
-val includeX86_64 = providers.gradleProperty("freedom.includeX86_64").orNull == "true"
-
 val cargoBuildAndroidX86_64 = tasks.register<Exec>("cargoBuildAndroidX86_64") {
     group = "build"
     description = "Builds libfreedom.so for x86_64-linux-android (emulator)."
@@ -141,7 +144,7 @@ val copyAndroidNativeX86_64 = tasks.register<Copy>("copyAndroidNativeX86_64") {
 
 tasks.named("preBuild") {
     dependsOn(copyAndroidNative)
-    if (includeX86_64) {
+    if (includeX86_64Arch) {
         dependsOn(copyAndroidNativeX86_64)
     }
 }

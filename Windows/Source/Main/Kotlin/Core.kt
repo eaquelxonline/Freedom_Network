@@ -79,21 +79,26 @@ import javax.net.ssl.SSLSession
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.TrustManagerFactory
+import javax.imageio.ImageIO
 import javax.swing.BorderFactory
 import javax.swing.BoxLayout
+import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JCheckBox
 import javax.swing.JComboBox
+import javax.swing.JComponent
 import javax.swing.JFrame
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
+import javax.swing.ScrollPaneConstants
 import javax.swing.SwingUtilities
 import javax.swing.Timer
 import javax.swing.UIManager
 import javax.swing.WindowConstants
+import javax.swing.plaf.basic.BasicScrollBarUI
 import kotlin.system.exitProcess
 
 // ==================================================================================
@@ -146,6 +151,8 @@ object Native {
     @JvmStatic external fun wgConsumeResponse(wgHandle: Long, pkt: ByteArray): Int
     @JvmStatic external fun wgEncrypt(wgHandle: Long, ipPacket: ByteArray): ByteArray?
     @JvmStatic external fun wgDecrypt(wgHandle: Long, wgPacket: ByteArray): ByteArray?
+    @JvmStatic external fun wgSetReserved(wgHandle: Long, reserved3: ByteArray): Int
+    @JvmStatic external fun wgBuildAwgPrefaces(jc: Int, jmin: Int, jmax: Int, cpsTemplate: ByteArray?): ByteArray?
 }
 
 object Codes {
@@ -190,6 +197,7 @@ class Record {
     fun ints(tag: Int): List<Long> = fields.filter { it.first == tag }.mapNotNull { (it.second as? IntValue)?.v }
     fun texts(tag: Int): List<String> = fields.filter { it.first == tag }.mapNotNull { (it.second as? TextValue)?.v }
     fun records(tag: Int): List<Record> = fields.filter { it.first == tag }.mapNotNull { (it.second as? RecordValue)?.v }
+    fun bytesAll(tag: Int): List<ByteArray> = fields.filter { it.first == tag }.mapNotNull { (it.second as? BytesValue)?.v }
     fun getInt(tag: Int): Long? = ints(tag).firstOrNull()
     fun getText(tag: Int): String? = texts(tag).firstOrNull()
     val status: Long? get() = getInt(Tags.STATUS)
@@ -382,6 +390,8 @@ object Tags {
         const val CONNECTIONS = 13; const val TLS_SPLIT = 14; const val HTTP_SPLIT = 15
         const val FAKE_SENT = 16; const val RST_DROPPED = 17; const val ACTIVE = 18
         const val VISION_SPLICE = 19; const val REALITY_DEST = 20
+        const val PERSONA = 21; const val BLOCK_TRACKERS = 22; const val STRIP_PARAMS = 23
+        const val TRACKERS_BLOCKED = 24; const val PARAMS_STRIPPED = 25
     }
 }
 
@@ -3131,14 +3141,15 @@ class WarpTunnel(
             start()
         }
         keepaliveThread = Thread({
+            val rng = java.security.SecureRandom()
             while (!closed.get() && established) {
                 try {
-                    Thread.sleep(22_000L)
+                    Thread.sleep(18_000L + rng.nextInt(6_001).toLong())
                 } catch (_: InterruptedException) {
                     break
                 }
                 if (closed.get() || !established) break
-                if (System.currentTimeMillis() - lastTxMs >= 20_000L) {
+                if (System.currentTimeMillis() - lastTxMs >= 18_000L) {
                     sendIpPacket(ByteArray(0))
                 }
             }
@@ -3799,13 +3810,15 @@ class TunBridge(
             }
             if (hardExpiry > now) {
                 dnsCacheHits.incrementAndGet()
-                if (dnsRefreshInFlight.add(cacheKey)) {
-                    Thread({
+                val bgClient = dohClient
+                if (bgClient != null && dnsRefreshInFlight.add(cacheKey)) {
+                    ioPool.execute {
                         try {
                             val dohWireBg = query.copyOf().also { it[0] = 0; it[1] = 0 }
                             val eps = dohEndpoints.filter(Doh::validEndpoint)
-                            if (eps.isNotEmpty()) {
-                                val resp = dohFetcher(eps.first(), dohWireBg)
+                            val ep = eps.getOrNull(preferredDoh.coerceIn(0, (eps.size - 1).coerceAtLeast(0)))
+                            if (ep != null) {
+                                val resp = bgClient.post(ep, dohWireBg, 2200)
                                 val body = resp.body
                                 if (resp.transport == 1 && body != null && body.size >= 12 && !IpPackets.containsPoisonedDns(body)) {
                                     val ttl = (IpPackets.dnsMinTtl(body) ?: 30L).coerceIn(10L, 600L)
@@ -3817,7 +3830,7 @@ class TunBridge(
                         } finally {
                             dnsRefreshInFlight.remove(cacheKey)
                         }
-                    }, "freedom-dns-swr").apply { isDaemon = true }.start()
+                    }
                 }
                 return withId(msg, query)
             }
@@ -4196,9 +4209,14 @@ class TunBridge(
                                 data,
                                 persona = devicePersona,
                                 stripGeoHeaders = devicePersona != DevicePersona.OFF,
+                                stripTrackingParams = true,
                             )
                             if (cleanData !== data) {
                                 leaksBlocked.incrementAndGet()
+                                val reqLine = String(data, 0, minOf(data.size, 512), Charsets.ISO_8859_1).substringBefore("\r\n")
+                                if (IpPackets.stripUrlTrackingParamsFromRequestLine(reqLine).second) {
+                                    paramsStripped.incrementAndGet()
+                                }
                                 if (devicePersona != DevicePersona.OFF) {
                                     httpHeadersSpoofed.incrementAndGet()
                                 }
@@ -4535,14 +4553,35 @@ fun runCli(args: List<String>): Int {
     var system = false
     var desyncMode = DesyncMode.OFF
     var proxyPort = -1
+    var personaId = DevicePersona.IPHONE_19_BETA.id
+    var blockTrackers = true
+    var stripUrlParams = true
     var i = 0
     while (i < args.size) {
         when (args[i]) {
+            "--help", "-h" -> {
+                println("Freedom Network CLI ${runCatching { Native.engineVersion() }.getOrElse { "native" }}")
+                println("Kullanım: FreedomNetwork --cli [hedef ...] [--dns IP] [--alt IP] [--doh URL]")
+                println("          [--desync reality|split|disorder|badsum|ttl|quic|adaptive] [--proxy PORT]")
+                println("          [--persona iphone19|android19|ios20|off] [--no-trackers] [--no-strip] [--system]")
+                return 0
+            }
             "--cli" -> {}
             "--dns" -> dns += args.getOrNull(++i) ?: ""
             "--alt" -> alt += args.getOrNull(++i) ?: ""
             "--doh" -> doh += args.getOrNull(++i) ?: ""
             "--system" -> system = true
+            "--no-trackers" -> blockTrackers = false
+            "--no-strip" -> stripUrlParams = false
+            "--persona" -> {
+                val p = (args.getOrNull(++i) ?: "iphone19").lowercase()
+                personaId = when (p) {
+                    "off", "0", "none" -> ""
+                    "android", "android19" -> DevicePersona.ANDROID_19_QUANTUM.id
+                    "ios", "ios20" -> DevicePersona.IOS_20_DEV.id
+                    else -> DevicePersona.IPHONE_19_BETA.id
+                }
+            }
             "--desync" -> {
                 val m = (args.getOrNull(++i) ?: "reality").lowercase()
                 desyncMode = when (m) {
@@ -4567,14 +4606,24 @@ fun runCli(args: List<String>): Int {
             println("Freedom Network ${Native.engineVersion()} · TLS güveni: ${WindowsPlatform.trust.second}")
             print(Text.environment(env))
             println()
-            val report = session.run(
-                targets, alt.filter { it.isNotEmpty() }, WindowsPlatform.prober(),
-                WindowsPlatform.dohClient(), doh.filter { it.isNotEmpty() },
-            )
-            print(Text.report(report))
+            if (targets.isNotEmpty()) {
+                val report = session.run(
+                    targets, alt.filter { it.isNotEmpty() }, WindowsPlatform.prober(),
+                    WindowsPlatform.dohClient(), doh.filter { it.isNotEmpty() },
+                )
+                print(Text.report(report))
+            }
             if (desyncMode != DesyncMode.OFF || proxyPort >= 0) {
                 val mode = if (desyncMode != DesyncMode.OFF) desyncMode else DesyncMode.REALITY_VISION
-                val ps = session.startProxy(DesyncConfig(mode = mode, port = if (proxyPort >= 0) proxyPort else 0))
+                val ps = session.startProxy(
+                    DesyncConfig(
+                        mode = mode,
+                        port = if (proxyPort >= 0) proxyPort else 0,
+                        persona = personaId,
+                        blockTrackers = blockTrackers,
+                        stripUrlParams = stripUrlParams,
+                    ),
+                )
                 println()
                 print(Text.proxyStatus(ps))
                 session.stopProxy()
@@ -5207,10 +5256,316 @@ class ModernStatCard(val iconType: Int, title: String, val heroColor: Color) : J
 
 typealias StatCard = ModernStatCard
 
+/** Custom anti-aliased flat dark button immune to WindowsLookAndFeel white painting bugs. */
+class FreedomButton(
+    text: String,
+    fillColor: Color = Color(30, 41, 59),
+    textColor: Color = Color(226, 232, 240),
+    var borderColor: Color = Color(51, 65, 85),
+    private val arc: Int = 10,
+) : JButton(text) {
+    private var hovered = false
+    private var pressed = false
+
+    init {
+        background = fillColor
+        foreground = textColor
+        font = Font("Segoe UI", Font.BOLD, 11)
+        isContentAreaFilled = false
+        isBorderPainted = false
+        isFocusPainted = false
+        isOpaque = false
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        margin = Insets(6, 14, 6, 14)
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseEntered(e: MouseEvent) {
+                hovered = true
+                repaint()
+            }
+            override fun mouseExited(e: MouseEvent) {
+                hovered = false
+                pressed = false
+                repaint()
+            }
+            override fun mousePressed(e: MouseEvent) {
+                pressed = true
+                repaint()
+            }
+            override fun mouseReleased(e: MouseEvent) {
+                pressed = false
+                repaint()
+            }
+        })
+    }
+
+    override fun getPreferredSize(): Dimension {
+        if (isPreferredSizeSet) return super.getPreferredSize()
+        val fm = getFontMetrics(font)
+        val w = fm.stringWidth(text ?: "") + margin.left + margin.right + 4
+        val h = maxOf(32, fm.height + margin.top + margin.bottom)
+        return Dimension(w, h)
+    }
+
+    private fun shiftColor(c: Color, delta: Int): Color = Color(
+        (c.red + delta).coerceIn(0, 255),
+        (c.green + delta).coerceIn(0, 255),
+        (c.blue + delta).coerceIn(0, 255),
+    )
+
+    override fun paintComponent(g: Graphics) {
+        val g2 = g.create() as Graphics2D
+        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
+
+        val w = width
+        val h = height
+        val fill = when {
+            !isEnabled -> Color(22, 31, 48)
+            pressed -> shiftColor(background, -18)
+            hovered -> shiftColor(background, 16)
+            else -> background
+        }
+        val bCol = when {
+            !isEnabled -> Color(36, 48, 68)
+            hovered -> shiftColor(borderColor, 28)
+            else -> borderColor
+        }
+        g2.color = fill
+        g2.fillRoundRect(0, 0, w - 1, h - 1, arc, arc)
+        g2.color = bCol
+        g2.stroke = BasicStroke(1f)
+        g2.drawRoundRect(0, 0, w - 1, h - 1, arc, arc)
+
+        val label = text ?: ""
+        if (label.isNotEmpty()) {
+            g2.font = font
+            val fm = g2.fontMetrics
+            g2.color = if (isEnabled) foreground else Color(100, 116, 139)
+            val tx = ((w - fm.stringWidth(label)) / 2).coerceAtLeast(6)
+            val ty = ((h - fm.height) / 2) + fm.ascent
+            g2.drawString(label, tx, ty)
+        }
+        g2.dispose()
+    }
+}
+
+/** Slim dark scrollbar UI without bright native Win32/Metal chrome. */
+private class DarkScrollBarUI : BasicScrollBarUI() {
+    override fun configureScrollBarColors() {
+        thumbColor = Color(51, 65, 85)
+        thumbDarkShadowColor = Color(30, 41, 59)
+        thumbHighlightColor = Color(71, 85, 105)
+        trackColor = Color(9, 13, 22)
+        trackHighlightColor = Color(9, 13, 22)
+    }
+
+    private fun zeroBtn(): JButton = JButton().apply {
+        preferredSize = Dimension(0, 0)
+        minimumSize = Dimension(0, 0)
+        maximumSize = Dimension(0, 0)
+        isVisible = false
+    }
+
+    override fun createDecreaseButton(orientation: Int): JButton = zeroBtn()
+    override fun createIncreaseButton(orientation: Int): JButton = zeroBtn()
+
+    override fun paintTrack(g: Graphics, c: JComponent, trackBounds: java.awt.Rectangle) {
+        g.color = Color(9, 13, 22)
+        g.fillRect(trackBounds.x, trackBounds.y, trackBounds.width, trackBounds.height)
+    }
+
+    override fun paintThumb(g: Graphics, c: JComponent, thumbBounds: java.awt.Rectangle) {
+        if (thumbBounds.isEmpty || !scrollbar.isEnabled) return
+        val g2 = g.create() as Graphics2D
+        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g2.color = if (isThumbRollover || isDragging) Color(71, 85, 105) else Color(51, 65, 85)
+        g2.fillRoundRect(thumbBounds.x + 2, thumbBounds.y + 2, thumbBounds.width - 4, thumbBounds.height - 4, 6, 6)
+        g2.dispose()
+    }
+}
+
+/** Crisp dark vector checkbox icon (never renders white native box). */
+internal class DarkCheckBoxIcon(private val selected: Boolean) : Icon {
+    override fun getIconWidth(): Int = 16
+    override fun getIconHeight(): Int = 16
+
+    override fun paintIcon(c: java.awt.Component?, g: Graphics, x: Int, y: Int) {
+        val g2 = g.create() as Graphics2D
+        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g2.color = if (selected) Color(14, 116, 144) else Color(14, 22, 38)
+        g2.fillRoundRect(x + 1, y + 1, 14, 14, 5, 5)
+        g2.color = if (selected) Color(56, 189, 248) else Color(71, 85, 105)
+        g2.stroke = BasicStroke(1.3f)
+        g2.drawRoundRect(x + 1, y + 1, 14, 14, 5, 5)
+        if (selected) {
+            g2.color = Color.WHITE
+            g2.stroke = BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND)
+            g2.drawLine(x + 4, y + 8, x + 7, y + 11)
+            g2.drawLine(x + 7, y + 11, x + 12, y + 5)
+        }
+        g2.dispose()
+    }
+}
+
+/** Installs CrossPlatform dark LookAndFeel defaults so no Swing popup/tooltip/viewport/control renders white. */
+internal object FreedomDarkTheme {
+    fun install() {
+        runCatching { UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName()) }
+        val bg = Color(7, 11, 20)
+        val surface = Color(14, 22, 38)
+        val fg = Color(226, 232, 240)
+        val muted = Color(148, 163, 184)
+        val border = Color(30, 41, 59)
+        val accent = Color(56, 189, 248)
+        val transparent = Color(0, 0, 0, 0)
+        UIManager.put("control", bg)
+        UIManager.put("text", fg)
+        UIManager.put("Panel.background", bg)
+        UIManager.put("Panel.foreground", fg)
+        UIManager.put("Label.background", bg)
+        UIManager.put("Label.foreground", fg)
+        UIManager.put("Button.background", Color(30, 41, 59))
+        UIManager.put("Button.foreground", fg)
+        UIManager.put("Button.select", Color(51, 65, 85))
+        UIManager.put("Button.focus", transparent)
+        UIManager.put("CheckBox.background", bg)
+        UIManager.put("CheckBox.foreground", muted)
+        UIManager.put("CheckBox.focus", transparent)
+        UIManager.put("TextArea.background", surface)
+        UIManager.put("TextArea.foreground", fg)
+        UIManager.put("TextArea.caretForeground", accent)
+        UIManager.put("TextArea.selectionBackground", Color(37, 99, 235))
+        UIManager.put("TextArea.selectionForeground", Color.WHITE)
+        UIManager.put("TextField.background", surface)
+        UIManager.put("TextField.foreground", fg)
+        UIManager.put("TextField.caretForeground", accent)
+        UIManager.put("TextField.selectionBackground", Color(37, 99, 235))
+        UIManager.put("TextField.selectionForeground", Color.WHITE)
+        UIManager.put("ScrollPane.background", bg)
+        UIManager.put("Viewport.background", surface)
+        UIManager.put("ScrollBar.background", Color(9, 13, 22))
+        UIManager.put("ScrollBar.track", Color(9, 13, 22))
+        UIManager.put("ScrollBar.thumb", Color(51, 65, 85))
+        UIManager.put("ScrollBar.width", 10)
+        UIManager.put("ToolTip.background", surface)
+        UIManager.put("ToolTip.foreground", fg)
+        UIManager.put("ToolTip.border", BorderFactory.createLineBorder(border, 1))
+        UIManager.put("OptionPane.background", bg)
+        UIManager.put("OptionPane.messageForeground", fg)
+    }
+
+    fun darkScrollPane(view: JComponent, showBorder: Boolean = true): JScrollPane = JScrollPane(view).apply {
+        background = Color(9, 13, 22)
+        viewport.background = if (showBorder) Color(9, 13, 22) else Color(7, 11, 20)
+        border = if (showBorder) BorderFactory.createLineBorder(Color(30, 41, 59), 1) else BorderFactory.createEmptyBorder()
+        verticalScrollBar.apply {
+            setUI(DarkScrollBarUI())
+            preferredSize = Dimension(10, 0)
+            unitIncrement = 16
+        }
+        horizontalScrollBar.apply {
+            setUI(DarkScrollBarUI())
+            preferredSize = Dimension(0, 10)
+            unitIncrement = 16
+        }
+        setCorner(ScrollPaneConstants.LOWER_RIGHT_CORNER, JPanel().apply { background = Color(9, 13, 22) })
+    }
+}
+
+/**
+ * Reversible Windows HKCU WinINet system proxy helper (`Internet Settings`).
+ * Captures prior `ProxyEnable`/`ProxyServer`/`ProxyOverride` values once and restores them on stop or JVM shutdown.
+ */
+object WindowsSystemProxy {
+    private const val REG_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+    private val isWindows = System.getProperty("os.name").lowercase().contains("windows")
+
+    @Volatile var appliedByApp = false
+        private set
+    private var prevCaptured = false
+    private var prevEnable = 0
+    private var prevServer: String? = null
+    private var prevOverride: String? = null
+    private val hookRegistered = AtomicBoolean(false)
+
+    private fun runCmd(vararg cmd: String): Pair<Int, String> {
+        val pb = ProcessBuilder(*cmd).redirectErrorStream(true)
+        val p = pb.start()
+        val out = p.inputStream.bufferedReader().readText()
+        val code = if (p.waitFor(4, TimeUnit.SECONDS)) p.exitValue() else { p.destroyForcibly(); -1 }
+        return code to out
+    }
+
+    private fun queryRegValue(name: String): String? {
+        if (!isWindows) return null
+        val (rc, out) = runCmd("reg", "query", REG_KEY, "/v", name)
+        if (rc != 0) return null
+        val line = out.lines().firstOrNull { it.trim().startsWith(name, ignoreCase = true) } ?: return null
+        return line.trim().split(Regex("\\s+"), limit = 3).getOrNull(2)?.trim()
+    }
+
+    private fun notifyWinInet() {
+        if (!isWindows) return
+        runCatching {
+            val ps = """
+                Add-Type -MemberDefinition '[DllImport("wininet.dll", SetLastError=true)] public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);' -Name WinInet -Namespace Freedom
+                [Freedom.WinInet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+                [Freedom.WinInet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+            """.trimIndent().replace("\n", "; ")
+            runCmd("powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps)
+        }
+    }
+
+    @Synchronized
+    fun enable(port: Int): Boolean {
+        if (!isWindows || port !in 1..65535) return false
+        if (hookRegistered.compareAndSet(false, true)) {
+            runCatching { Runtime.getRuntime().addShutdownHook(Thread { restore() }) }
+        }
+        if (!prevCaptured) {
+            prevEnable = queryRegValue("ProxyEnable")?.let { raw ->
+                if (raw.startsWith("0x", ignoreCase = true)) raw.substring(2).toIntOrNull(16) else raw.toIntOrNull()
+            } ?: 0
+            prevServer = queryRegValue("ProxyServer")
+            prevOverride = queryRegValue("ProxyOverride")
+            prevCaptured = true
+        }
+        val (r1, _) = runCmd("reg", "add", REG_KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f")
+        val (r2, _) = runCmd("reg", "add", REG_KEY, "/v", "ProxyServer", "/t", "REG_SZ", "/d", "127.0.0.1:$port", "/f")
+        val (r3, _) = runCmd("reg", "add", REG_KEY, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", "localhost;127.*;10.*;192.168.*;<local>", "/f")
+        if (r1 == 0 && r2 == 0 && r3 == 0) {
+            appliedByApp = true
+            notifyWinInet()
+            return true
+        }
+        return false
+    }
+
+    @Synchronized
+    fun restore() {
+        if (!isWindows || !appliedByApp) return
+        runCmd("reg", "add", REG_KEY, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", prevEnable.toString(), "/f")
+        val oldSrv = prevServer
+        if (!oldSrv.isNullOrBlank()) {
+            runCmd("reg", "add", REG_KEY, "/v", "ProxyServer", "/t", "REG_SZ", "/d", oldSrv, "/f")
+        } else {
+            runCmd("reg", "delete", REG_KEY, "/v", "ProxyServer", "/f")
+        }
+        val oldOvr = prevOverride
+        if (!oldOvr.isNullOrBlank()) {
+            runCmd("reg", "add", REG_KEY, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", oldOvr, "/f")
+        } else {
+            runCmd("reg", "delete", REG_KEY, "/v", "ProxyOverride", "/f")
+        }
+        appliedByApp = false
+        notifyWinInet()
+    }
+}
+
 /**
  * MainWindow:
  * Freedom Network 2026–2027 Windows desktop architecture with 3 segmented navigation tabs:
- * 1. KONTROL (Freedom Hero Power Shield, Smart Route Pill, Privacy Cards, Leak Test & Collapsible Metrics)
+ * 1. KONTROL (Freedom Hero Power Shield, WinINet System Proxy Toggle, Persona, Dual-Path Leak Test & Metrics)
  * 2. TEŞHİS (ISP Out-of-Tunnel Diagnostic Runner, Targets, Monospace Output, Copy)
  * 3. GÜNLÜK & SİSTEM (System Connection Explorer, Socket Diagnostics, Copy)
  */
@@ -5219,19 +5574,22 @@ class MainWindow {
     private val pulsePanel = ModernPowerShieldPanel()
     private val sparkline = ThroughputSparklinePanel()
     private val cardTcp = ModernStatCard(0, "TCP DESYNC", Color(16, 185, 129))
-    private val cardVision = ModernStatCard(1, "VISION SPLICE", Color(56, 189, 248))
+    private val cardVision = ModernStatCard(1, "VISION & GİZLİLİK", Color(56, 189, 248))
     private val cardFake = ModernStatCard(2, "SAHTE & KALKAN", Color(167, 139, 250))
     private val cardDns = ModernStatCard(3, "ŞİFRELİ DoH3 / ECH", Color(251, 191, 36))
 
     private var selectedPersona = DevicePersona.IPHONE_19_BETA
     private var advancedExpanded = false
+    private var systemProxyDesired = false
 
     private val statusPill = JLabel("KORUMA KAPALI · DOKUNARAK BAĞLANIN", JLabel.CENTER).apply {
+        isOpaque = true
+        background = Color(11, 18, 32)
         font = Font("Segoe UI", Font.BOLD, 11)
         foreground = Color(148, 163, 184)
         border = BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-            BorderFactory.createEmptyBorder(4, 12, 4, 12),
+            BorderFactory.createEmptyBorder(5, 14, 5, 14),
         )
     }
 
@@ -5239,19 +5597,25 @@ class MainWindow {
         font = Font("Segoe UI", Font.PLAIN, 11)
         foreground = Color(226, 232, 240)
     }
-    private val btnPersonaCycle = JButton(selectedPersona.shortLabel).apply {
-        background = Color(46, 16, 101)
-        foreground = Color(221, 214, 254)
-        font = Font("Segoe UI", Font.BOLD, 11)
-        isFocusPainted = false
-    }
-    private val btnLeakTest = JButton("Gizlilik & Genel IP Testi").apply {
-        background = Color(15, 27, 46)
-        foreground = Color(56, 189, 248)
-        font = Font("Segoe UI", Font.BOLD, 11)
-        isFocusPainted = false
-    }
-    private val leakTestResult = JLabel("IPv6 AAAA Red · STUN/WebRTC Engel · DNS-Rebinding Filtre · WARP WireGuard hazır").apply {
+    private val btnSystemProxyToggle = FreedomButton(
+        "Sistem Vekili: Kapalı",
+        fillColor = Color(15, 27, 46),
+        textColor = Color(148, 163, 184),
+        borderColor = Color(51, 65, 85),
+    )
+    private val btnPersonaCycle = FreedomButton(
+        selectedPersona.shortLabel,
+        fillColor = Color(46, 16, 101),
+        textColor = Color(233, 213, 255),
+        borderColor = Color(124, 58, 237),
+    )
+    private val btnLeakTest = FreedomButton(
+        "Gizlilik & Çift-Yol Testi",
+        fillColor = Color(15, 27, 46),
+        textColor = Color(56, 189, 248),
+        borderColor = Color(29, 78, 216),
+    )
+    private val leakTestResult = JLabel("İzleyici & URL Parametre Temizliği + HTTP Kimlik Maskeleme + WireGuard hazır").apply {
         font = Font("Segoe UI", Font.PLAIN, 10)
         foreground = Color(148, 163, 184)
     }
@@ -5259,17 +5623,14 @@ class MainWindow {
     private val targets = JTextArea("cloudflare.com\nwikipedia.org\nietf.org", 2, 35).apply {
         background = Color(14, 22, 38)
         foreground = Color.WHITE
-        caretColor = Color.WHITE
+        caretColor = Color(56, 189, 248)
         font = Font("Segoe UI", Font.PLAIN, 12)
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-            BorderFactory.createEmptyBorder(4, 6, 4, 6),
-        )
+        border = BorderFactory.createEmptyBorder(4, 6, 4, 6)
     }
     private val altDns = JTextField(25).apply {
         background = Color(14, 22, 38)
         foreground = Color.WHITE
-        caretColor = Color.WHITE
+        caretColor = Color(56, 189, 248)
         font = Font("Segoe UI", Font.PLAIN, 12)
         border = BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(Color(30, 41, 59), 1),
@@ -5280,42 +5641,52 @@ class MainWindow {
         toolTipText = "Örnek: https://1.1.1.1/dns-query"
         background = Color(14, 22, 38)
         foreground = Color.WHITE
-        caretColor = Color.WHITE
+        caretColor = Color(56, 189, 248)
         font = Font("Segoe UI", Font.PLAIN, 12)
         border = BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(Color(30, 41, 59), 1),
             BorderFactory.createEmptyBorder(4, 6, 4, 6),
         )
     }
-    private val runButton = JButton("Ağ Tanıla").apply {
-        background = Color(37, 99, 235)
-        foreground = Color.WHITE
-        font = Font("Segoe UI", Font.BOLD, 12)
-        isFocusPainted = false
-    }
-    private val heroActionButton = JButton("ÖZGÜR AĞI BAŞLAT (DPI Aşma + Gizlilik)").apply {
-        background = Color(16, 185, 129)
-        foreground = Color(7, 11, 20)
-        font = Font("Segoe UI", Font.BOLD, 12)
-        isFocusPainted = false
-    }
-    private val systemButton = JButton("Sistem Bağlantıları").apply {
-        background = Color(30, 41, 59)
-        foreground = Color(148, 163, 184)
-        font = Font("Segoe UI", Font.PLAIN, 11)
-        isFocusPainted = false
-    }
-    private val appliedButton = JButton("Öneriyi Doğrula").apply {
-        isEnabled = false
-        background = Color(30, 41, 59)
-        foreground = Color(148, 163, 184)
-        font = Font("Segoe UI", Font.PLAIN, 11)
-        isFocusPainted = false
-    }
+    private val runButton = FreedomButton(
+        "Ağ Tanıla",
+        fillColor = Color(37, 99, 235),
+        textColor = Color.WHITE,
+        borderColor = Color(59, 130, 246),
+    ).apply { font = Font("Segoe UI", Font.BOLD, 12) }
+
+    private val heroActionButton = FreedomButton(
+        "ÖZGÜR AĞI BAŞLAT (DPI Aşma + Gizlilik)",
+        fillColor = Color(16, 185, 129),
+        textColor = Color(4, 22, 16),
+        borderColor = Color(52, 211, 153),
+        arc = 12,
+    ).apply { font = Font("Segoe UI", Font.BOLD, 12) }
+
+    private val systemButton = FreedomButton(
+        "Sistem Bağlantıları",
+        fillColor = Color(30, 41, 59),
+        textColor = Color(226, 232, 240),
+        borderColor = Color(71, 85, 105),
+    )
+    private val appliedButton = FreedomButton(
+        "Öneriyi Doğrula",
+        fillColor = Color(30, 41, 59),
+        textColor = Color(226, 232, 240),
+        borderColor = Color(51, 65, 85),
+    ).apply { isEnabled = false }
+
     private val auto = JCheckBox("Ağ değişince yeniden tanıla", false).apply {
         foreground = Color(148, 163, 184)
         background = Color(7, 11, 20)
+        isOpaque = false
+        isContentAreaFilled = false
+        isBorderPainted = false
         isFocusPainted = false
+        icon = DarkCheckBoxIcon(false)
+        selectedIcon = DarkCheckBoxIcon(true)
+        font = Font("Segoe UI", Font.PLAIN, 11)
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
     }
     private val output = JTextArea().apply {
         isEditable = false
@@ -5324,10 +5695,7 @@ class MainWindow {
         wrapStyleWord = true
         background = Color(9, 13, 22)
         foreground = Color(226, 232, 240)
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-            BorderFactory.createEmptyBorder(8, 8, 8, 8),
-        )
+        border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
     }
     private val status = JLabel(" ").apply {
         foreground = Color(56, 189, 248)
@@ -5339,18 +5707,9 @@ class MainWindow {
     private val centerContainer = JPanel(cardLayout).apply {
         background = Color(7, 11, 20)
     }
-    private val tabBtnControl = JButton("KONTROL").apply {
-        font = Font("Segoe UI", Font.BOLD, 11)
-        isFocusPainted = false
-    }
-    private val tabBtnDiag = JButton("TEŞHİS").apply {
-        font = Font("Segoe UI", Font.BOLD, 11)
-        isFocusPainted = false
-    }
-    private val tabBtnLog = JButton("GÜNLÜK & SİSTEM").apply {
-        font = Font("Segoe UI", Font.BOLD, 11)
-        isFocusPainted = false
-    }
+    private val tabBtnControl = FreedomButton("KONTROL", arc = 8)
+    private val tabBtnDiag = FreedomButton("TEŞHİS", arc = 8)
+    private val tabBtnLog = FreedomButton("GÜNLÜK & SİSTEM", arc = 8)
 
     private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "freedom-worker").apply { isDaemon = true } }
     private val busy = AtomicBoolean(false)
@@ -5369,9 +5728,9 @@ class MainWindow {
         pulsePanel.portInfo = if (p.active) "127.0.0.1:${p.port}" else ""
 
         cardTcp.update("${p.connections} Akış", "TLS Bölme: ${p.tlsSplit} · HTTP: ${p.httpSplit}")
-        cardVision.update("${p.visionSplice} Splice", "Kimlik: ${selectedPersona.shortLabel}")
+        cardVision.update("${p.visionSplice} Splice", "İzleyici: ${p.trackersBlocked} · URL: ${p.paramsStripped}")
         cardFake.update("${p.fakeSent} Sahte", "RST Kalkanı: ${p.rstDropped} Engellendi")
-        cardDns.update(if (p.active) "Etkin" else "Beklemede", "PQ-TLS 1.3 / ECH + DoH3")
+        cardDns.update(if (p.active) "Etkin" else "Beklemede", "PQ-TLS 1.3 / ECH + ${selectedPersona.shortLabel}")
 
         val now = System.currentTimeMillis()
         var rxRate = 0f
@@ -5385,24 +5744,59 @@ class MainWindow {
         lastTickMs = now
         sparkline.updateMetrics(rxRate, txRate, p.connections * 16384L, p.connections * 4096L)
 
+        updateProtectionVisuals(p)
+    }
+
+    private fun updateProtectionVisuals(p: ProxyStatus) {
         if (p.active) {
+            val sysState = if (WindowsSystemProxy.appliedByApp) "Sistem Vekili Açık" else "SOCKS5/HTTP Hazır"
             statusPill.text = "FREEDOM NETWORK DEVREDE (127.0.0.1:${p.port} · ${selectedPersona.shortLabel})"
             statusPill.foreground = Color(16, 185, 129)
-            ipCardDetail.text = "Aktif: Yerel DPI/ECH Aşma Vekili (127.0.0.1:${p.port}) · Tarayıcı SOCKS/HTTP çıkışı"
+            ipCardDetail.text = "Aktif: 127.0.0.1:${p.port} · $sysState · İzleyici ${p.trackersBlocked} / URL ${p.paramsStripped}"
             heroActionButton.text = "KORUMAYI DURDUR (127.0.0.1:${p.port})"
             heroActionButton.background = Color(220, 38, 38)
             heroActionButton.foreground = Color.WHITE
+            heroActionButton.borderColor = Color(248, 113, 113)
         } else {
             statusPill.text = "KORUMA KAPALI · DOKUNARAK BAĞLANIN"
             statusPill.foreground = Color(148, 163, 184)
-            ipCardDetail.text = "Hazır · Dahili WARP WireGuard Kripto + DPI Aşma + Cihaz Kimliği Koruması"
+            ipCardDetail.text = "Hazır · Yerel DPI Aşma Vekili + Cihaz Kimliği & URL Gizliliği"
             heroActionButton.text = "ÖZGÜR AĞI BAŞLAT (DPI Aşma + Gizlilik)"
             heroActionButton.background = Color(16, 185, 129)
-            heroActionButton.foreground = Color(7, 11, 20)
+            heroActionButton.foreground = Color(4, 22, 16)
+            heroActionButton.borderColor = Color(52, 211, 153)
         }
+        ipCardDetail.toolTipText = ipCardDetail.text
+        heroActionButton.repaint()
+
+        if (WindowsSystemProxy.appliedByApp) {
+            btnSystemProxyToggle.text = "Sistem Vekili: Açık"
+            btnSystemProxyToggle.background = Color(6, 78, 59)
+            btnSystemProxyToggle.foreground = Color(167, 243, 208)
+            btnSystemProxyToggle.borderColor = Color(16, 185, 129)
+        } else if (systemProxyDesired) {
+            btnSystemProxyToggle.text = "Sistem Vekili: Bekliyor"
+            btnSystemProxyToggle.background = Color(30, 41, 59)
+            btnSystemProxyToggle.foreground = Color(251, 191, 36)
+            btnSystemProxyToggle.borderColor = Color(217, 119, 6)
+        } else {
+            btnSystemProxyToggle.text = "Sistem Vekili: Kapalı"
+            btnSystemProxyToggle.background = Color(15, 27, 46)
+            btnSystemProxyToggle.foreground = Color(148, 163, 184)
+            btnSystemProxyToggle.borderColor = Color(51, 65, 85)
+        }
+        btnSystemProxyToggle.repaint()
+    }
+
+    private fun loadWindowIcons() {
+        val imgs = listOf("/icon-16.png", "/icon-32.png", "/icon-48.png", "/icon-256.png").mapNotNull { path ->
+            runCatching { MainWindow::class.java.getResourceAsStream(path)?.use { ImageIO.read(it) } }.getOrNull()
+        }
+        if (imgs.isNotEmpty()) frame.iconImages = imgs
     }
 
     fun show() {
+        loadWindowIcons()
         val root = JPanel(BorderLayout()).apply {
             background = Color(7, 11, 20)
         }
@@ -5410,7 +5804,7 @@ class MainWindow {
         // Top Header + Tab Navigation
         val topBar = JPanel(BorderLayout()).apply {
             background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(8, 12, 6, 12)
+            border = BorderFactory.createEmptyBorder(10, 14, 8, 14)
         }
         val brandRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
             background = Color(7, 11, 20)
@@ -5418,14 +5812,14 @@ class MainWindow {
                 font = Font("Segoe UI", Font.BOLD, 17)
                 foreground = Color(248, 250, 252)
             }
-            val lblVer = JLabel(" 2026–2027 · v2.0").apply {
+            val lblVer = JLabel("2026–2027 · v2.0").apply {
                 font = Font("Segoe UI", Font.BOLD, 11)
                 foreground = Color(56, 189, 248)
             }
             add(lblTitle)
             add(lblVer)
         }
-        val tabRow = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0)).apply {
+        val tabRow = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
             background = Color(7, 11, 20)
             add(tabBtnControl)
             add(tabBtnDiag)
@@ -5438,7 +5832,7 @@ class MainWindow {
         // ---------------- TAB 0: KONTROL ----------------
         val panelControl = JPanel(BorderLayout()).apply {
             background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(0, 12, 6, 12)
+            border = BorderFactory.createEmptyBorder(0, 14, 8, 14)
         }
         pulsePanel.onToggleListener = { toggleDesync() }
         panelControl.add(pulsePanel, BorderLayout.NORTH)
@@ -5454,13 +5848,13 @@ class MainWindow {
         controlCenter.add(statusRow)
 
         fun privacyCard(titleText: String, titleColor: Color, bodyComp: java.awt.Component, rightComp: java.awt.Component? = null): JPanel {
-            return JPanel(BorderLayout(8, 2)).apply {
+            return JPanel(BorderLayout(12, 2)).apply {
                 background = Color(11, 18, 32)
                 border = BorderFactory.createCompoundBorder(
                     BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-                    BorderFactory.createEmptyBorder(8, 12, 8, 12),
+                    BorderFactory.createEmptyBorder(9, 12, 9, 12),
                 )
-                val left = JPanel(BorderLayout(0, 2)).apply {
+                val left = JPanel(BorderLayout(0, 3)).apply {
                     isOpaque = false
                     add(
                         JLabel(titleText).apply {
@@ -5472,19 +5866,32 @@ class MainWindow {
                     add(bodyComp, BorderLayout.CENTER)
                 }
                 add(left, BorderLayout.CENTER)
-                if (rightComp != null) add(rightComp, BorderLayout.EAST)
+                if (rightComp != null) {
+                    val rightWrap = JPanel(GridBagLayout()).apply {
+                        isOpaque = false
+                        add(rightComp)
+                    }
+                    add(rightWrap, BorderLayout.EAST)
+                }
             }
         }
 
         val privacyStack = JPanel(GridLayout(3, 1, 0, 6)).apply {
             background = Color(7, 11, 20)
             border = BorderFactory.createEmptyBorder(4, 0, 6, 0)
-            add(privacyCard("IP GİZLİLİĞİ & ROTA", Color(16, 185, 129), ipCardDetail))
             add(
                 privacyCard(
-                    "CİHAZ GİZLİLİĞİ (GELECEK KİMLİK)",
+                    "IP GİZLİLİĞİ & WINDOWS SİSTEM VEKİLİ (HKCU WinINet)",
+                    Color(16, 185, 129),
+                    ipCardDetail,
+                    btnSystemProxyToggle,
+                ),
+            )
+            add(
+                privacyCard(
+                    "CİHAZ GİZLİLİĞİ & GELECEK KİMLİK",
                     Color(167, 139, 250),
-                    JLabel("HTTP User-Agent & Client Hints seçilen gelecek kimliğe dönüştürülür").apply {
+                    JLabel("HTTP User-Agent, Client Hints & URL izleme parametreleri otomatik temizlenir").apply {
                         font = Font("Segoe UI", Font.PLAIN, 10)
                         foreground = Color(148, 163, 184)
                     },
@@ -5493,7 +5900,7 @@ class MainWindow {
             )
             add(
                 privacyCard(
-                    "GİZLİLİK & GENEL IP TESTİ",
+                    "GİZLİLİK & ÇİFT-YOL IP SIZINTI TESTİ",
                     Color(56, 189, 248),
                     leakTestResult,
                     btnLeakTest,
@@ -5516,11 +5923,12 @@ class MainWindow {
             }
             add(cardsPanel, BorderLayout.CENTER)
         }
-        val btnAdvancedToggle = JButton("Gelişmiş Metrikler & Canlı Trafik ▾").apply {
-            background = Color(12, 19, 34)
-            foreground = Color(148, 163, 184)
-            font = Font("Segoe UI", Font.BOLD, 11)
-            isFocusPainted = false
+        val btnAdvancedToggle = FreedomButton(
+            "Gelişmiş Metrikler & Canlı Trafik ▾",
+            fillColor = Color(12, 19, 34),
+            textColor = Color(148, 163, 184),
+            borderColor = Color(30, 41, 59),
+        ).apply {
             alignmentX = java.awt.Component.CENTER_ALIGNMENT
             addActionListener {
                 advancedExpanded = !advancedExpanded
@@ -5535,40 +5943,95 @@ class MainWindow {
         }
         controlCenter.add(advToggleWrap)
         controlCenter.add(advancedContainer)
-        panelControl.add(controlCenter, BorderLayout.CENTER)
-
-        val quickActionRow = JPanel(FlowLayout(FlowLayout.CENTER, 0, 4)).apply {
+        val controlScrollHost = JPanel(BorderLayout()).apply {
             background = Color(7, 11, 20)
-            heroActionButton.preferredSize = Dimension(450, 36)
+            add(controlCenter, BorderLayout.NORTH)
+        }
+        panelControl.add(FreedomDarkTheme.darkScrollPane(controlScrollHost, showBorder = false), BorderLayout.CENTER)
+
+        val quickActionRow = JPanel(FlowLayout(FlowLayout.CENTER, 0, 6)).apply {
+            background = Color(7, 11, 20)
+            heroActionButton.preferredSize = Dimension(460, 38)
             add(heroActionButton)
         }
         panelControl.add(quickActionRow, BorderLayout.SOUTH)
         centerContainer.add(panelControl, "CONTROL")
 
+        btnSystemProxyToggle.addActionListener {
+            systemProxyDesired = !systemProxyDesired
+            val s = session
+            worker.execute {
+                val ps = s?.proxyStats()
+                if (systemProxyDesired && ps != null && ps.active) {
+                    WindowsSystemProxy.enable(ps.port)
+                } else {
+                    WindowsSystemProxy.restore()
+                }
+                ui {
+                    ps?.let { updateProtectionVisuals(it) }
+                    status.text = if (systemProxyDesired) {
+                        if (WindowsSystemProxy.appliedByApp) {
+                            "Windows sistem vekili etkin (127.0.0.1:${ps?.port})"
+                        } else {
+                            "Sistem vekili koruma açılınca devreye girecek"
+                        }
+                    } else {
+                        "Windows sistem vekili orijinal ayarlara geri döndürüldü"
+                    }
+                }
+            }
+        }
+
         btnPersonaCycle.addActionListener {
             val all = DevicePersona.entries
             selectedPersona = all[(all.indexOf(selectedPersona) + 1) % all.size]
             btnPersonaCycle.text = selectedPersona.shortLabel
-            status.text = "Cihaz kimliği: ${selectedPersona.shortLabel}"
+            btnPersonaCycle.repaint()
+            status.text = "Cihaz kimliği: ${selectedPersona.shortLabel} (yeniden bağlanmada uygulanır)"
         }
+
         btnLeakTest.addActionListener {
             btnLeakTest.isEnabled = false
-            leakTestResult.text = "Genel IP & WARP el sıkışma yeteneği kontrol ediliyor..."
+            leakTestResult.text = "Doğrudan çıkış & yerel vekil yolu test ediliyor..."
+            val s = session
             worker.execute {
-                val ip = runCatching {
-                    val conn = URI("https://api.ipify.org").toURL().openConnection() as javax.net.ssl.HttpsURLConnection
+                val directIp = runCatching {
+                    val conn = URI("https://api.ipify.org").toURL().openConnection(java.net.Proxy.NO_PROXY) as javax.net.ssl.HttpsURLConnection
                     conn.connectTimeout = 3500
                     conn.readTimeout = 3500
-                    conn.inputStream.bufferedReader().readText().trim()
+                    try {
+                        conn.inputStream.bufferedReader().readText().trim()
+                    } finally {
+                        conn.disconnect()
+                    }
                 }.getOrNull()
+                val ps = s?.proxyStats()
+                val proxyIp = if (ps != null && ps.active) {
+                    runCatching {
+                        val proxy = java.net.Proxy(java.net.Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", ps.port))
+                        val conn = URI("https://api.ipify.org").toURL().openConnection(proxy) as javax.net.ssl.HttpsURLConnection
+                        conn.connectTimeout = 4000
+                        conn.readTimeout = 4000
+                        try {
+                            conn.inputStream.bufferedReader().readText().trim()
+                        } finally {
+                            conn.disconnect()
+                        }
+                    }.getOrNull()
+                } else null
                 val wgPub = Native.wgPublicKey(ByteArray(32).also { java.security.SecureRandom().nextBytes(it) })?.size == 32
                 ui {
                     btnLeakTest.isEnabled = true
-                    leakTestResult.text = buildString {
-                        append("Ham Çıkış IP: ").append(ip ?: "ölçülemedi (ağ/güvenlik duvarı)")
-                        append(" · WireGuard Motoru: ").append(if (wgPub) "Hazır" else "Hata")
-                        append(" · Kimlik: ").append(selectedPersona.shortLabel)
+                    val resText = buildString {
+                        append("Doğrudan IP: ").append(directIp ?: "ölçülemedi")
+                        if (ps?.active == true) {
+                            append(" · Vekil (:").append(ps.port).append("): ").append(proxyIp ?: "hata")
+                            append(" · İzleyici=").append(ps.trackersBlocked).append(" URL=").append(ps.paramsStripped)
+                        }
+                        append(" · WG: ").append(if (wgPub) "Hazır" else "Hata")
                     }
+                    leakTestResult.text = resText
+                    leakTestResult.toolTipText = resText
                 }
             }
         }
@@ -5576,13 +6039,13 @@ class MainWindow {
         // ---------------- TAB 1: TEŞHİS ----------------
         val panelDiag = JPanel(BorderLayout()).apply {
             background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(4, 12, 6, 12)
+            border = BorderFactory.createEmptyBorder(4, 14, 8, 14)
         }
         val form = JPanel(GridBagLayout()).apply {
             background = Color(7, 11, 20)
             border = BorderFactory.createEmptyBorder(4, 0, 8, 0)
         }
-        val c = GridBagConstraints().apply { insets = Insets(2, 4, 2, 4); anchor = GridBagConstraints.WEST; fill = GridBagConstraints.HORIZONTAL }
+        val c = GridBagConstraints().apply { insets = Insets(3, 4, 3, 4); anchor = GridBagConstraints.WEST; fill = GridBagConstraints.HORIZONTAL }
         fun row(y: Int, label: String, comp: java.awt.Component) {
             val lbl = JLabel(label).apply {
                 foreground = Color(148, 163, 184)
@@ -5591,46 +6054,39 @@ class MainWindow {
             c.gridx = 0; c.gridy = y; c.weightx = 0.0; form.add(lbl, c)
             c.gridx = 1; c.weightx = 1.0; form.add(comp, c)
         }
-        row(0, "Test hedefleri:", JScrollPane(targets))
+        row(0, "Test hedefleri:", FreedomDarkTheme.darkScrollPane(targets))
         row(1, "Karşılaştırılacak DNS (isteğe bağlı):", altDns)
         row(2, "Şifreli DoH adresleri (isteğe bağlı):", dohEndpoints)
 
+        val btnCopyDiag = FreedomButton(
+            "Raporu Kopyala",
+            fillColor = Color(30, 41, 59),
+            textColor = Color(226, 232, 240),
+            borderColor = Color(71, 85, 105),
+        ).apply {
+            addActionListener {
+                val sel = StringSelection(output.text)
+                Toolkit.getDefaultToolkit().systemClipboard.setContents(sel, sel)
+                status.text = "Teşhis çıktısı panoya kopyalandı"
+            }
+        }
         val btnRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
             background = Color(7, 11, 20)
             add(runButton)
             add(appliedButton)
+            add(btnCopyDiag)
             add(auto)
         }
         c.gridx = 0; c.gridy = 3; c.gridwidth = 2; form.add(btnRow, c)
         panelDiag.add(form, BorderLayout.NORTH)
-        panelDiag.add(JScrollPane(output).apply {
-            border = BorderFactory.createEmptyBorder(0, 0, 6, 0)
-            viewport.background = Color(9, 13, 22)
-        }, BorderLayout.CENTER)
+        panelDiag.add(FreedomDarkTheme.darkScrollPane(output), BorderLayout.CENTER)
         centerContainer.add(panelDiag, "DIAG")
 
         // ---------------- TAB 2: GÜNLÜK & SİSTEM ----------------
         val panelLog = JPanel(BorderLayout()).apply {
             background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(6, 12, 6, 12)
+            border = BorderFactory.createEmptyBorder(6, 14, 8, 14)
         }
-        val logTopBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
-            background = Color(7, 11, 20)
-            add(systemButton)
-            val btnCopy = JButton("Panoya Kopyala").apply {
-                background = Color(37, 99, 235)
-                foreground = Color.WHITE
-                font = Font("Segoe UI", Font.BOLD, 11)
-                isFocusPainted = false
-                addActionListener {
-                    val sel = StringSelection(output.text)
-                    Toolkit.getDefaultToolkit().systemClipboard.setContents(sel, sel)
-                    status.text = "Çıktı panoya kopyalandı"
-                }
-            }
-            add(btnCopy)
-        }
-        panelLog.add(logTopBar, BorderLayout.NORTH)
         val logOutput = JTextArea().apply {
             isEditable = false
             font = Font(Font.MONOSPACED, Font.PLAIN, 12)
@@ -5638,28 +6094,42 @@ class MainWindow {
             wrapStyleWord = true
             background = Color(8, 12, 20)
             foreground = Color(167, 243, 208)
-            border = BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-                BorderFactory.createEmptyBorder(8, 8, 8, 8),
-            )
+            border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
             text = "Freedom Network Dahili Log & Sistem Gözlemcisi Hazır.\nSistem genelindeki bağlantıları incelemek için 'Sistem Bağlantıları' düğmesine tıklayın."
         }
-        panelLog.add(JScrollPane(logOutput), BorderLayout.CENTER)
+        val logTopBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
+            background = Color(7, 11, 20)
+            add(systemButton)
+            val btnCopyLog = FreedomButton(
+                "Sistem Çıktısını Kopyala",
+                fillColor = Color(37, 99, 235),
+                textColor = Color.WHITE,
+                borderColor = Color(59, 130, 246),
+            ).apply {
+                addActionListener {
+                    val sel = StringSelection(logOutput.text)
+                    Toolkit.getDefaultToolkit().systemClipboard.setContents(sel, sel)
+                    status.text = "Sistem günlüğü panoya kopyalandı"
+                }
+            }
+            add(btnCopyLog)
+        }
+        panelLog.add(logTopBar, BorderLayout.NORTH)
+        panelLog.add(FreedomDarkTheme.darkScrollPane(logOutput), BorderLayout.CENTER)
         centerContainer.add(panelLog, "LOG")
 
         root.add(centerContainer, BorderLayout.CENTER)
-        root.add(status.apply { border = BorderFactory.createEmptyBorder(4, 12, 6, 12) }, BorderLayout.SOUTH)
+        root.add(status.apply { border = BorderFactory.createEmptyBorder(4, 14, 8, 14) }, BorderLayout.SOUTH)
 
         fun updateTabs(activeIdx: Int) {
-            val activeBg = Color(30, 41, 59)
-            val inactiveBg = Color(14, 22, 38)
-            tabBtnControl.background = if (activeIdx == 0) activeBg else inactiveBg
-            tabBtnControl.foreground = if (activeIdx == 0) Color.WHITE else Color(100, 116, 139)
-            tabBtnDiag.background = if (activeIdx == 1) activeBg else inactiveBg
-            tabBtnDiag.foreground = if (activeIdx == 1) Color.WHITE else Color(100, 116, 139)
-            tabBtnLog.background = if (activeIdx == 2) activeBg else inactiveBg
-            tabBtnLog.foreground = if (activeIdx == 2) Color.WHITE else Color(100, 116, 139)
-
+            val tabs = listOf(tabBtnControl, tabBtnDiag, tabBtnLog)
+            tabs.forEachIndexed { idx, btn ->
+                val active = idx == activeIdx
+                btn.background = if (active) Color(30, 58, 138) else Color(15, 23, 42)
+                btn.foreground = if (active) Color.WHITE else Color(148, 163, 184)
+                btn.borderColor = if (active) Color(56, 189, 248) else Color(30, 41, 59)
+                btn.repaint()
+            }
             cardLayout.show(centerContainer, when (activeIdx) {
                 0 -> "CONTROL"
                 1 -> "DIAG"
@@ -5672,12 +6142,14 @@ class MainWindow {
         tabBtnLog.addActionListener { updateTabs(2) }
         updateTabs(0)
 
+        frame.background = Color(7, 11, 20)
         frame.contentPane = root
         frame.defaultCloseOperation = WindowConstants.DISPOSE_ON_CLOSE
         frame.addWindowListener(object : WindowAdapter() {
             override fun windowClosed(e: WindowEvent) = shutdown()
         })
-        frame.minimumSize = Dimension(750, 620)
+        frame.minimumSize = Dimension(820, 680)
+        frame.size = Dimension(880, 740)
         frame.setLocationRelativeTo(null)
 
         runButton.addActionListener { startRun(verifyRuns = 0) }
@@ -5737,13 +6209,27 @@ class MainWindow {
     private fun toggleDesync() {
         val s = session ?: return
         heroActionButton.isEnabled = false
+        val personaStr = if (selectedPersona != DevicePersona.OFF) selectedPersona.id else ""
         worker.execute {
             val cur = s.proxyStats()
             val next = if (cur.active) {
+                WindowsSystemProxy.restore()
                 s.stopProxy()
                 s.proxyStats()
             } else {
-                s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
+                val started = s.startProxy(
+                    DesyncConfig(
+                        mode = DesyncMode.REALITY_VISION,
+                        port = 0,
+                        persona = personaStr,
+                        blockTrackers = true,
+                        stripUrlParams = true,
+                    ),
+                )
+                if (started.active && systemProxyDesired) {
+                    WindowsSystemProxy.enable(started.port)
+                }
+                started
             }
             val text = Text.proxyStatus(next)
             ui {
@@ -5751,22 +6237,11 @@ class MainWindow {
                 output.caretPosition = 0
                 pulsePanel.isActive = next.active
                 pulsePanel.portInfo = if (next.active) "127.0.0.1:${next.port}" else ""
-                if (next.active) {
-                    statusPill.text = "FREEDOM NETWORK DEVREDE (127.0.0.1:${next.port} · ${selectedPersona.shortLabel})"
-                    statusPill.foreground = Color(16, 185, 129)
-                    ipCardDetail.text = "Aktif: Yerel DPI/ECH Aşma Vekili (127.0.0.1:${next.port}) · Tarayıcı SOCKS/HTTP çıkışı"
-                    heroActionButton.text = "KORUMAYI DURDUR (127.0.0.1:${next.port})"
-                    heroActionButton.background = Color(220, 38, 38)
-                    heroActionButton.foreground = Color.WHITE
-                    status.text = "Freedom Network etkin (127.0.0.1:${next.port})"
+                updateProtectionVisuals(next)
+                status.text = if (next.active) {
+                    "Freedom Network etkin (127.0.0.1:${next.port})"
                 } else {
-                    statusPill.text = "KORUMA KAPALI · DOKUNARAK BAĞLANIN"
-                    statusPill.foreground = Color(148, 163, 184)
-                    ipCardDetail.text = "Hazır · Dahili WARP WireGuard Kripto + DPI Aşma + Cihaz Kimliği Koruması"
-                    heroActionButton.text = "ÖZGÜR AĞI BAŞLAT (DPI Aşma + Gizlilik)"
-                    heroActionButton.background = Color(16, 185, 129)
-                    heroActionButton.foreground = Color(7, 11, 20)
-                    status.text = "Freedom Network durduruldu"
+                    "Freedom Network durduruldu"
                 }
                 heroActionButton.isEnabled = true
             }
@@ -5833,6 +6308,7 @@ class MainWindow {
     }
 
     private fun shutdown() {
+        runCatching { WindowsSystemProxy.restore() }
         pulsePanel.stop()
         ticker.stop()
         watcher.stop()
@@ -5845,6 +6321,6 @@ class MainWindow {
 
 fun main(args: Array<String>) {
     if (args.isNotEmpty()) exitProcess(runCli(args.toList()))
-    runCatching { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()) }
+    FreedomDarkTheme.install()
     SwingUtilities.invokeLater { MainWindow().show() }
 }

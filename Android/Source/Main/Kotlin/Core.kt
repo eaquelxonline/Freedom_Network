@@ -155,6 +155,8 @@ object Native {
     @JvmStatic external fun wgConsumeResponse(wgHandle: Long, pkt: ByteArray): Int
     @JvmStatic external fun wgEncrypt(wgHandle: Long, ipPacket: ByteArray): ByteArray?
     @JvmStatic external fun wgDecrypt(wgHandle: Long, wgPacket: ByteArray): ByteArray?
+    @JvmStatic external fun wgSetReserved(wgHandle: Long, reserved3: ByteArray): Int
+    @JvmStatic external fun wgBuildAwgPrefaces(jc: Int, jmin: Int, jmax: Int, cpsTemplate: ByteArray?): ByteArray?
 }
 
 object Codes {
@@ -199,6 +201,7 @@ class Record {
     fun ints(tag: Int): List<Long> = fields.filter { it.first == tag }.mapNotNull { (it.second as? IntValue)?.v }
     fun texts(tag: Int): List<String> = fields.filter { it.first == tag }.mapNotNull { (it.second as? TextValue)?.v }
     fun records(tag: Int): List<Record> = fields.filter { it.first == tag }.mapNotNull { (it.second as? RecordValue)?.v }
+    fun bytesAll(tag: Int): List<ByteArray> = fields.filter { it.first == tag }.mapNotNull { (it.second as? BytesValue)?.v }
     fun getInt(tag: Int): Long? = ints(tag).firstOrNull()
     fun getText(tag: Int): String? = texts(tag).firstOrNull()
     val status: Long? get() = getInt(Tags.STATUS)
@@ -391,6 +394,8 @@ object Tags {
         const val CONNECTIONS = 13; const val TLS_SPLIT = 14; const val HTTP_SPLIT = 15
         const val FAKE_SENT = 16; const val RST_DROPPED = 17; const val ACTIVE = 18
         const val VISION_SPLICE = 19; const val REALITY_DEST = 20
+        const val PERSONA = 21; const val BLOCK_TRACKERS = 22; const val STRIP_PARAMS = 23
+        const val TRACKERS_BLOCKED = 24; const val PARAMS_STRIPPED = 25
     }
 }
 
@@ -3140,14 +3145,15 @@ class WarpTunnel(
             start()
         }
         keepaliveThread = Thread({
+            val rng = java.security.SecureRandom()
             while (!closed.get() && established) {
                 try {
-                    Thread.sleep(22_000L)
+                    Thread.sleep(18_000L + rng.nextInt(6_001).toLong())
                 } catch (_: InterruptedException) {
                     break
                 }
                 if (closed.get() || !established) break
-                if (System.currentTimeMillis() - lastTxMs >= 20_000L) {
+                if (System.currentTimeMillis() - lastTxMs >= 18_000L) {
                     sendIpPacket(ByteArray(0))
                 }
             }
@@ -3808,13 +3814,15 @@ class TunBridge(
             }
             if (hardExpiry > now) {
                 dnsCacheHits.incrementAndGet()
-                if (dnsRefreshInFlight.add(cacheKey)) {
-                    Thread({
+                val bgClient = dohClient
+                if (bgClient != null && dnsRefreshInFlight.add(cacheKey)) {
+                    ioPool.execute {
                         try {
                             val dohWireBg = query.copyOf().also { it[0] = 0; it[1] = 0 }
                             val eps = dohEndpoints.filter(Doh::validEndpoint)
-                            if (eps.isNotEmpty()) {
-                                val resp = dohFetcher(eps.first(), dohWireBg)
+                            val ep = eps.getOrNull(preferredDoh.coerceIn(0, (eps.size - 1).coerceAtLeast(0)))
+                            if (ep != null) {
+                                val resp = bgClient.post(ep, dohWireBg, 2200)
                                 val body = resp.body
                                 if (resp.transport == 1 && body != null && body.size >= 12 && !IpPackets.containsPoisonedDns(body)) {
                                     val ttl = (IpPackets.dnsMinTtl(body) ?: 30L).coerceIn(10L, 600L)
@@ -3826,7 +3834,7 @@ class TunBridge(
                         } finally {
                             dnsRefreshInFlight.remove(cacheKey)
                         }
-                    }, "freedom-dns-swr").apply { isDaemon = true }.start()
+                    }
                 }
                 return withId(msg, query)
             }
@@ -4205,9 +4213,14 @@ class TunBridge(
                                 data,
                                 persona = devicePersona,
                                 stripGeoHeaders = devicePersona != DevicePersona.OFF,
+                                stripTrackingParams = true,
                             )
                             if (cleanData !== data) {
                                 leaksBlocked.incrementAndGet()
+                                val reqLine = String(data, 0, minOf(data.size, 512), Charsets.ISO_8859_1).substringBefore("\r\n")
+                                if (IpPackets.stripUrlTrackingParamsFromRequestLine(reqLine).second) {
+                                    paramsStripped.incrementAndGet()
+                                }
                                 if (devicePersona != DevicePersona.OFF) {
                                     httpHeadersSpoofed.incrementAndGet()
                                 }
@@ -4838,13 +4851,36 @@ class AndroidDohClient(
         // HttpEngine (QUIC/HTTP3) is a platform API from Android 14 (API 34).
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return postLegacy(url, body, timeoutMs)
         val host = runCatching { URL(url).host }.getOrNull() ?: return DohResponse(6, 0, EncProtocol.UNKNOWN, null)
-        val engine = HttpEngine.Builder(context)
-            .setEnableQuic(true)
-            .setEnableHttp2(true)
-            .addQuicHint(host, 443, 443)
-            .build()
-        network?.let { engine.bindToNetwork(it) }
-        val executor = Executors.newSingleThreadExecutor()
+        val key = network?.networkHandle ?: -1L
+        val appCtx = context.applicationContext ?: context
+        var engine = engineCache[key] as? HttpEngine
+        if (engine == null) {
+            if (engineCache.size >= 8) {
+                for (cached in engineCache.values) {
+                    runCatching { (cached as? HttpEngine)?.shutdown() }
+                }
+                engineCache.clear()
+            }
+            val created = HttpEngine.Builder(appCtx)
+                .setEnableQuic(true)
+                .setEnableHttp2(true)
+                .addQuicHint(host, 443, 443)
+                .addQuicHint("1.1.1.1", 443, 443)
+                .addQuicHint("dns.google", 443, 443)
+                .addQuicHint("dns.quad9.net", 443, 443)
+                .build()
+            if (network != null) {
+                created.bindToNetwork(network)
+            }
+            val prev = engineCache.putIfAbsent(key, created)
+            if (prev != null) {
+                runCatching { created.shutdown() }
+                engine = prev as HttpEngine
+            } else {
+                engine = created
+            }
+        }
+        val executor = callbackPool
         val done = CountDownLatch(1)
         val received = java.io.ByteArrayOutputStream()
         var status = 0
@@ -4908,16 +4944,11 @@ class AndroidDohClient(
             .addHeader("Accept", "application/dns-message")
             .setUploadDataProvider(upload, executor)
             .build()
-        try {
-            request.start()
-            if (!done.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)) {
-                request.cancel()
-                done.await(1, TimeUnit.SECONDS)
-                failure = 2
-            }
-        } finally {
-            executor.shutdown()
-            engine.shutdown()
+        request.start()
+        if (!done.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)) {
+            request.cancel()
+            done.await(1, TimeUnit.SECONDS)
+            failure = 2
         }
         val rtt = (System.nanoTime() - start) / 1000
         val proto = if (protocol.startsWith("h3") || protocol.contains("quic")) EncProtocol.DOH3 else EncProtocol.DOH
@@ -4926,6 +4957,13 @@ class AndroidDohClient(
             status == 200 && contentType.startsWith("application/dns-message") -> DohResponse(1, rtt, proto, received.toByteArray())
             else -> DohResponse(6, rtt, proto, null)
         }
+    }
+
+    private companion object {
+        val callbackPool: ExecutorService = Executors.newCachedThreadPool { r ->
+            Thread(r, "freedom-doh-http").apply { isDaemon = true }
+        }
+        val engineCache = ConcurrentHashMap<Long, Any>()
     }
 }
 
@@ -5251,7 +5289,15 @@ class FreedomVpnService : VpnService() {
         try {
             val s = DiagnosticSession()
             session = s
-            s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
+            s.startProxy(
+                DesyncConfig(
+                    mode = DesyncMode.REALITY_VISION,
+                    port = 0,
+                    persona = if (persona != DevicePersona.OFF) persona.id else "",
+                    blockTrackers = blockTrackers,
+                    stripUrlParams = true,
+                ),
+            )
             val builder = Builder()
                 .setSession("Freedom Network")
                 .setMtu(1500)
@@ -7064,11 +7110,29 @@ class MainActivity : Activity() {
         panelDiag.addView(noticeCard)
 
         val android17Notice = TextView(this).apply {
-            text = "Android 16 QPR1+ / 17 Ağ Koruması: Ani ağ geçişlerinde QUIC soket kapanışı ve Wi-Fi ↔ 5G otomatik oturum + WireGuard soket koruması desteklenir."
+            val qClose = if (Build.VERSION.SDK_INT >= 36) {
+                runCatching {
+                    android.provider.Settings.Global.getInt(contentResolver, "close_quic_connection", 0)
+                }.getOrDefault(0)
+            } else {
+                0
+            }
+            val qState = when {
+                Build.VERSION.SDK_INT < 36 -> "SDK ${Build.VERSION.SDK_INT}: Standart koruma aktif"
+                qClose == -1 -> "Android 16/17 QUIC Soket Koruması: ETKİN (close_quic_connection=-1)"
+                else -> "Android 16/17 QUIC Önerisi (Dokun → ADB Kopyala): close_quic_connection=-1 önerilir"
+            }
+            text = "$qState\nAni ağ geçişlerinde Wi-Fi ↔ 5G otomatik oturum + WireGuard soket koruması desteklenir."
             textSize = 10f
             setTextColor(Color.parseColor("#7DD3FC"))
             background = createCardShape("#0A1A2F", borderColor = "#1D4ED8", cornerDp = 10f)
             setPadding(dp(10), dp(7), dp(10), dp(7))
+            setOnClickListener {
+                val cmd = "adb shell settings put global close_quic_connection -1"
+                val cmClip = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                cmClip.setPrimaryClip(ClipData.newPlainText("adb_quic", cmd))
+                Toast.makeText(this@MainActivity, "ADB komutu kopyalandı: $cmd", Toast.LENGTH_SHORT).show()
+            }
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                 setMargins(0, 0, 0, dp(8))
             }
@@ -7651,14 +7715,24 @@ class MainActivity : Activity() {
                     directRes.getOrNull()?.let { append(" · Ham Hat IP: $it") }
                 } else if (b?.isWarpActive == true) {
                     val dirIp = directRes.getOrNull() ?: "ölçülemedi"
-                    append("WARP WIREGUARD AKTİF (${b.activeExitRelayLabel}) · Cihaz trafiği Cloudflare çıkışı ile maskelenir (Ham ISP hat IP: $dirIp)")
+                    val cfTrace = runCatching {
+                        val conn = (URL("https://cloudflare.com/cdn-cgi/trace").openConnection() as HttpsURLConnection).apply {
+                            connectTimeout = 3500; readTimeout = 3500
+                        }
+                        try {
+                            conn.inputStream.bufferedReader().readLines().firstOrNull { it.startsWith("warp=") } ?: ""
+                        } finally {
+                            conn.disconnect()
+                        }
+                    }.getOrDefault("")
+                    append("WARP WIREGUARD AKTİF (${b.activeExitRelayLabel}) · $cfTrace · Çıkış IP: $dirIp")
                 } else {
                     val dirIp = directRes.getOrNull() ?: "ölçülemedi (${directRes.exceptionOrNull()?.message})"
-                    append("Rota: ${b?.activeExitRelayLabel ?: "Koruma Kapalı"} · Ham Hat IP: $dirIp")
+                    append("Rota: ${b?.activeExitRelayLabel ?: "Koruma Kapalı"} · Çıkış IP: $dirIp")
                 }
                 append("\nKonum: ${if (NullIslandLocationShield.isActive) "0.0°, 0.0° Aktif" else "Kapalı"} · Kimlik: ${selectedPersona.shortLabel}")
                 if (b != null) {
-                    append("\nKalkan: IPv6=${b.ipv6Rejected.get()} · AAAA=${b.aaaaSuppressed.get()} · Sızıntı/STUN=${b.leaksBlocked.get()} · Zehir=${b.poisonedDnsBlocked.get()} · Başlık=${b.httpHeadersSpoofed.get()}")
+                    append("\nKalkan: IPv6=${b.ipv6Rejected.get()} · AAAA=${b.aaaaSuppressed.get()} · Sızıntı/STUN=${b.leaksBlocked.get()} · Zehir=${b.poisonedDnsBlocked.get()} · İzleyici=${b.trackersBlocked.get()} · URL=${b.paramsStripped.get()}")
                 }
             }
             CrashLogger.log("MainActivity", "Gizlilik & Sızıntı Test Sonucu: $summary")
@@ -7874,7 +7948,15 @@ class MainActivity : Activity() {
         }
         worker.execute {
             try {
-                val next = s.startProxy(DesyncConfig(mode = DesyncMode.REALITY_VISION, port = 0))
+                val next = s.startProxy(
+                    DesyncConfig(
+                        mode = DesyncMode.REALITY_VISION,
+                        port = 0,
+                        persona = if (selectedPersona != DevicePersona.OFF) selectedPersona.id else "",
+                        blockTrackers = trackersEnabled,
+                        stripUrlParams = true,
+                    ),
+                )
                 CrashLogger.log("MainActivity", "startProxy tamamlandı: active=${next.active}, port=${next.port}")
                 val b = ActiveBridgeHolder.current
                 val text = Text.vpnStatus(

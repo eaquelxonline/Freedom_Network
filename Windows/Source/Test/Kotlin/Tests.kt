@@ -1235,6 +1235,58 @@ fun main() {
         eq(res[2].toInt() and 0xFF, 0x01, "reserved[2]")
     }
 
+    test("35. Windows dark theme, FreedomButton, and vector panels never render white native chrome") {
+        FreedomDarkTheme.install()
+        val lafClass = javax.swing.UIManager.getLookAndFeel().javaClass.name
+        expect("WindowsLookAndFeel" !in lafClass) { "Must not use WindowsLookAndFeel: $lafClass" }
+
+        val btn = FreedomButton(
+            "ÖZGÜR AĞ TEST",
+            fillColor = java.awt.Color(15, 27, 46),
+            textColor = java.awt.Color(226, 232, 240),
+            borderColor = java.awt.Color(51, 65, 85),
+        )
+        expect(!btn.isContentAreaFilled && !btn.isBorderPainted && !btn.isOpaque) {
+            "FreedomButton must disable default Swing content/border/opaque painting"
+        }
+        btn.setSize(180, 38)
+        val img = java.awt.image.BufferedImage(180, 38, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+        val g2 = img.createGraphics()
+        btn.paint(g2)
+        g2.dispose()
+
+        // Interior corner away from glyphs must show dark fill (15, 27, 46), never white/light native grey
+        val sample = java.awt.Color(img.getRGB(8, 8), true)
+        expect(sample.red < 60 && sample.green < 60 && sample.blue < 90) {
+            "Button fill must stay dark, got rgb=(${sample.red},${sample.green},${sample.blue})"
+        }
+
+        // Verify dark checkbox icon paints non-white background
+        val cbImg = java.awt.image.BufferedImage(20, 20, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+        val cbG = cbImg.createGraphics()
+        DarkCheckBoxIcon(false).paintIcon(null, cbG, 2, 2)
+        cbG.dispose()
+        val cbPixel = java.awt.Color(cbImg.getRGB(10, 10), true)
+        expect(cbPixel.red < 60 && cbPixel.green < 60 && cbPixel.blue < 90) {
+            "DarkCheckBoxIcon interior must be dark, got $cbPixel"
+        }
+
+        // Verify hero & sparkline & stat card paint cleanly onto offscreen Graphics2D
+        val hero = ModernPowerShieldPanel().apply { setSize(320, 180) }
+        val spark = ThroughputSparklinePanel().apply { setSize(320, 80); updateMetrics(12.5f, 3.1f, 4096, 1024) }
+        val stat = ModernStatCard(0, "TEST", java.awt.Color(16, 185, 129)).apply { setSize(160, 70) }
+        try {
+            val canvas = java.awt.image.BufferedImage(320, 180, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+            val cg = canvas.createGraphics()
+            hero.paint(cg)
+            spark.paint(cg)
+            stat.paint(cg)
+            cg.dispose()
+        } finally {
+            hero.stop()
+        }
+    }
+
     println()
     println("RESULT: $passed passed, ${failures.size} failed")
     if (failures.isNotEmpty()) {

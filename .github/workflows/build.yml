@@ -103,7 +103,9 @@ jobs:
           retention-days: 30
 
   android-emulator-test:
+    name: Android Emulator (KVM x86_64)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
@@ -116,6 +118,12 @@ jobs:
         run: |
           rustup toolchain install 1.99.1 --profile minimal -c clippy,rustfmt -t x86_64-linux-android -t aarch64-linux-android
 
+      - name: Android SDK platform 37.0 and NDK 30
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null
+          "$SDKM" "platforms;android-37.0" "ndk;30.0.16248370"
+
       - name: Build x86_64 Debug APK
         run: ./gradlew --no-daemon -Pfreedom.includeX86_64=true :Android:assembleDebug
 
@@ -125,23 +133,34 @@ jobs:
           unset XDG_CONFIG_HOME
           export ANDROID_USER_HOME="$HOME/.android"
           mkdir -p "$ANDROID_USER_HOME/avd"
+          if [ -e /dev/kvm ] && [ ! -w /dev/kvm ]; then
+            sudo -n chmod 666 /dev/kvm 2>/dev/null || true
+          fi
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           export PATH="$SDK_ROOT/cmdline-tools/latest/bin:$SDK_ROOT/platform-tools:$SDK_ROOT/emulator:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "emulator" "system-images;android-35;google_apis;x86_64"
           echo "no" | avdmanager create avd -n freedom_avd -k "system-images;android-35;google_apis;x86_64" --path "$HOME/.android/avd/freedom_avd.avd" --force
-          emulator -avd freedom_avd -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect &
+          emulator -avd freedom_avd -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect &
           EMU_PID=$!
           trap 'kill $EMU_PID 2>/dev/null || true' EXIT
           adb wait-for-device
-          for i in $(seq 1 90); do
+          BOOT=""
+          for i in $(seq 1 120); do
             BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
             if [ "$BOOT" = "1" ]; then break; fi
             sleep 2
           done
+          if [ "$BOOT" != "1" ]; then
+            echo "Emulator failed to finish booting in time"
+            exit 1
+          fi
+          adb shell wm dismiss-keyguard >/dev/null 2>&1 || true
+          adb shell input keyevent 82 >/dev/null 2>&1 || true
+          adb shell settings put global close_quic_connection -1 >/dev/null 2>&1 || true
           adb install -r -d Android/build/outputs/apk/debug/Android-debug.apk
           adb logcat -c
-          adb shell am start -n com.freedom.network/.MainActivity
+          adb shell am start -W -n com.freedom.network/.MainActivity
           sleep 5
           CRASHES=$(adb logcat -d -s AndroidRuntime:E | grep -E "FATAL EXCEPTION|com.freedom.network" || true)
           if [ -n "$CRASHES" ]; then
@@ -149,4 +168,10 @@ jobs:
             echo "$CRASHES"
             exit 1
           fi
-          echo "Android Emulator smoke test PASSED"
+          PID=$(adb shell pidof com.freedom.network 2>/dev/null | tr -d '\r' || true)
+          if [ -z "$PID" ]; then
+            echo "com.freedom.network process did not stay alive!"
+            adb logcat -d | tail -n 80
+            exit 1
+          fi
+          echo "Android Emulator smoke test PASSED (PID=$PID)"
