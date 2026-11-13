@@ -391,6 +391,11 @@ pub mod tags {
         pub const ACTIVE: u8 = 18;
         pub const VISION_SPLICE: u8 = 19;
         pub const REALITY_DEST: u8 = 20;
+        pub const PERSONA: u8 = 21;
+        pub const BLOCK_TRACKERS: u8 = 22;
+        pub const STRIP_PARAMS: u8 = 23;
+        pub const TRACKERS_BLOCKED: u8 = 24;
+        pub const PARAMS_STRIPPED: u8 = 25;
     }
 }
 
@@ -458,6 +463,12 @@ pub mod wire {
         }
         pub fn get_bytes(&self, tag: u8) -> Option<&[u8]> {
             self.fields.iter().find_map(|(t, v)| match v {
+                Value::Bytes(b) if *t == tag => Some(b.as_slice()),
+                _ => None,
+            })
+        }
+        pub fn bytes_all(&self, tag: u8) -> impl Iterator<Item = &[u8]> + '_ {
+            self.fields.iter().filter_map(move |(t, v)| match v {
                 Value::Bytes(b) if *t == tag => Some(b.as_slice()),
                 _ => None,
             })
@@ -2255,6 +2266,12 @@ pub mod desync {
         pub drop_spoofed_rst: bool,
         /// Local proxy listen port (0 = OS-assigned ephemeral port).
         pub listen_port: u16,
+        /// Optional futuristic device persona id (`iphone19`, `android19`, `pixel14`, or empty).
+        pub persona: String,
+        /// Block telemetry, ad, and geo-beacon hosts directly inside LocalProxy.
+        pub block_trackers: bool,
+        /// Strip URL query tracking parameters (`utm_*`, `fbclid`, `gclid`, ...) on plaintext HTTP.
+        pub strip_url_params: bool,
     }
 
     impl Default for DesyncConfig {
@@ -2265,6 +2282,9 @@ pub mod desync {
                 split_pos: 2,
                 drop_spoofed_rst: true,
                 listen_port: 0,
+                persona: String::new(),
+                block_trackers: true,
+                strip_url_params: true,
             }
         }
     }
@@ -2289,12 +2309,22 @@ pub mod desync {
                 .get_int(t::PORT)
                 .and_then(|v| u16::try_from(v.clamp(0, 65535)).ok())
                 .unwrap_or(d.listen_port);
+            let persona = r.get_text(t::PERSONA).unwrap_or("").to_owned();
+            let block_trackers = r
+                .get_int(t::BLOCK_TRACKERS)
+                .map_or(d.block_trackers, |v| v != 0);
+            let strip_url_params = r
+                .get_int(t::STRIP_PARAMS)
+                .map_or(d.strip_url_params, |v| v != 0);
             Self {
                 mode,
                 fake_ttl,
                 split_pos,
                 drop_spoofed_rst,
                 listen_port,
+                persona,
+                block_trackers,
+                strip_url_params,
             }
         }
     }
@@ -3369,8 +3399,8 @@ pub mod desync {
     }
 
     /// Writes a payload over `stream` applying socket-level DPI desynchronization
-    /// (`TCP_NODELAY` + optional low-TTL decoy + multi-segment SNI/ECH split writes
-    /// + `xtls-rprx-vision` direct splice transition tracking).
+    /// (`TCP_NODELAY` + HTTP privacy sanitization/persona + TLS record-level splitting +
+    /// optional low-TTL decoy + multi-segment SNI/ECH split writes + `xtls-rprx-vision` splice).
     pub fn write_desync_stream(
         stream: &mut TcpStream,
         payload: &[u8],
@@ -3385,26 +3415,50 @@ pub mod desync {
             stats.vision_splice.fetch_add(1, Ordering::Relaxed);
             return stream.write_all(payload);
         }
-        let info = inspect_l7(payload, cfg.split_pos);
+        let mut owned_payload: Option<Vec<u8>> = None;
+        let initial_info = inspect_l7(payload, cfg.split_pos);
+        if initial_info.protocol == PROTO_HTTP_REQUEST
+            && (cfg.strip_url_params || !cfg.persona.is_empty())
+        {
+            let (sanitized, stripped) = crate::oblivious::sanitize_http_payload(
+                payload,
+                cfg.strip_url_params,
+                &cfg.persona,
+            );
+            if stripped > 0 {
+                stats.params_stripped.fetch_add(stripped, Ordering::Relaxed);
+            }
+            if sanitized != payload {
+                owned_payload = Some(sanitized);
+            }
+        }
+        let active_payload = owned_payload.as_deref().unwrap_or(payload);
+        let info = if owned_payload.is_some() {
+            inspect_l7(active_payload, cfg.split_pos)
+        } else {
+            initial_info
+        };
+
         if info.protocol == PROTO_TLS_CLIENT_HELLO {
             stats.tls_split.fetch_add(1, Ordering::Relaxed);
         } else if info.protocol == PROTO_HTTP_REQUEST {
             stats.http_split.fetch_add(1, Ordering::Relaxed);
         } else {
-            return stream.write_all(payload);
+            return stream.write_all(active_payload);
         }
 
         let ipv6 = stream.peer_addr().is_ok_and(|a| a.is_ipv6());
-        let ranges = slice_ranges(payload.len(), &info.split_offsets);
+        let ranges = slice_ranges(active_payload.len(), &info.split_offsets);
 
         // Low-TTL decoy segment on the initial prefix when requested and supported by OS
         if matches!(
             cfg.mode,
             DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
         ) {
-            let first_end = ranges.first().map_or(2, |r| r.1).min(payload.len());
+            let first_end = ranges.first().map_or(2, |r| r.1).min(active_payload.len());
             if sys::set_tcp_ttl(stream, ipv6, u32::from(cfg.fake_ttl)).is_ok() {
-                let decoy = make_decoy_payload_for_mode(&payload[..first_end], &info, cfg.mode);
+                let decoy =
+                    make_decoy_payload_for_mode(&active_payload[..first_end], &info, cfg.mode);
                 let _ = stream.write(&decoy);
                 let _ = stream.flush();
                 let _ = sys::set_tcp_ttl(stream, ipv6, 64);
@@ -3412,9 +3466,32 @@ pub mod desync {
             }
         }
 
-        for (start, end) in ranges {
-            stream.write_all(&payload[start..end])?;
-            stream.flush()?;
+        // For TLS ClientHello, split into multiple valid TLSPlaintext (0x16) records at SNI/ECH boundaries
+        // so both stateful TCP reassemblers and record-boundary DPI inspectors fail to match SNI/ECH.
+        if info.protocol == PROTO_TLS_CLIENT_HELLO
+            && let Some(fragmented) =
+                fragment_tls_client_hello_records(active_payload, cfg.split_pos)
+        {
+            let mut pos = 0usize;
+            while pos + 5 <= fragmented.len() {
+                let rlen = usize::from(u16::from_be_bytes([
+                    fragmented[pos + 3],
+                    fragmented[pos + 4],
+                ]));
+                let end = (pos + 5 + rlen).min(fragmented.len());
+                stream.write_all(&fragmented[pos..end])?;
+                stream.flush()?;
+                pos = end;
+            }
+            if pos < fragmented.len() {
+                stream.write_all(&fragmented[pos..])?;
+                stream.flush()?;
+            }
+        } else {
+            for (start, end) in ranges {
+                stream.write_all(&active_payload[start..end])?;
+                stream.flush()?;
+            }
         }
         if cfg.mode == DesyncMode::RealityVision && info.protocol == PROTO_TLS_CLIENT_HELLO {
             stats.vision_splice.fetch_add(1, Ordering::Relaxed);
@@ -3430,6 +3507,8 @@ pub mod desync {
         pub fake_sent: AtomicU64,
         pub rst_dropped: AtomicU64,
         pub vision_splice: AtomicU64,
+        pub trackers_blocked: AtomicU64,
+        pub params_stripped: AtomicU64,
     }
 
     /// Unprivileged local SOCKS5 (RFC 1928) + HTTP CONNECT DPI-circumvention proxy.
@@ -3523,6 +3602,13 @@ pub mod desync {
         }
     }
 
+    fn bare_host(host_port: &str) -> &str {
+        if let Some(rest) = host_port.strip_prefix('[') {
+            return rest.split(']').next().unwrap_or(host_port);
+        }
+        host_port.split(':').next().unwrap_or(host_port)
+    }
+
     fn handle_proxy_client(
         mut client: TcpStream,
         cfg: &DesyncConfig,
@@ -3575,6 +3661,13 @@ pub mod desync {
                     return Ok(());
                 }
                 let host = std::str::from_utf8(&req[5..5 + dlen]).unwrap_or("");
+                if cfg.block_trackers && crate::oblivious::is_tracker_or_ad_domain(host) {
+                    counters.trackers_blocked.fetch_add(1, Ordering::Relaxed);
+                    // 0x02 = connection not allowed by ruleset (RFC 1928 §6)
+                    let _ = client.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                    let _ = client.flush();
+                    return Ok(());
+                }
                 let port = u16::from_be_bytes([req[5 + dlen], req[6 + dlen]]);
                 format!("{host}:{port}")
             }
@@ -3616,6 +3709,15 @@ pub mod desync {
             let line_end = ascii::scan_pattern(initial, b"\r\n").unwrap_or(initial.len());
             let line = std::str::from_utf8(&initial[8..line_end]).unwrap_or("");
             let host_port = line.split_whitespace().next().unwrap_or("");
+            if cfg.block_trackers && crate::oblivious::is_tracker_or_ad_domain(bare_host(host_port))
+            {
+                counters.trackers_blocked.fetch_add(1, Ordering::Relaxed);
+                let _ = client.write_all(
+                    b"HTTP/1.1 403 Blocked by Freedom Network\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = client.flush();
+                return Ok(());
+            }
             let mut upstream = connect_target(host_port)?;
             client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
             client.flush()?;
@@ -3630,11 +3732,32 @@ pub mod desync {
             if info.host.is_empty() {
                 return Ok(());
             }
-            let target = if info.host.contains(':') {
-                info.host.clone()
-            } else {
-                format!("{}:80", info.host)
-            };
+            if cfg.block_trackers && crate::oblivious::is_tracker_or_ad_domain(&info.host) {
+                counters.trackers_blocked.fetch_add(1, Ordering::Relaxed);
+                let _ = client.write_all(
+                    b"HTTP/1.1 403 Blocked by Freedom Network\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = client.flush();
+                return Ok(());
+            }
+            let target = ascii::scan_pattern(initial, b"\r\nHost:")
+                .or_else(|| ascii::scan_pattern(initial, b"\r\nhost:"))
+                .and_then(|p| {
+                    let rest = &initial[p + 7..];
+                    let end = ascii::scan_pattern(rest, b"\r\n").unwrap_or(rest.len());
+                    std::str::from_utf8(&rest[..end]).ok().map(str::trim)
+                })
+                .filter(|h| !h.is_empty())
+                .map_or_else(
+                    || format!("{}:80", info.host),
+                    |h| {
+                        if h.contains(':') {
+                            h.to_owned()
+                        } else {
+                            format!("{h}:80")
+                        }
+                    },
+                );
             let mut upstream = connect_target(&target)?;
             write_desync_stream(&mut upstream, initial, cfg, counters)?;
             relay_bidirectional(client, upstream)
@@ -4465,22 +4588,60 @@ pub mod oblivious {
     }
 
     /// Checks whether a queried hostname matches well-known telemetry/ad/tracker sinkhole patterns
-    /// when the user enables Privacy Tracker Guard.
+    /// when the user enables Privacy Tracker Guard (synchronized with Kotlin `IpPackets.TRACKER_SUFFIXES`).
     pub fn is_tracker_or_ad_domain(host: &str) -> bool {
         let lower = ascii::lowercased(host.trim_end_matches('.'));
-        const TRACKER_SUFFIXES: [&str; 12] = [
+        const TRACKER_SUFFIXES: [&str; 50] = [
             "doubleclick.net",
             "googlesyndication.com",
             "googleadservices.com",
             "google-analytics.com",
+            "analytics.google.com",
+            "adservice.google.com",
             "app-measurement.com",
-            "adsrvr.org",
-            "adnxs.com",
-            "criteo.com",
+            "appsflyer.com",
+            "adjust.com",
+            "branch.io",
+            "mixpanel.com",
+            "amplitude.com",
+            "hotjar.com",
             "taboola.com",
             "outbrain.com",
+            "criteo.com",
+            "pubmatic.com",
+            "rubiconproject.com",
             "scorecardresearch.com",
-            "branch.io",
+            "quantserve.com",
+            "unityads.unity3d.com",
+            "ads-api.tiktok.com",
+            "analytics.tiktok.com",
+            "ads.reddit.com",
+            "telemetry.mozilla.org",
+            "fpjs.io",
+            "fingerprintjs.com",
+            "fingerprint.com",
+            "location.services.mozilla.com",
+            "mls.services.mozilla.com",
+            "diagmon.samsung.com",
+            "samsungcloudsolution.com",
+            "metrics.icloud.com",
+            "metrics.apple.com",
+            "crashlytics.com",
+            "firebase-settings.crashlytics.com",
+            "vortex.data.microsoft.com",
+            "telemetry.microsoft.com",
+            "data.mistat.xiaomi.com",
+            "tracking.miui.com",
+            "singular.net",
+            "kochava.com",
+            "inmobi.com",
+            "applovin.com",
+            "ironsrc.com",
+            "vungle.com",
+            "sentry.io",
+            "datadoghq.com",
+            "segment.io",
+            "segment.com",
         ];
         TRACKER_SUFFIXES.iter().any(|suf| {
             lower == *suf
@@ -4488,6 +4649,251 @@ pub mod oblivious {
                     && lower.ends_with(suf)
                     && lower.as_bytes()[lower.len() - suf.len() - 1] == b'.')
         })
+    }
+
+    fn is_tracking_query_key(key: &str) -> bool {
+        let k = ascii::lowercased(key);
+        if k.starts_with("utm_") {
+            return true;
+        }
+        matches!(
+            k.as_str(),
+            "fbclid"
+                | "gclid"
+                | "dclid"
+                | "gbraid"
+                | "wbraid"
+                | "msclkid"
+                | "ttclid"
+                | "twclid"
+                | "li_fat_id"
+                | "igshid"
+                | "igsh"
+                | "si"
+                | "mc_cid"
+                | "mc_eid"
+                | "_hsenc"
+                | "_hsmi"
+                | "mkt_tok"
+                | "spm"
+                | "ref_src"
+                | "yclid"
+                | "zanpid"
+                | "_gl"
+                | "s_kwcid"
+                | "scid"
+        )
+    }
+
+    /// Strips tracking query parameters (`utm_*`, `fbclid`, `gclid`, `gbraid`, `wbraid`,
+    /// `igshid`, `igsh`, `si`, `mc_cid`, `mc_eid`, `_hsenc`, `spm`, etc.) from a request target URI
+    /// while preserving functional query parameters and fragments. Returns `(cleaned_target, stripped_count)`.
+    pub fn strip_url_tracking_params(target: &str) -> (String, u64) {
+        let Some(q_idx) = target.find('?') else {
+            return (target.to_owned(), 0);
+        };
+        let path = &target[..q_idx];
+        let rest = &target[q_idx + 1..];
+        let (query, frag) = match rest.find('#') {
+            Some(f_idx) => (&rest[..f_idx], &rest[f_idx..]),
+            None => (rest, ""),
+        };
+        let mut kept: Vec<&str> = Vec::new();
+        let mut stripped = 0u64;
+        for part in query.split('&') {
+            if part.is_empty() {
+                continue;
+            }
+            let key = part.split('=').next().unwrap_or("");
+            if is_tracking_query_key(key) {
+                stripped += 1;
+            } else {
+                kept.push(part);
+            }
+        }
+        if stripped == 0 {
+            return (target.to_owned(), 0);
+        }
+        let mut out = String::with_capacity(target.len());
+        out.push_str(path);
+        if !kept.is_empty() {
+            out.push('?');
+            for (i, item) in kept.iter().enumerate() {
+                if i > 0 {
+                    out.push('&');
+                }
+                out.push_str(item);
+            }
+        }
+        out.push_str(frag);
+        (out, stripped)
+    }
+
+    struct PersonaHeaders {
+        ua: &'static str,
+        ch_ua: &'static str,
+        ch_model: &'static str,
+        ch_platform: &'static str,
+        ch_platform_ver: &'static str,
+        ch_mobile: &'static str,
+    }
+
+    fn persona_profile(id: &str) -> Option<PersonaHeaders> {
+        match ascii::lowercased(id).as_str() {
+            "iphone19" => Some(PersonaHeaders {
+                ua: "Mozilla/5.0 (iPhone19,3; CPU iPhone OS 21_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/21.0 Mobile/25A109 Safari/604.1",
+                ch_ua: "\"Safari\";v=\"21\", \"Not_A Brand\";v=\"99\"",
+                ch_model: "\"iPhone 19 Beta\"",
+                ch_platform: "\"iOS\"",
+                ch_platform_ver: "\"21.0.0\"",
+                ch_mobile: "?1",
+            }),
+            "android19" => Some(PersonaHeaders {
+                ua: "Mozilla/5.0 (Linux; Android 19; Quantum-X99) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36",
+                ch_ua: "\"Chromium\";v=\"148\", \"Not_A Brand\";v=\"99\"",
+                ch_model: "\"Quantum-X99 Beta\"",
+                ch_platform: "\"Android\"",
+                ch_platform_ver: "\"19.0.0\"",
+                ch_mobile: "?1",
+            }),
+            "pixel14" => Some(PersonaHeaders {
+                ua: "Mozilla/5.0 (Linux; Android 19; Pixel 14 Ultra Proto) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36",
+                ch_ua: "\"Google Chrome\";v=\"149\", \"Not_A Brand\";v=\"99\"",
+                ch_model: "\"Pixel 14 Ultra Proto\"",
+                ch_platform: "\"Android\"",
+                ch_platform_ver: "\"19.0.0\"",
+                ch_mobile: "?1",
+            }),
+            _ => None,
+        }
+    }
+
+    /// Sanitizes an HTTP/1.x request payload:
+    /// - Strips tracking query parameters (`utm_*`, `fbclid`, `gclid`, ...) from the request line
+    /// - Strips forwarding/client-IP and geo headers (`X-Forwarded-For`, `X-Geo-Location`, ...)
+    /// - Replaces identifying `User-Agent` / `Sec-CH-UA-*` headers with the chosen synthetic persona.
+    pub fn sanitize_http_payload(
+        payload: &[u8],
+        strip_url_params: bool,
+        persona_id: &str,
+    ) -> (Vec<u8>, u64) {
+        if payload.len() < 16 || !payload[0].is_ascii_uppercase() {
+            return (payload.to_vec(), 0);
+        }
+        let scan_end = payload.len().min(8192);
+        let Some(hdr_end) = ascii::scan_pattern(&payload[..scan_end], b"\r\n\r\n") else {
+            return (payload.to_vec(), 0);
+        };
+        let Ok(head_str) = std::str::from_utf8(&payload[..hdr_end]) else {
+            return (payload.to_vec(), 0);
+        };
+        let mut lines = head_str.split("\r\n");
+        let Some(first_line) = lines.next() else {
+            return (payload.to_vec(), 0);
+        };
+        if !first_line.contains("HTTP/1.") {
+            return (payload.to_vec(), 0);
+        }
+
+        let mut changed = false;
+        let mut stripped_params = 0u64;
+        let cleaned_first = if strip_url_params {
+            let mut parts = first_line.splitn(3, ' ');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(method), Some(target), Some(ver)) => {
+                    let (new_target, cnt) = strip_url_tracking_params(target);
+                    if cnt > 0 {
+                        stripped_params += cnt;
+                        changed = true;
+                        format!("{method} {new_target} {ver}")
+                    } else {
+                        first_line.to_owned()
+                    }
+                }
+                _ => first_line.to_owned(),
+            }
+        } else {
+            first_line.to_owned()
+        };
+
+        let profile = persona_profile(persona_id);
+        let mut kept: Vec<String> = Vec::new();
+        kept.push(cleaned_first);
+        let mut saw_ua = false;
+
+        for line in lines {
+            let lower = ascii::lowercased(line);
+            let strip_always = lower.starts_with("x-forwarded-for:")
+                || lower.starts_with("forwarded:")
+                || lower.starts_with("via:")
+                || lower.starts_with("x-real-ip:")
+                || lower.starts_with("client-ip:")
+                || lower.starts_with("true-client-ip:")
+                || lower.starts_with("cf-connecting-ip:")
+                || lower.starts_with("x-originating-ip:")
+                || lower.starts_with("x-client-ip:")
+                || lower.starts_with("x-geo-location:")
+                || lower.starts_with("x-location:")
+                || lower.starts_with("geo-position:");
+            let strip_persona = profile.is_some()
+                && (lower.starts_with("x-requested-with:")
+                    || lower.starts_with("x-device-model:")
+                    || lower.starts_with("x-device-brand:"));
+            if strip_always || strip_persona {
+                changed = true;
+                continue;
+            }
+            if let Some(p) = &profile {
+                if lower.starts_with("user-agent:") {
+                    kept.push(format!("User-Agent: {}", p.ua));
+                    saw_ua = true;
+                    changed = true;
+                    continue;
+                } else if lower.starts_with("sec-ch-ua:") {
+                    kept.push(format!("Sec-CH-UA: {}", p.ch_ua));
+                    changed = true;
+                    continue;
+                } else if lower.starts_with("sec-ch-ua-model:") {
+                    kept.push(format!("Sec-CH-UA-Model: {}", p.ch_model));
+                    changed = true;
+                    continue;
+                } else if lower.starts_with("sec-ch-ua-platform:") {
+                    kept.push(format!("Sec-CH-UA-Platform: {}", p.ch_platform));
+                    changed = true;
+                    continue;
+                } else if lower.starts_with("sec-ch-ua-platform-version:") {
+                    kept.push(format!("Sec-CH-UA-Platform-Version: {}", p.ch_platform_ver));
+                    changed = true;
+                    continue;
+                } else if lower.starts_with("sec-ch-ua-mobile:") {
+                    kept.push(format!("Sec-CH-UA-Mobile: {}", p.ch_mobile));
+                    changed = true;
+                    continue;
+                } else if lower.starts_with("accept-language:") {
+                    kept.push("Accept-Language: en-US,en;q=0.9".to_owned());
+                    changed = true;
+                    continue;
+                }
+            }
+            kept.push(line.to_owned());
+        }
+
+        if let Some(p) = &profile
+            && !saw_ua
+        {
+            kept.push(format!("User-Agent: {}", p.ua));
+            changed = true;
+        }
+
+        if !changed {
+            return (payload.to_vec(), stripped_params);
+        }
+        let new_head = kept.join("\r\n");
+        let mut out = Vec::with_capacity(new_head.len() + 4 + (payload.len() - hdr_end - 4));
+        out.extend_from_slice(new_head.as_bytes());
+        out.extend_from_slice(b"\r\n\r\n");
+        out.extend_from_slice(&payload[hdr_end + 4..]);
+        (out, stripped_params)
     }
 }
 
@@ -5236,6 +5642,7 @@ pub mod wireguard {
         static_pub: [u8; 32],
         peer_static_pub: [u8; 32],
         psk: [u8; 32],
+        reserved: [u8; 3],
         cookie: Option<[u8; 16]>,
         next_index: u32,
         pending: Option<PendingHandshake>,
@@ -5250,11 +5657,21 @@ pub mod wireguard {
                 static_pub,
                 peer_static_pub,
                 psk: [0u8; 32],
+                reserved: [0u8; 3],
                 cookie: None,
                 next_index: 0x4652_0001,
                 pending: None,
                 transport: None,
             }
+        }
+
+        /// Sets the 3-byte WireGuard `reserved` header field (e.g. Cloudflare WARP `client_id` ECMP routing bytes).
+        pub fn set_reserved(&mut self, reserved: [u8; 3]) {
+            self.reserved = reserved;
+        }
+
+        pub fn reserved(&self) -> [u8; 3] {
+            self.reserved
         }
 
         /// Initiator step 1: generates a 148-byte WireGuard Type 1 Handshake Initiation packet.
@@ -5294,6 +5711,7 @@ pub mod wireguard {
 
             let mut pkt = [0u8; 148];
             pkt[0] = 1;
+            pkt[1..4].copy_from_slice(&self.reserved);
             pkt[4..8].copy_from_slice(&sender_idx.to_le_bytes());
             pkt[8..40].copy_from_slice(&eph_pub);
             pkt[40..88].copy_from_slice(&enc_static);
@@ -5496,7 +5914,7 @@ pub mod wireguard {
             let ct = aead_encrypt(&t.send_key, &nonce, &padded, &[]);
 
             let mut out = Vec::with_capacity(16 + ct.len());
-            out.extend_from_slice(&[4, 0, 0, 0]);
+            out.extend_from_slice(&[4, self.reserved[0], self.reserved[1], self.reserved[2]]);
             out.extend_from_slice(&t.remote_index.to_le_bytes());
             out.extend_from_slice(&counter.to_le_bytes());
             out.extend_from_slice(&ct);
@@ -5541,6 +5959,336 @@ pub mod wireguard {
         }
     }
 
+    // ---- AmneziaWG 2.0 / 3.1 Obfuscation & CPS Signature Engine ----
+
+    /// AmneziaWG 2.0/3.1 obfuscation parameters: junk packet burst (`Jc`, `Jmin`, `Jmax`),
+    /// per-type random prefix padding (`S1..S4`), randomized magic header ranges (`H1..H4`),
+    /// and Custom Protocol Signature (`I1..I5`) imitation templates.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AwgConfig {
+        pub jc: u8,
+        pub jmin: u16,
+        pub jmax: u16,
+        pub s1: u16,
+        pub s2: u16,
+        pub s3: u16,
+        pub s4: u16,
+        pub h1_range: (u32, u32),
+        pub h2_range: (u32, u32),
+        pub h3_range: (u32, u32),
+        pub h4_range: (u32, u32),
+        pub cps_i1: String,
+        pub cps_i2: String,
+        pub cps_i3: String,
+        pub cps_i4: String,
+        pub cps_i5: String,
+    }
+
+    impl Default for AwgConfig {
+        fn default() -> Self {
+            Self {
+                jc: 3,
+                jmin: 40,
+                jmax: 120,
+                s1: 0,
+                s2: 0,
+                s3: 0,
+                s4: 0,
+                h1_range: (1, 1),
+                h2_range: (2, 2),
+                h3_range: (3, 3),
+                h4_range: (4, 4),
+                cps_i1: String::new(),
+                cps_i2: String::new(),
+                cps_i3: String::new(),
+                cps_i4: String::new(),
+                cps_i5: String::new(),
+            }
+        }
+    }
+
+    impl AwgConfig {
+        /// Validates AmneziaWG structural invariants so packet lengths and `H1..H4` ranges remain unambiguous.
+        pub fn validate(&self) -> Result<(), &'static str> {
+            if self.s1 > 64 || self.s2 > 64 || self.s3 > 64 || self.s4 > 32 {
+                return Err("amneziawg padding bounds exceeded");
+            }
+            if self.s1 + 56 == self.s2 {
+                return Err("S1 + 56 must not equal S2");
+            }
+            if self.jmin > self.jmax || self.jmax > 1280 {
+                return Err("invalid Jmin/Jmax bounds");
+            }
+            let ranges = [self.h1_range, self.h2_range, self.h3_range, self.h4_range];
+            for &(lo, hi) in &ranges {
+                if lo > hi {
+                    return Err("inverted H range");
+                }
+            }
+            for i in 0..ranges.len() {
+                for j in (i + 1)..ranges.len() {
+                    if ranges[i].0 <= ranges[j].1 && ranges[j].0 <= ranges[i].1 {
+                        return Err("overlapping H1..H4 header ranges");
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn splitmix_next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn decode_hex_bytes(hex: &str, out: &mut Vec<u8>) {
+        let hex = hex.trim();
+        let hex = hex
+            .strip_prefix("0x")
+            .or_else(|| hex.strip_prefix("0X"))
+            .unwrap_or(hex);
+        let mut hi: Option<u8> = None;
+        for b in hex.bytes() {
+            let val = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                b' ' | b'\t' | b'x' | b'X' => continue,
+                _ => continue,
+            };
+            if let Some(h) = hi.take() {
+                out.push((h << 4) | val);
+            } else {
+                hi = Some(val);
+            }
+        }
+    }
+
+    /// Renders an AmneziaWG Custom Protocol Signature (CPS) template supporting:
+    /// - `<b 0x...>` static hex bytes
+    /// - `<t>` 4-byte big-endian Unix timestamp
+    /// - `<r N>` `N` pseudo-random bytes
+    /// - `<rc N>` `N` random alphanumeric ASCII chars
+    /// - `<rd N>` `N` random ASCII digits (`0..9`)
+    pub fn render_cps_template(template: &str, seed: u64, now_unix_secs: u32) -> Vec<u8> {
+        let mut rng = seed ^ 0x4652_444d_2026_0001;
+        let mut out = Vec::with_capacity(template.len().max(16));
+        let mut rest = template.trim();
+        while !rest.is_empty() {
+            if let Some(open) = rest.find('<') {
+                if open > 0 {
+                    out.extend_from_slice(&rest.as_bytes()[..open]);
+                }
+                let after = &rest[open + 1..];
+                let Some(close) = after.find('>') else {
+                    out.extend_from_slice(&rest.as_bytes()[open..]);
+                    break;
+                };
+                let tag = after[..close].trim();
+                let mut parts = tag.splitn(2, |c: char| c.is_ascii_whitespace());
+                let kind = parts.next().unwrap_or("");
+                let arg = parts.next().unwrap_or("").trim();
+                match kind {
+                    "b" => decode_hex_bytes(arg, &mut out),
+                    "t" => out.extend_from_slice(&now_unix_secs.to_be_bytes()),
+                    "r" => {
+                        let count = arg.parse::<usize>().unwrap_or(16).clamp(1, 1280);
+                        for _ in 0..count {
+                            out.push(splitmix_next(&mut rng) as u8);
+                        }
+                    }
+                    "rc" => {
+                        const ALNUM: &[u8] =
+                            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+                        let count = arg.parse::<usize>().unwrap_or(16).clamp(1, 1280);
+                        for _ in 0..count {
+                            let idx = (splitmix_next(&mut rng) as usize) % ALNUM.len();
+                            out.push(ALNUM[idx]);
+                        }
+                    }
+                    "rd" => {
+                        let count = arg.parse::<usize>().unwrap_or(8).clamp(1, 1280);
+                        for _ in 0..count {
+                            out.push(b'0' + (splitmix_next(&mut rng) % 10) as u8);
+                        }
+                    }
+                    _ => {}
+                }
+                rest = &after[close + 1..];
+            } else {
+                out.extend_from_slice(rest.as_bytes());
+                break;
+            }
+        }
+        out
+    }
+
+    /// Derives the 256-bit ChaCha20 header-protection key from a responder's WireGuard public key.
+    pub fn derive_awg_header_key(peer_static_pub: &[u8; 32]) -> [u8; 32] {
+        blake2s_two(b"amneziawg-hdr-v3", peer_static_pub)
+    }
+
+    /// Symmetric ChaCha20 keystream mask over the 16-byte WireGuard outer header using ciphertext
+    /// bytes `pkt[16..28]` as the 12-byte nonce (zero extra overhead on wire).
+    pub fn obfuscate_packet_header(header_key: &[u8; 32], pkt: &mut [u8]) -> bool {
+        if pkt.len() < 28 {
+            return false;
+        }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&pkt[16..28]);
+        let ks = chacha20_block(header_key, 0, &nonce);
+        for (dst, &k) in pkt[..16].iter_mut().zip(ks[..16].iter()) {
+            *dst ^= k;
+        }
+        true
+    }
+
+    /// Wraps a WireGuard Type 1..4 packet with AmneziaWG `S1..S4` prefix padding, `H1..H4` magic
+    /// header remapping, and optional ChaCha20 header key obfuscation.
+    pub fn wrap_awg_packet(
+        cfg: &AwgConfig,
+        pkt: &[u8],
+        header_key: Option<&[u8; 32]>,
+        seed: u64,
+    ) -> Option<Vec<u8>> {
+        if pkt.len() < 28 || cfg.validate().is_err() {
+            return None;
+        }
+        let (pad_len, h_range) = match pkt[0] {
+            1 => (usize::from(cfg.s1), cfg.h1_range),
+            2 => (usize::from(cfg.s2), cfg.h2_range),
+            3 => (usize::from(cfg.s3), cfg.h3_range),
+            4 => (usize::from(cfg.s4), cfg.h4_range),
+            _ => return None,
+        };
+        let mut rng = seed ^ (u64::from(pkt[0]) << 56);
+        let span = h_range.1 - h_range.0;
+        let h_val = if span == 0 {
+            h_range.0
+        } else {
+            h_range.0 + ((splitmix_next(&mut rng) as u32) % (span + 1))
+        };
+
+        let mut inner = pkt.to_vec();
+        if h_range != (u32::from(pkt[0]), u32::from(pkt[0])) {
+            inner[0..4].copy_from_slice(&h_val.to_le_bytes());
+        }
+        if let Some(hk) = header_key
+            && !obfuscate_packet_header(hk, &mut inner)
+        {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(pad_len + inner.len());
+        for _ in 0..pad_len {
+            out.push(splitmix_next(&mut rng) as u8);
+        }
+        out.extend_from_slice(&inner);
+        Some(out)
+    }
+
+    /// Unwraps an AmneziaWG-wrapped WireGuard packet back into a canonical Type 1..4 WireGuard frame.
+    pub fn unwrap_awg_packet(
+        cfg: &AwgConfig,
+        outer: &[u8],
+        header_key: Option<&[u8; 32]>,
+    ) -> Option<Vec<u8>> {
+        if cfg.validate().is_err() {
+            return None;
+        }
+        type AwgUnwrapSpec = (u8, usize, (u32, u32), bool, usize);
+        let specs: [AwgUnwrapSpec; 4] = [
+            (1, usize::from(cfg.s1), cfg.h1_range, true, 148),
+            (2, usize::from(cfg.s2), cfg.h2_range, true, 92),
+            (3, usize::from(cfg.s3), cfg.h3_range, true, 64),
+            (4, usize::from(cfg.s4), cfg.h4_range, false, 32),
+        ];
+        for &(msg_type, pad_len, (h_lo, h_hi), exact, expected_len) in &specs {
+            if outer.len() < pad_len + expected_len {
+                continue;
+            }
+            let inner_len = outer.len() - pad_len;
+            if exact && inner_len != expected_len {
+                continue;
+            }
+            if !exact && inner_len < expected_len {
+                continue;
+            }
+            let mut candidate = outer[pad_len..].to_vec();
+            if let Some(hk) = header_key
+                && !obfuscate_packet_header(hk, &mut candidate)
+            {
+                continue;
+            }
+            let hdr_word =
+                u32::from_le_bytes([candidate[0], candidate[1], candidate[2], candidate[3]]);
+            let matches_type = if (h_lo, h_hi) == (u32::from(msg_type), u32::from(msg_type)) {
+                candidate[0] == msg_type
+            } else {
+                (h_lo..=h_hi).contains(&hdr_word)
+            };
+            if matches_type {
+                if (h_lo, h_hi) != (u32::from(msg_type), u32::from(msg_type)) {
+                    candidate[0] = msg_type;
+                    candidate[1] = 0;
+                    candidate[2] = 0;
+                    candidate[3] = 0;
+                }
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Generates an AmneziaWG junk/CPS pre-handshake datagram burst and encodes it into a
+    /// `wire::Record` using `tags::desync::OUT_PACKET` frames for zero-overhead JNI transfer.
+    pub fn build_awg_preface_record(
+        jc: i32,
+        jmin: i32,
+        jmax: i32,
+        cps_template: Option<&str>,
+    ) -> crate::wire::Record {
+        let count = usize::try_from(jc.clamp(0, 64)).unwrap_or(0);
+        let min_len = usize::try_from(jmin.clamp(8, 1280)).unwrap_or(40);
+        let max_len = usize::try_from(jmax.clamp(min_len as i32, 1280)).unwrap_or(min_len);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1_770_000_000u32, |d| d.as_secs() as u32);
+        let seed = crate::probe::random_u64();
+        let mut rng = seed;
+        let mut rec = crate::wire::Record::with_status(crate::code::OK);
+        let mut emitted = 0usize;
+
+        if let Some(tpl) = cps_template {
+            for part in tpl.split(';') {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let rendered = render_cps_template(trimmed, splitmix_next(&mut rng), now_secs);
+                if !rendered.is_empty() {
+                    rec.bytes(crate::tags::desync::OUT_PACKET, &rendered);
+                    emitted += 1;
+                }
+            }
+        }
+
+        while emitted < count {
+            let span = (max_len - min_len).saturating_add(1);
+            let len = min_len + ((splitmix_next(&mut rng) as usize) % span);
+            let mut pkt = Vec::with_capacity(len);
+            for _ in 0..len {
+                pkt.push(splitmix_next(&mut rng) as u8);
+            }
+            rec.bytes(crate::tags::desync::OUT_PACKET, &pkt);
+            emitted += 1;
+        }
+        rec
+    }
+
     // ---- Opaque WireGuard Session Registry for JNI ----
 
     struct WgRegistry {
@@ -5577,6 +6325,18 @@ pub mod wireguard {
         r.items
             .push((h, Arc::new(Mutex::new(WgPeer::new(s_priv, p_pub)))));
         h
+    }
+
+    pub fn set_reserved(handle: i64, reserved3: &[u8]) -> i32 {
+        if reserved3.len() != 3 {
+            return crate::code::INVALID_ARGUMENT;
+        }
+        let Some(peer) = get_peer(handle) else {
+            return crate::code::INVALID_HANDLE;
+        };
+        let mut guard = peer.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.set_reserved([reserved3[0], reserved3[1], reserved3[2]]);
+        crate::code::OK
     }
 
     pub fn destroy_session(handle: i64) -> i32 {
@@ -8226,6 +8986,14 @@ pub mod engine {
                         .int(
                             tags::desync::VISION_SPLICE,
                             sat(c.vision_splice.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            tags::desync::TRACKERS_BLOCKED,
+                            sat(c.trackers_blocked.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            tags::desync::PARAMS_STRIPPED,
+                            sat(c.params_stripped.load(Ordering::Relaxed)),
                         );
                     *guard = Some(p);
                     out
@@ -8262,6 +9030,14 @@ pub mod engine {
                         .int(
                             t::VISION_SPLICE,
                             sat(c.vision_splice.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            t::TRACKERS_BLOCKED,
+                            sat(c.trackers_blocked.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            t::PARAMS_STRIPPED,
+                            sat(c.params_stripped.load(Ordering::Relaxed)),
                         );
                 }
                 None => {
@@ -8276,6 +9052,14 @@ pub mod engine {
                         .int(
                             t::VISION_SPLICE,
                             sat(c.vision_splice.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            t::TRACKERS_BLOCKED,
+                            sat(c.trackers_blocked.load(Ordering::Relaxed)),
+                        )
+                        .int(
+                            t::PARAMS_STRIPPED,
+                            sat(c.params_stripped.load(Ordering::Relaxed)),
                         );
                 }
             }
@@ -9466,6 +10250,52 @@ mod exports {
                 Some(out) => unsafe { respond(env, &out) },
                 None => null_mut(),
             }
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_wgSetReserved(
+        env: EnvPtr,
+        _class: JClass,
+        wg_handle: JLong,
+        reserved3: JByteArray,
+    ) -> JInt {
+        jni::guard(code::PANIC, || {
+            // SAFETY: JVM-provided env and array.
+            let Ok(b) = (unsafe { input(env, reserved3) }) else {
+                return code::INVALID_ARGUMENT;
+            };
+            crate::wireguard::set_reserved(wg_handle, &b)
+        })
+    }
+
+    /// # Safety
+    /// Called by the JVM with a valid `JNIEnv`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "system" fn Java_com_freedom_network_Native_wgBuildAwgPrefaces(
+        env: EnvPtr,
+        _class: JClass,
+        jc: JInt,
+        jmin: JInt,
+        jmax: JInt,
+        cps_template: JByteArray,
+    ) -> JByteArray {
+        jni::guard(null_mut(), || {
+            let tpl_bytes = if cps_template.is_null() {
+                None
+            } else {
+                // SAFETY: JVM-provided env and array.
+                unsafe { input(env, cps_template) }.ok()
+            };
+            let tpl_str = tpl_bytes
+                .as_deref()
+                .and_then(|b| std::str::from_utf8(b).ok());
+            let rec = crate::wireguard::build_awg_preface_record(jc, jmin, jmax, tpl_str);
+            let encoded = wire::encode(&rec).unwrap_or_else(|_| api::status_only(code::INTERNAL));
+            // SAFETY: JVM-provided env.
+            unsafe { respond(env, &encoded) }
         })
     }
 }

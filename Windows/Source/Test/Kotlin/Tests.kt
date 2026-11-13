@@ -1208,6 +1208,33 @@ fun main() {
         eq(roundTrip?.clientIpv4, parsed.clientIpv4, "serialized clientIpv4")
     }
 
+    test("URL tracking param stripping and WarpIdentity reservedBytes") {
+        val (cleanLine, changed) = IpPackets.stripUrlTrackingParamsFromRequestLine(
+            "GET /watch?v=123&utm_source=x&fbclid=abc&si=99 HTTP/1.1"
+        )
+        expect(changed) { "expected tracking params stripped" }
+        eq(cleanLine, "GET /watch?v=123 HTTP/1.1", "stripped request line")
+
+        val req = "GET /page?gclid=1&keep=yes HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-For: 1.2.3.4\r\n\r\n"
+            .toByteArray(Charsets.ISO_8859_1)
+        val sanitized = String(IpPackets.sanitizePlainHttpHeaders(req, DevicePersona.ANDROID_19_QUANTUM), Charsets.ISO_8859_1)
+        expect(sanitized.contains("GET /page?keep=yes HTTP/1.1")) { "sanitized url: $sanitized" }
+        expect(!sanitized.contains("X-Forwarded-For")) { "stripped X-Forwarded-For" }
+
+        val id = WarpIdentity(
+            privateKeyB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            peerPublicKeyB64 = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+            clientIpv4 = "172.16.0.2",
+            endpointHost = "162.159.192.1",
+            clientIdB64 = "wP4B",
+        )
+        val res = id.reservedBytes()
+        eq(res.size, 3, "reservedBytes length")
+        eq(res[0].toInt() and 0xFF, 0xC0, "reserved[0]")
+        eq(res[1].toInt() and 0xFF, 0xFE, "reserved[1]")
+        eq(res[2].toInt() and 0xFF, 0x01, "reserved[2]")
+    }
+
     println()
     println("RESULT: $passed passed, ${failures.size} failed")
     if (failures.isNotEmpty()) {

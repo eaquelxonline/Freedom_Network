@@ -115,4 +115,33 @@ val copyAndroidNative = tasks.register<Copy>("copyAndroidNative") {
     into(jniOut.map { it.dir("arm64-v8a") })
 }
 
-tasks.named("preBuild") { dependsOn(copyAndroidNative) }
+val includeX86_64 = providers.gradleProperty("freedom.includeX86_64").orNull == "true"
+
+val cargoBuildAndroidX86_64 = tasks.register<Exec>("cargoBuildAndroidX86_64") {
+    group = "build"
+    description = "Builds libfreedom.so for x86_64-linux-android (emulator)."
+    mustRunAfter(":nativeFormatCheck", ":nativeLint", ":nativeTest", ":nativeBuildHost")
+    val windowsHost = System.getProperty("os.name").startsWith("Windows")
+    val hostTag = if (windowsHost) "windows-x86_64" else "linux-x86_64"
+    val linker = androidComponents.sdkComponents.ndkDirectory.map {
+        it.file("toolchains/llvm/prebuilt/$hostTag/bin/x86_64-linux-android30-clang" + if (windowsHost) ".cmd" else "").asFile.absolutePath
+    }
+    workingDir(nativeDir)
+    inputs.property("linker", linker)
+    doFirst { environment("CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER", linker.get()) }
+    environment("CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS", "-C link-arg=-Wl,-z,max-page-size=16384")
+    commandLine("cargo", "build", "--release", "--locked", "--target", "x86_64-linux-android")
+}
+
+val copyAndroidNativeX86_64 = tasks.register<Copy>("copyAndroidNativeX86_64") {
+    dependsOn(cargoBuildAndroidX86_64)
+    from(nativeDir.file("target/x86_64-linux-android/release/libfreedom.so"))
+    into(jniOut.map { it.dir("x86_64") })
+}
+
+tasks.named("preBuild") {
+    dependsOn(copyAndroidNative)
+    if (includeX86_64) {
+        dependsOn(copyAndroidNativeX86_64)
+    }
+}

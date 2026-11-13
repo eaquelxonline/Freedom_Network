@@ -525,11 +525,17 @@ data class DesyncConfig(
     val splitPos: Int = 2,
     val dropRst: Boolean = true,
     val port: Int = 0,
+    val persona: String = "",
+    val blockTrackers: Boolean = true,
+    val stripUrlParams: Boolean = true,
 ) {
     fun toRecord(): Record = Record()
         .int(Tags.Desync.MODE, mode).int(Tags.Desync.FAKE_TTL, fakeTtl)
         .int(Tags.Desync.SPLIT_POS, splitPos).int(Tags.Desync.DROP_RST, if (dropRst) 1 else 0)
         .int(Tags.Desync.PORT, port)
+        .apply { if (persona.isNotEmpty()) text(Tags.Desync.PERSONA, persona) }
+        .int(Tags.Desync.BLOCK_TRACKERS, if (blockTrackers) 1 else 0)
+        .int(Tags.Desync.STRIP_PARAMS, if (stripUrlParams) 1 else 0)
 }
 
 data class DesyncResult(
@@ -541,6 +547,7 @@ data class ProxyStatus(
     val status: Int, val active: Boolean, val port: Int, val mode: Int,
     val connections: Long = 0, val tlsSplit: Long = 0, val httpSplit: Long = 0,
     val fakeSent: Long = 0, val rstDropped: Long = 0, val visionSplice: Long = 0,
+    val trackersBlocked: Long = 0, val paramsStripped: Long = 0,
 )
 
 object ServerStatus {
@@ -1318,7 +1325,7 @@ object Text {
         }
         appendLine("FREEDOM NETWORK (YEREL DPI AŞMA): Etkin · 127.0.0.1:${p.port} (SOCKS5 + HTTP CONNECT)")
         appendLine("  Strateji   : ${desyncMode(p.mode)}")
-        appendLine("  İstatistik : bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped} · Vision doğrudan aktarım ${p.visionSplice}")
+        appendLine("  İstatistik : bağlantı ${p.connections} · TLS bölme ${p.tlsSplit} · HTTP bölme ${p.httpSplit} · sahte paket ${p.fakeSent} · RST kalkanı ${p.rstDropped} · Vision doğrudan aktarım ${p.visionSplice} · izleyici engeli ${p.trackersBlocked} · URL temizleme ${p.paramsStripped}")
     }
 
     fun vpnStatus(
@@ -2228,10 +2235,46 @@ object IpPackets {
      * `X-Device-Model`, `X-Requested-With`, etc.) from plaintext HTTP/1.x requests and optionally
      * replaces device identity headers with a synthetic future [DevicePersona].
      */
+    private val TRACKING_QUERY_KEYS = setOf(
+        "fbclid", "gclid", "gbraid", "wbraid", "dclid", "msclkid", "ttclid",
+        "twclid", "yclid", "igshid", "mc_cid", "mc_eid", "_hsenc", "_hsmi",
+        "mkt_tok", "ref_src", "ref_url", "spm", "si", "oly_enc_id", "oly_anon_id",
+        "vero_id", "wickedid",
+    )
+
+    fun stripUrlTrackingParamsFromRequestLine(requestLine: String): Pair<String, Boolean> {
+        val sp1 = requestLine.indexOf(' ')
+        if (sp1 <= 0) return requestLine to false
+        val sp2 = requestLine.indexOf(' ', sp1 + 1)
+        if (sp2 <= sp1 + 1) return requestLine to false
+        val target = requestLine.substring(sp1 + 1, sp2)
+        val qIdx = target.indexOf('?')
+        if (qIdx < 0 || qIdx == target.lastIndex) return requestLine to false
+        val path = target.substring(0, qIdx)
+        val query = target.substring(qIdx + 1)
+        val parts = query.split('&')
+        val kept = ArrayList<String>(parts.size)
+        var stripped = false
+        for (part in parts) {
+            if (part.isEmpty()) continue
+            val eq = part.indexOf('=')
+            val key = (if (eq >= 0) part.substring(0, eq) else part).lowercase()
+            if (key.startsWith("utm_") || key in TRACKING_QUERY_KEYS) {
+                stripped = true
+            } else {
+                kept.add(part)
+            }
+        }
+        if (!stripped) return requestLine to false
+        val newTarget = if (kept.isEmpty()) path else "$path?${kept.joinToString("&")}"
+        return "${requestLine.substring(0, sp1 + 1)}$newTarget${requestLine.substring(sp2)}" to true
+    }
+
     fun sanitizePlainHttpHeaders(
         payload: ByteArray,
         persona: DevicePersona? = null,
         stripGeoHeaders: Boolean = true,
+        stripTrackingParams: Boolean = true,
     ): ByteArray {
         if (payload.size < 16) return payload
         val b0 = payload[0].toInt() and 0xFF
@@ -2246,7 +2289,13 @@ object IpPackets {
         var changed = false
         var sawUa = false
         val kept = ArrayList<String>(lines.size + 4)
-        kept.add(lines[0])
+        val (cleanReqLine, reqChanged) = if (stripTrackingParams) {
+            stripUrlTrackingParamsFromRequestLine(lines[0])
+        } else {
+            lines[0] to false
+        }
+        if (reqChanged) changed = true
+        kept.add(cleanReqLine)
         for (i in 1 until lines.size) {
             val line = lines[i]
             val lower = line.lowercase()
@@ -2610,6 +2659,8 @@ data class WarpIdentity(
     val deviceId: String = "",
     val accessToken: String = "",
     val createdAtMs: Long = System.currentTimeMillis(),
+    val clientIdB64: String = "",
+    val clientIpv6: String = "",
 ) {
     fun privateKeyBytes(): ByteArray? = runCatching {
         java.util.Base64.getDecoder().decode(privateKeyB64).takeIf { it.size == 32 }
@@ -2618,6 +2669,11 @@ data class WarpIdentity(
     fun peerPublicKeyBytes(): ByteArray? = runCatching {
         java.util.Base64.getDecoder().decode(peerPublicKeyB64).takeIf { it.size == 32 }
     }.getOrNull()
+
+    fun reservedBytes(): ByteArray {
+        val raw = runCatching { java.util.Base64.getDecoder().decode(clientIdB64) }.getOrNull()
+        return if (raw != null && raw.size >= 3) raw.copyOfRange(0, 3) else byteArrayOf(0, 0, 0)
+    }
 
     fun clientIpInt(): Int? = IpPackets.parseIpLiteral(clientIpv4)
 
@@ -2638,6 +2694,8 @@ data class WarpIdentity(
             deviceId,
             accessToken,
             createdAtMs.toString(),
+            clientIdB64,
+            clientIpv6,
         ).joinToString("|")
 
     companion object {
@@ -2654,6 +2712,8 @@ data class WarpIdentity(
                 deviceId = p.getOrNull(5)?.trim().orEmpty(),
                 accessToken = p.getOrNull(6)?.trim().orEmpty(),
                 createdAtMs = p.getOrNull(7)?.trim()?.toLongOrNull() ?: 0L,
+                clientIdB64 = p.getOrNull(8)?.trim().orEmpty(),
+                clientIpv6 = p.getOrNull(9)?.trim().orEmpty(),
             )
             return if (id.isValid()) id else null
         }
@@ -2708,6 +2768,9 @@ object WarpProvisioner {
         val addrIdx = json.indexOf("\"addresses\"")
         val rawV4 = if (addrIdx >= 0) extractJsonString(json, "v4", addrIdx) else extractJsonString(json, "v4")
         val clientIpv4 = rawV4?.substringBefore('/')?.trim().orEmpty()
+        val rawV6 = if (addrIdx >= 0) extractJsonString(json, "v6", addrIdx) else null
+        val clientIpv6 = rawV6?.substringBefore('/')?.trim().orEmpty()
+        val clientIdB64 = extractJsonString(json, "client_id").orEmpty()
         val peersIdx = json.indexOf("\"peers\"")
         val searchFrom = if (peersIdx >= 0) peersIdx else 0
         val peerPub = extractJsonString(json, "public_key", searchFrom).orEmpty()
@@ -2725,6 +2788,8 @@ object WarpProvisioner {
             endpointPort = if (port in 1..65535) port else 2408,
             deviceId = deviceId,
             accessToken = token,
+            clientIdB64 = clientIdB64,
+            clientIpv6 = clientIpv6,
         )
         return if (id.isValid()) id else null
     }
@@ -2923,6 +2988,7 @@ class WarpTunnel(
     @Volatile private var socket: DatagramSocket? = null
     @Volatile var activeEndpoint: InetSocketAddress? = null
     @Volatile var established: Boolean = false
+    @Volatile var handshakeRttMs: Long = 0L
     @Volatile private var lastRxMs: Long = 0L
     @Volatile private var lastTxMs: Long = 0L
     private var recvThread: Thread? = null
@@ -2942,14 +3008,17 @@ class WarpTunnel(
     private fun buildCandidates(): List<InetSocketAddress> {
         val list = ArrayList<Pair<String, Int>>()
         list.add(identity.endpointHost to identity.endpointPort)
-        for (p in intArrayOf(2408, 500, 4500, 1701, 894, 854)) {
+        for (p in intArrayOf(2408, 500, 4500, 1701, 894, 854, 4198, 7152, 8854)) {
             list.add(identity.endpointHost to p)
         }
-        list.add("162.159.192.1" to 2408)
-        list.add("162.159.193.1" to 2408)
-        list.add("162.159.192.1" to 500)
-        list.add("162.159.193.1" to 4500)
-        list.add("162.159.195.1" to 2408)
+        for (ip in arrayOf(
+            "162.159.192.1", "162.159.193.1", "162.159.195.1",
+            "188.114.96.1", "188.114.97.1", "188.114.98.1", "188.114.99.1",
+        )) {
+            list.add(ip to 2408)
+            list.add(ip to 500)
+            list.add(ip to 4500)
+        }
         return list.distinct().mapNotNull { (h, p) ->
             runCatching { InetSocketAddress(InetAddress.getByName(h), p) }.getOrNull()
         }
@@ -2962,6 +3031,7 @@ class WarpTunnel(
         val h = Native.wgCreate(priv, peerPub)
         if (h <= 0L) return false
         wgHandle.set(h)
+        runCatching { Native.wgSetReserved(h, identity.reservedBytes()) }
         val s = try {
             DatagramSocket().also { ds ->
                 protectDatagram(ds)
@@ -2982,6 +3052,17 @@ class WarpTunnel(
             return false
         }
         val candidates = buildCandidates()
+        val awgPrefaces = runCatching {
+            Native.wgBuildAwgPrefaces(2, 48, 96, null)?.let { raw ->
+                Wire.decode(raw).bytesAll(Tags.Desync.OUT_PACKET)
+            }
+        }.getOrNull().orEmpty()
+        for (ep in candidates.take(4)) {
+            for (junk in awgPrefaces) {
+                runCatching { s.send(DatagramPacket(junk, junk.size, ep)) }
+            }
+        }
+        val t0Ms = System.currentTimeMillis()
         for (ep in candidates) {
             runCatching { s.send(DatagramPacket(initPkt, initPkt.size, ep)) }
         }
@@ -3004,12 +3085,13 @@ class WarpTunnel(
                     activeEndpoint = dp.socketAddress as? InetSocketAddress ?: candidates.firstOrNull()
                     established = true
                     val now = System.currentTimeMillis()
+                    handshakeRttMs = (now - t0Ms).coerceAtLeast(1L)
                     lastRxMs = now
                     lastTxMs = now
                     sendIpPacket(ByteArray(0))
                     logger?.invoke(
                         "WarpTunnel",
-                        "WARP WireGuard el sıkışması tamamlandı -> ${activeEndpoint?.hostString}:${activeEndpoint?.port}",
+                        "WARP WireGuard el sıkışması tamamlandı (${handshakeRttMs}ms) -> ${activeEndpoint?.hostString}:${activeEndpoint?.port}",
                     )
                     return true
                 }
@@ -3188,7 +3270,8 @@ class TunBridge(
     private val udpTable = ConcurrentHashMap<FlowKey, UdpFlow>()
     private val dnsIpToHost = ConcurrentHashMap<Int, String>()
     private val virtualDnsIp: Int = IpPackets.parseIpLiteral(VPN_DNS_IP) ?: 0x0AD7AD02
-    private val dnsCache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
+    private val dnsCache = ConcurrentHashMap<String, Triple<Long, Long, ByteArray>>()
+    private val dnsRefreshInFlight = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var preferredDoh = 0
 
     val isExitRelayActive: Boolean get() = activeExitRelay != null
@@ -3208,6 +3291,8 @@ class TunBridge(
     val quicFallbacks = AtomicInteger(0)
     val tlsRecordFragmented = AtomicInteger(0)
     val dnsCacheHits = AtomicInteger(0)
+    val warpDnsFastHits = AtomicInteger(0)
+    val paramsStripped = AtomicInteger(0)
     val ipv6Rejected = AtomicInteger(0)
     val aaaaSuppressed = AtomicInteger(0)
     val trackersBlocked = AtomicInteger(0)
@@ -3716,9 +3801,33 @@ class TunBridge(
         // 1) TTL-bounded cache keyed by the query without its ID
         val cacheKey = query.copyOfRange(2, query.size).joinToString("") { "%02x".format(it) }
         val now = System.currentTimeMillis()
-        dnsCache[cacheKey]?.let { (expiry, msg) ->
-            if (expiry > now) {
+        dnsCache[cacheKey]?.let { (softExpiry, hardExpiry, msg) ->
+            if (softExpiry > now) {
                 dnsCacheHits.incrementAndGet()
+                return withId(msg, query)
+            }
+            if (hardExpiry > now) {
+                dnsCacheHits.incrementAndGet()
+                if (dnsRefreshInFlight.add(cacheKey)) {
+                    Thread({
+                        try {
+                            val dohWireBg = query.copyOf().also { it[0] = 0; it[1] = 0 }
+                            val eps = dohEndpoints.filter(Doh::validEndpoint)
+                            if (eps.isNotEmpty()) {
+                                val resp = dohFetcher(eps.first(), dohWireBg)
+                                val body = resp.body
+                                if (resp.transport == 1 && body != null && body.size >= 12 && !IpPackets.containsPoisonedDns(body)) {
+                                    val ttl = (IpPackets.dnsMinTtl(body) ?: 30L).coerceIn(10L, 600L)
+                                    val tNow = System.currentTimeMillis()
+                                    dnsCache[cacheKey] = Triple(tNow + ttl * 1000L, tNow + ttl * 1000L + 1_800_000L, body)
+                                }
+                            }
+                        } catch (_: Throwable) {
+                        } finally {
+                            dnsRefreshInFlight.remove(cacheKey)
+                        }
+                    }, "freedom-dns-swr").apply { isDaemon = true }.start()
+                }
                 return withId(msg, query)
             }
             dnsCache.remove(cacheKey)
@@ -3738,7 +3847,7 @@ class TunBridge(
             }
             val ttl = (IpPackets.dnsMinTtl(msg) ?: 30L).coerceIn(10L, 600L)
             if (dnsCache.size > 2048) dnsCache.clear()
-            dnsCache[cacheKey] = (now + ttl * 1000L) to msg
+            dnsCache[cacheKey] = Triple(now + ttl * 1000L, now + ttl * 1000L + 1_800_000L, msg)
             return withId(msg, query)
         }
         // 2) Encrypted DNS (RFC 8484, ID 0) — via Exit Relay first if active, else Happy Eyeballs parallel racing

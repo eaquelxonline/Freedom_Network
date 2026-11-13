@@ -2949,6 +2949,7 @@ fn desync_ipv4_and_ipv6_packet_split_disorder_and_fake_injection() {
         split_pos: 2,
         drop_spoofed_rst: true,
         listen_port: 0,
+        ..desync::DesyncConfig::default()
     };
     let out = desync::desync_packet(&raw_pkt, &cfg);
     assert!(!out.dropped_inbound);
@@ -3042,8 +3043,9 @@ fn desync_inbound_filter_drops_spoofed_rst_and_redirect() {
 #[test]
 fn local_proxy_socks5_and_http_connect_desync_roundtrip() {
     let ch = sample_tls_client_hello("proxy.example.org", true, false);
-    let expected_len = ch.len();
-    // Echo server on loopback that collects all bytes sent by the proxy
+    let expected_len =
+        desync::fragment_tls_client_hello_records(&ch, 2).map_or(ch.len(), |v| v.len());
+    // Echo server on loopback that collects all fragmented TLS record bytes sent by the proxy
     let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let up_port = upstream.local_addr().unwrap().port();
     let srv_thread = thread::spawn(move || {
@@ -3073,6 +3075,7 @@ fn local_proxy_socks5_and_http_connect_desync_roundtrip() {
         split_pos: 2,
         drop_spoofed_rst: true,
         listen_port: 0,
+        ..desync::DesyncConfig::default()
     };
     let mut proxy = desync::LocalProxy::start(cfg).unwrap();
     let pport = proxy.port();
@@ -3105,7 +3108,12 @@ fn local_proxy_socks5_and_http_connect_desync_roundtrip() {
     assert_eq!(&reply, b"SERVER_OK");
 
     let received = srv_thread.join().unwrap();
-    assert_eq!(received, ch);
+    assert!(
+        received.len() > ch.len(),
+        "must fragment TLS record on wire"
+    );
+    let reassembled = desync::reassemble_tls_records(&received).expect("valid multi-record TLS");
+    assert_eq!(reassembled, ch);
     assert_eq!(proxy.counters().tls_split.load(Ordering::Relaxed), 1);
     proxy.stop();
 }
@@ -3181,6 +3189,7 @@ fn reality_mlkem768_handshake_and_vision_flow_splice() {
         split_pos: 2,
         drop_spoofed_rst: true,
         listen_port: 0,
+        ..desync::DesyncConfig::default()
     };
     let out = desync::desync_packet(&pkt, &cfg);
     assert!(!out.dropped_inbound);
@@ -3655,4 +3664,212 @@ fn wireguard_crypto_rfc_vectors_and_tunnel_loopback() {
 
     assert_eq!(wireguard::destroy_session(init_handle), 0);
     assert_eq!(wireguard::destroy_session(init_handle), -2);
+}
+
+#[test]
+fn url_tracking_param_stripping_and_http_persona_sanitization() {
+    let (cleaned, n) = oblivious::strip_url_tracking_params(
+        "/watch?v=dQw4w9&utm_source=x&fbclid=123&gclid=abc&feature=share#top",
+    );
+    assert_eq!(cleaned, "/watch?v=dQw4w9&feature=share#top");
+    assert_eq!(n, 3);
+
+    let (cleaned_all, n2) =
+        oblivious::strip_url_tracking_params("/post?igshid=xyz&si=999&utm_campaign=fall");
+    assert_eq!(cleaned_all, "/post");
+    assert_eq!(n2, 3);
+
+    let raw = b"GET /news?id=42&utm_medium=social&gbraid=z9 HTTP/1.1\r\nHost: example.org\r\nX-Forwarded-For: 198.51.100.7\r\nX-Geo-Location: 41.0,29.0\r\nUser-Agent: RealAndroid/15\r\n\r\n";
+    let (sanitized, count) = oblivious::sanitize_http_payload(raw, true, "iphone19");
+    assert_eq!(count, 2);
+    let s = std::str::from_utf8(&sanitized).unwrap();
+    assert!(s.starts_with("GET /news?id=42 HTTP/1.1\r\n"));
+    assert!(!s.contains("X-Forwarded-For"));
+    assert!(!s.contains("X-Geo-Location"));
+    assert!(s.contains("iPhone19,3"));
+
+    // Synchronized 50-entry tracker list includes telemetry/fingerprinting domains
+    assert!(oblivious::is_tracker_or_ad_domain("api.fpjs.io"));
+    assert!(oblivious::is_tracker_or_ad_domain("diagmon.samsung.com"));
+    assert!(oblivious::is_tracker_or_ad_domain(
+        "vortex.data.microsoft.com"
+    ));
+    assert!(!oblivious::is_tracker_or_ad_domain("eff.org"));
+}
+
+#[test]
+fn local_proxy_blocks_trackers_and_sanitizes_http_requests() {
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let srv_thread = thread::spawn(move || {
+        let (mut conn, _) = upstream.accept().unwrap();
+        conn.set_read_timeout(Some(Duration::from_millis(2000)))
+            .unwrap();
+        let mut rec = Vec::new();
+        let mut buf = [0u8; 512];
+        while let Ok(n) = conn.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            rec.extend_from_slice(&buf[..n]);
+            if ascii::scan_pattern(&rec, b"\r\n\r\n").is_some() {
+                break;
+            }
+        }
+        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            .unwrap();
+        let _ = conn.flush();
+        rec
+    });
+
+    let cfg = desync::DesyncConfig {
+        mode: desync::DesyncMode::Split,
+        persona: "android19".to_owned(),
+        block_trackers: true,
+        strip_url_params: true,
+        ..desync::DesyncConfig::default()
+    };
+    let mut proxy = desync::LocalProxy::start(cfg).unwrap();
+    let pport = proxy.port();
+
+    // 1) SOCKS5 request to tracker domain must be blocked with reply 0x02 (not allowed)
+    {
+        let mut c = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, pport)).unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        let mut a = [0u8; 2];
+        c.read_exact(&mut a).unwrap();
+        let dom = b"metrics.doubleclick.net";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, dom.len() as u8];
+        req.extend_from_slice(dom);
+        req.extend_from_slice(&443u16.to_be_bytes());
+        c.write_all(&req).unwrap();
+        let mut resp = [0u8; 10];
+        c.read_exact(&mut resp).unwrap();
+        assert_eq!(resp[1], 0x02, "tracker domain must be denied by LocalProxy");
+    }
+
+    // 2) HTTP proxy CONNECT to tracker domain must return 403
+    {
+        let mut c = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, pport)).unwrap();
+        c.write_all(
+            b"CONNECT tracking.miui.com:443 HTTP/1.1\r\nHost: tracking.miui.com:443\r\n\r\n",
+        )
+        .unwrap();
+        let mut buf = [0u8; 128];
+        let n = c.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(s.starts_with("HTTP/1.1 403"));
+    }
+
+    // 3) Plain HTTP request to upstream via HTTP proxy strips tracking params + injects persona
+    {
+        let mut c = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, pport)).unwrap();
+        let req = format!(
+            "GET /item?sku=99&utm_source=ad&fbclid=777 HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\nX-Forwarded-For: 203.0.113.1\r\nUser-Agent: CustomLeak\r\n\r\n"
+        );
+        c.write_all(req.as_bytes()).unwrap();
+        let mut resp = [0u8; 64];
+        let n = c.read(&mut resp).unwrap();
+        assert!(std::str::from_utf8(&resp[..n]).unwrap().contains("200 OK"));
+    }
+
+    let upstream_seen = srv_thread.join().unwrap();
+    let seen_str = std::str::from_utf8(&upstream_seen).unwrap();
+    assert!(seen_str.starts_with("GET /item?sku=99 HTTP/1.1\r\n"));
+    assert!(!seen_str.contains("fbclid"));
+    assert!(!seen_str.contains("X-Forwarded-For"));
+    assert!(seen_str.contains("Android 19"));
+    assert_eq!(proxy.counters().trackers_blocked.load(Ordering::Relaxed), 2);
+    assert_eq!(proxy.counters().params_stripped.load(Ordering::Relaxed), 2);
+    proxy.stop();
+}
+
+#[test]
+fn wireguard_reserved_bytes_and_amneziawg_v2_v3_obfuscation() {
+    use crate::wireguard;
+
+    let alice_priv = [0x11u8; 32];
+    let bob_priv = [0x22u8; 32];
+    let a_pub = wireguard::x25519_public(&alice_priv);
+    let b_pub = wireguard::x25519_public(&bob_priv);
+
+    let mut responder = wireguard::WgPeer::new(bob_priv, a_pub);
+    let h = wireguard::create_session(&alice_priv, &b_pub);
+    let reserved = [0xA1u8, 0xB2, 0xC3];
+    assert_eq!(wireguard::set_reserved(h, &reserved), code::OK);
+    assert_eq!(wireguard::set_reserved(h, &[1, 2]), code::INVALID_ARGUMENT);
+    assert_eq!(wireguard::set_reserved(-9, &reserved), code::INVALID_HANDLE);
+
+    let tai = [0x40, 0, 0, 0, 0x69, 0x20, 0, 0, 0, 0, 0, 7];
+    let init_pkt = wireguard::handshake_init(h, &[0x33u8; 32], &tai).expect("init");
+    assert_eq!(&init_pkt[1..4], &reserved);
+    let resp_pkt = responder
+        .respond_initiation(&init_pkt, [0x44u8; 32])
+        .expect("responder must accept Type 1 with WARP reserved[3]");
+    assert_eq!(wireguard::consume_response(h, &resp_pkt), 0);
+
+    let ip_pkt = vec![
+        0x45, 0x00, 0x00, 0x18, 0, 1, 0x40, 0, 64, 17, 0, 0, 172, 16, 0, 2, 1, 1, 1, 1, b'T', b'E',
+        b'S', b'T',
+    ];
+    let enc_pkt = wireguard::encrypt_data(h, &ip_pkt).expect("type 4");
+    assert_eq!(&enc_pkt[1..4], &reserved);
+
+    // AmneziaWG validation rules
+    let bad_cfg = wireguard::AwgConfig {
+        s1: 10,
+        s2: 66, // 10 + 56 == 66 (forbidden)
+        ..wireguard::AwgConfig::default()
+    };
+    assert!(bad_cfg.validate().is_err());
+
+    let bad_h = wireguard::AwgConfig {
+        h1_range: (100, 200),
+        h2_range: (150, 250),
+        ..wireguard::AwgConfig::default()
+    };
+    assert!(bad_h.validate().is_err());
+
+    // Valid AmneziaWG 2.0/3.1 wrap/unwrap with S1..S4 + H1..H4 + ChaCha20 header key
+    let awg = wireguard::AwgConfig {
+        jc: 4,
+        jmin: 32,
+        jmax: 96,
+        s1: 18,
+        s2: 24,
+        s3: 12,
+        s4: 8,
+        h1_range: (100_000, 199_999),
+        h2_range: (200_000, 299_999),
+        h3_range: (300_000, 399_999),
+        h4_range: (400_000, 499_999),
+        ..wireguard::AwgConfig::default()
+    };
+    assert!(awg.validate().is_ok());
+    let hk = wireguard::derive_awg_header_key(&b_pub);
+    let wrapped = wireguard::wrap_awg_packet(&awg, &enc_pkt, Some(&hk), 0x9999).expect("wrap");
+    assert_eq!(wrapped.len(), enc_pkt.len() + usize::from(awg.s4));
+    let unwrapped = wireguard::unwrap_awg_packet(&awg, &wrapped, Some(&hk)).expect("unwrap");
+    assert_eq!(&unwrapped[16..], &enc_pkt[16..]);
+    let plain_back = responder
+        .decrypt_packet(&unwrapped)
+        .expect("decrypt unwrapped");
+    assert_eq!(plain_back, ip_pkt);
+
+    // CPS template engine (<b> hex, <t> timestamp, <r N>, <rc N>, <rd N>)
+    let cps = wireguard::render_cps_template("<b 0xc0fe><t><rd 4><rc 4><r 6>", 42, 1_770_000_123);
+    assert_eq!(cps.len(), 2 + 4 + 4 + 4 + 6);
+    assert_eq!(&cps[..2], &[0xc0, 0xfe]);
+    assert_eq!(&cps[2..6], &1_770_000_123u32.to_be_bytes());
+    assert!(cps[6..10].iter().all(|b| b.is_ascii_digit()));
+    assert!(cps[10..14].iter().all(|b| b.is_ascii_alphanumeric()));
+
+    let prefaces = wireguard::build_awg_preface_record(3, 40, 80, Some("<b cafe><r 8>"));
+    let outs: Vec<&[u8]> = prefaces.bytes_all(tags::desync::OUT_PACKET).collect();
+    assert_eq!(outs.len(), 3);
+    assert_eq!(outs[0].len(), 10);
+    assert_eq!(&outs[0][..2], &[0xca, 0xfe]);
+    assert!((40..=80).contains(&outs[1].len()));
+
+    assert_eq!(wireguard::destroy_session(h), 0);
 }
