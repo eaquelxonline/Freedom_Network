@@ -2184,9 +2184,11 @@ pub mod sysnet {
 ///    boundaries with `TCP_NODELAY` and low-TTL decoy writes.
 pub mod desync {
     use crate::wire::Record;
-    use crate::{ascii, code, quic, sys, tags};
+    use crate::{ascii, code, dns, probe, quic, tags};
     use std::io::{self, Read, Write};
-    use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::net::{
+        IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread::{self, JoinHandle};
@@ -3398,9 +3400,9 @@ pub mod desync {
         }
     }
 
-    /// Writes a payload over `stream` applying socket-level DPI desynchronization
-    /// (`TCP_NODELAY` + HTTP privacy sanitization/persona + TLS record-level splitting +
-    /// optional low-TTL decoy + multi-segment SNI/ECH split writes + `xtls-rprx-vision` splice).
+    /// Writes a payload over `stream` applying stream-safe socket-level DPI desynchronization
+    /// (`TCP_NODELAY` + HTTP privacy sanitization/persona + multi-record TLS `ClientHello` SNI/ECH
+    /// splitting + paced segment flushes + `xtls-rprx-vision` application-data splice).
     pub fn write_desync_stream(
         stream: &mut TcpStream,
         payload: &[u8],
@@ -3447,27 +3449,12 @@ pub mod desync {
             return stream.write_all(active_payload);
         }
 
-        let ipv6 = stream.peer_addr().is_ok_and(|a| a.is_ipv6());
         let ranges = slice_ranges(active_payload.len(), &info.split_offsets);
 
-        // Low-TTL decoy segment on the initial prefix when requested and supported by OS
-        if matches!(
-            cfg.mode,
-            DesyncMode::FakeAutoTtl | DesyncMode::AdaptiveFull | DesyncMode::RealityVision
-        ) {
-            let first_end = ranges.first().map_or(2, |r| r.1).min(active_payload.len());
-            if sys::set_tcp_ttl(stream, ipv6, u32::from(cfg.fake_ttl)).is_ok() {
-                let decoy =
-                    make_decoy_payload_for_mode(&active_payload[..first_end], &info, cfg.mode);
-                let _ = stream.write(&decoy);
-                let _ = stream.flush();
-                let _ = sys::set_tcp_ttl(stream, ipv6, 64);
-                stats.fake_sent.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
         // For TLS ClientHello, split into multiple valid TLSPlaintext (0x16) records at SNI/ECH boundaries
-        // so both stateful TCP reassemblers and record-boundary DPI inspectors fail to match SNI/ECH.
+        // with explicit inter-record flushes so OS TCP coalescing does not merge segments on the wire.
+        // Low-TTL / BadSum decoys stay strictly in raw L3 `desync_packet()` and are never injected onto
+        // connected stream sockets (which would corrupt TLS handshake sequence alignment).
         if info.protocol == PROTO_TLS_CLIENT_HELLO
             && let Some(fragmented) =
                 fragment_tls_client_hello_records(active_payload, cfg.split_pos)
@@ -3481,6 +3468,9 @@ pub mod desync {
                 let end = (pos + 5 + rlen).min(fragmented.len());
                 stream.write_all(&fragmented[pos..end])?;
                 stream.flush()?;
+                if end < fragmented.len() {
+                    thread::sleep(Duration::from_millis(2));
+                }
                 pos = end;
             }
             if pos < fragmented.len() {
@@ -3488,9 +3478,13 @@ pub mod desync {
                 stream.flush()?;
             }
         } else {
-            for (start, end) in ranges {
+            let last_idx = ranges.len().saturating_sub(1);
+            for (idx, (start, end)) in ranges.into_iter().enumerate() {
                 stream.write_all(&active_payload[start..end])?;
                 stream.flush()?;
+                if idx < last_idx {
+                    thread::sleep(Duration::from_millis(2));
+                }
             }
         }
         if cfg.mode == DesyncMode::RealityVision && info.protocol == PROTO_TLS_CLIENT_HELLO {
@@ -3764,17 +3758,121 @@ pub mod desync {
         }
     }
 
+    fn parse_host_port(host_port: &str) -> io::Result<(&str, u16)> {
+        let trimmed = host_port.trim();
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            let (host, after) = rest
+                .split_once(']')
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let port_str = after
+                .strip_prefix(':')
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let port: u16 = port_str
+                .parse()
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            return Ok((host, port));
+        }
+        let (host, port_str) = trimmed
+            .rsplit_once(':')
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        Ok((host, port))
+    }
+
+    pub fn is_clean_resolved_addr(host: &str, addr: &SocketAddr) -> bool {
+        let local_exempt = host.eq_ignore_ascii_case("localhost")
+            || host.ends_with(".local")
+            || host.ends_with(".test")
+            || host.ends_with(".example")
+            || host.ends_with(".invalid");
+        match addr.ip() {
+            IpAddr::V4(v4) => {
+                local_exempt
+                    || (!probe::is_poisoned_ipv4(&v4) && !v4.is_loopback() && !v4.is_unspecified())
+            }
+            IpAddr::V6(v6) => {
+                local_exempt
+                    || (!probe::is_poisoned_ipv6(&v6) && !v6.is_loopback() && !v6.is_unspecified())
+            }
+        }
+    }
+
+    pub fn filter_and_order_addrs(host: &str, raw: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut v4_addrs = Vec::new();
+        let mut v6_addrs = Vec::new();
+        for &sa in raw {
+            if is_clean_resolved_addr(host, &sa) {
+                if sa.is_ipv4() {
+                    if !v4_addrs.contains(&sa) {
+                        v4_addrs.push(sa);
+                    }
+                } else if !v6_addrs.contains(&sa) {
+                    v6_addrs.push(sa);
+                }
+            }
+        }
+        v4_addrs.extend(v6_addrs);
+        v4_addrs
+    }
+
+    fn resolve_clean_candidates(host_port: &str) -> io::Result<Vec<SocketAddr>> {
+        let (host, port) = parse_host_port(host_port)?;
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+        let mut raw = Vec::new();
+        if let Ok(os_addrs) = host_port.to_socket_addrs() {
+            raw.extend(os_addrs);
+        }
+        let saw_poison = raw.iter().any(|sa| !is_clean_resolved_addr(host, sa));
+        let mut candidates = filter_and_order_addrs(host, &raw);
+        if saw_poison || candidates.is_empty() {
+            for resolver in [
+                Ipv4Addr::new(1, 1, 1, 1),
+                Ipv4Addr::new(8, 8, 8, 8),
+                Ipv4Addr::new(9, 9, 9, 9),
+            ] {
+                let srv = SocketAddr::new(IpAddr::V4(resolver), 53);
+                if let Ok(ans) =
+                    probe::dns_exchange_tcp(srv, host, dns::TYPE_A, Duration::from_millis(1200))
+                {
+                    for rr in ans.response.answers {
+                        if let dns::RData::A(ip) = rr.data {
+                            let sa = SocketAddr::new(IpAddr::V4(ip), port);
+                            if is_clean_resolved_addr(host, &sa) && !candidates.contains(&sa) {
+                                candidates.push(sa);
+                            }
+                        }
+                    }
+                    if !candidates.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        Ok(candidates)
+    }
+
     fn connect_target(host_port: &str) -> io::Result<TcpStream> {
-        use std::net::ToSocketAddrs;
-        let mut addrs = host_port.to_socket_addrs()?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        let s = TcpStream::connect_timeout(&addr, Duration::from_millis(2500))?;
-        let _ = s.set_read_timeout(Some(Duration::from_millis(3000)));
-        let _ = s.set_write_timeout(Some(Duration::from_millis(3000)));
-        let _ = s.set_nodelay(true);
-        Ok(s)
+        let candidates = resolve_clean_candidates(host_port)?;
+        let mut last_err = io::Error::from(io::ErrorKind::NotFound);
+        for addr in candidates.iter().take(6) {
+            match TcpStream::connect_timeout(addr, Duration::from_millis(2000)) {
+                Ok(s) => {
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(3000)));
+                    let _ = s.set_write_timeout(Some(Duration::from_millis(3000)));
+                    let _ = s.set_nodelay(true);
+                    return Ok(s);
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
     }
 
     fn relay_bidirectional(mut client: TcpStream, mut upstream: TcpStream) -> io::Result<()> {
@@ -7807,6 +7905,11 @@ pub mod intel {
                 )
             });
 
+        let quic_timeout_targets = run
+            .targets
+            .iter()
+            .filter(|t| t.tcp_ok() && matches!(t.quic.status, Status::Timeout | Status::Refused))
+            .count();
         let env_v6 = env.map_or(UNKNOWN, |e| e.has_ipv6);
         for t in &run.targets {
             let h = t.target.host.as_str();
@@ -7978,13 +8081,21 @@ pub mod intel {
                     );
                 }
                 Status::Timeout | Status::Refused if h3 => {
+                    let conf = if quic_timeout_targets >= 2 { 90 } else { 65 };
                     b.add(
                         Category::QuicIncompatibility,
-                        65,
+                        conf,
                         vec![
                             obs(Obs::H3Advertised, h, &[]),
                             obs(Obs::QuicNoResponse, h, &[]),
                         ],
+                    );
+                }
+                Status::Timeout | Status::Refused if quic_timeout_targets >= 2 => {
+                    b.add(
+                        Category::Advisory,
+                        100,
+                        vec![obs(Obs::QuicNoResponse, h, &[])],
                     );
                 }
                 _ => {}

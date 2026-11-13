@@ -3873,3 +3873,121 @@ fn wireguard_reserved_bytes_and_amneziawg_v2_v3_obfuscation() {
 
     assert_eq!(wireguard::destroy_session(h), 0);
 }
+
+#[test]
+fn local_proxy_reality_vision_never_corrupts_tcp_stream_with_decoys() {
+    let ch = sample_tls_client_hello("discord.com", true, false);
+    let expected_len =
+        desync::fragment_tls_client_hello_records(&ch, 2).map_or(ch.len(), |v| v.len());
+    let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let srv_thread = thread::spawn(move || {
+        let (mut conn, _) = upstream.accept().unwrap();
+        let _ = conn.set_nodelay(true);
+        conn.set_read_timeout(Some(Duration::from_millis(3000)))
+            .unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 512];
+        while let Ok(n) = conn.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+            if received.len() >= expected_len {
+                break;
+            }
+        }
+        conn.write_all(b"TLS_HANDSHAKE_CLEAN").unwrap();
+        let _ = conn.flush();
+        received
+    });
+
+    let cfg = desync::DesyncConfig {
+        mode: desync::DesyncMode::RealityVision,
+        fake_ttl: 4,
+        split_pos: 2,
+        drop_spoofed_rst: true,
+        listen_port: 0,
+        ..desync::DesyncConfig::default()
+    };
+    let mut proxy = desync::LocalProxy::start(cfg).unwrap();
+    let pport = proxy.port();
+
+    let mut client = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, pport)).unwrap();
+    let _ = client.set_nodelay(true);
+    client
+        .set_read_timeout(Some(Duration::from_millis(3000)))
+        .unwrap();
+    let connect_req =
+        format!("CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\nHost: 127.0.0.1:{up_port}\r\n\r\n");
+    client.write_all(connect_req.as_bytes()).unwrap();
+    client.flush().unwrap();
+    let mut hdr_buf = [0u8; 256];
+    let n = client.read(&mut hdr_buf).unwrap();
+    assert!(std::str::from_utf8(&hdr_buf[..n]).unwrap().contains("200"));
+
+    client.write_all(&ch).unwrap();
+    client.flush().unwrap();
+    let mut reply = [0u8; 19];
+    client.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"TLS_HANDSHAKE_CLEAN");
+
+    let received = srv_thread.join().unwrap();
+    assert_eq!(received.len(), expected_len);
+    let reassembled = desync::reassemble_tls_records(&received)
+        .expect("RealityVision stream must reassemble cleanly without decoy corruption");
+    assert_eq!(reassembled, ch);
+    assert_eq!(proxy.counters().fake_sent.load(Ordering::Relaxed), 0);
+    assert_eq!(proxy.counters().tls_split.load(Ordering::Relaxed), 1);
+    proxy.stop();
+}
+
+#[test]
+fn desync_filter_and_order_addrs_drops_poisoned_and_prefers_v4() {
+    let raw = vec![
+        SocketAddr::from((
+            Ipv6Addr::new(0x2a01, 0x0358, 0x4014, 0x0a00, 0, 0, 0, 1),
+            443,
+        )),
+        SocketAddr::from((Ipv4Addr::new(195, 175, 254, 2), 443)),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+        SocketAddr::from((Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111), 443)),
+        SocketAddr::from((Ipv4Addr::new(162, 159, 135, 232), 443)),
+    ];
+    let filtered = desync::filter_and_order_addrs("discord.com", &raw);
+    assert_eq!(
+        filtered,
+        vec![
+            SocketAddr::from((Ipv4Addr::new(162, 159, 135, 232), 443)),
+            SocketAddr::from((Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111), 443)),
+        ]
+    );
+}
+
+#[test]
+fn classify_systemic_quic_timeouts_reaches_instant_recommend() {
+    let mut cf = healthy_target("cloudflare.com");
+    cf.dns.https = Some(dns::Svcb {
+        priority: 1,
+        alpn: vec!["h3".into(), "h2".into()],
+        ..dns::Svcb::default()
+    });
+    cf.quic.status = Status::Timeout;
+
+    let mut wiki = healthy_target("wikipedia.org");
+    wiki.quic.status = Status::Timeout;
+
+    let mut ietf = healthy_target("ietf.org");
+    ietf.quic.status = Status::Timeout;
+
+    let diags = intel::classify(
+        Some(&env_with(|_| {})),
+        &run_of(vec![cf, wiki, ietf], vec![resolver(true, false)]),
+    );
+    let q = has(&diags, Category::QuicIncompatibility).expect("QuicIncompatibility expected");
+    assert_eq!(q.confidence, 90);
+    let mut decider = decide::Decider::new(0, 10);
+    let dec = decider.step(1000, Some(663), &diags);
+    assert_eq!(dec.state, decide::State::Recommend);
+    assert_eq!(dec.action, decide::Action::PreferTcpFallback);
+}

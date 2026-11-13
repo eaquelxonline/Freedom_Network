@@ -2728,8 +2728,9 @@ data class WarpIdentity(
 /** Zero-config Cloudflare WARP WireGuard account provisioner via pure Rust X25519 + TLS. */
 object WarpProvisioner {
     private const val API_HOST = "api.cloudflareclient.com"
+    private const val ALT_API_HOST = "api.devices.cloudflare.com"
     private const val API_PATH = "/v0a2158/reg"
-    private val FALLBACK_API_IPS = listOf("162.159.137.105", "162.159.138.105", "104.16.80.230")
+    private val FALLBACK_API_IPS = listOf("162.159.137.105", "162.159.138.105", "104.16.80.230", "104.24.4.6")
 
     internal fun extractJsonString(json: String, key: String, startAt: Int = 0): String? {
         val needle = "\"$key\""
@@ -2829,6 +2830,7 @@ object WarpProvisioner {
         bearerToken: String = "",
         protectSocket: (Socket) -> Boolean,
         timeoutMs: Int = 5500,
+        apiHost: String = API_HOST,
     ): Pair<Int, String> {
         val raw = Socket()
         var ssl: SSLSocket? = null
@@ -2839,7 +2841,7 @@ object WarpProvisioner {
             raw.connect(InetSocketAddress(ip, 443), timeoutMs)
             raw.soTimeout = timeoutMs
             val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
-            ssl = factory.createSocket(raw, API_HOST, 443, true) as SSLSocket
+            ssl = factory.createSocket(raw, apiHost, 443, true) as SSLSocket
             val params = ssl.sslParameters
             params.endpointIdentificationAlgorithm = "HTTPS"
             ssl.sslParameters = params
@@ -2848,7 +2850,7 @@ object WarpProvisioner {
             val bodyBytes = bodyJson.toByteArray(Charsets.UTF_8)
             val sb = StringBuilder()
             sb.append("$method $path HTTP/1.1\r\n")
-            sb.append("Host: $API_HOST\r\n")
+            sb.append("Host: $apiHost\r\n")
             sb.append("User-Agent: okhttp/3.12.1\r\n")
             sb.append("Accept-Encoding: identity\r\n")
             sb.append("Content-Type: application/json; charset=UTF-8\r\n")
@@ -2908,21 +2910,25 @@ object WarpProvisioner {
         val out = ArrayList<InetAddress>()
         runCatching {
             DirectDohClient(protectSocket).use { doh ->
-                val q = Doh.query(API_HOST)
-                if (q != null) {
-                    val r = doh.post("https://1.1.1.1/dns-query", q, 2500)
-                    val b = r.body
-                    if (r.transport == 1 && b != null && !IpPackets.containsPoisonedDns(b)) {
-                        IpPackets.dnsAnswerAddresses(b)?.forEach { addr ->
-                            if (addr.size == 4) runCatching { out.add(InetAddress.getByAddress(addr)) }
+                for (hostName in arrayOf(API_HOST, ALT_API_HOST)) {
+                    val q = Doh.query(hostName)
+                    if (q != null) {
+                        val r = doh.post("https://1.1.1.1/dns-query", q, 2500)
+                        val b = r.body
+                        if (r.transport == 1 && b != null && !IpPackets.containsPoisonedDns(b)) {
+                            IpPackets.dnsAnswerAddresses(b)?.forEach { addr ->
+                                if (addr.size == 4) runCatching { out.add(InetAddress.getByAddress(addr)) }
+                            }
                         }
                     }
                 }
             }
         }
-        runCatching {
-            InetAddress.getAllByName(API_HOST).forEach { a ->
-                if (a is Inet4Address && !a.isLoopbackAddress && !a.isSiteLocalAddress) out.add(a)
+        for (hostName in arrayOf(API_HOST, ALT_API_HOST)) {
+            runCatching {
+                InetAddress.getAllByName(hostName).forEach { a ->
+                    if (a is Inet4Address && !a.isLoopbackAddress && !a.isSiteLocalAddress) out.add(a)
+                }
             }
         }
         for (ipStr in FALLBACK_API_IPS) {
@@ -2950,30 +2956,33 @@ object WarpProvisioner {
         val payload = "{\"install_id\":\"\",\"tos\":\"$tos\",\"key\":\"$pubB64\",\"fcm_token\":\"\",\"type\":\"Android\",\"model\":\"PC\",\"locale\":\"en_US\"}"
 
         val candidates = resolveApiCandidates(protectSocket)
-        for (ip in candidates) {
-            val res = runCatching {
-                httpsJsonRequest(ip, "POST", API_PATH, payload, "", protectSocket, 5000)
-            }.getOrNull() ?: continue
-            val (code, json) = res
-            if (code in 200..299 && json.isNotBlank()) {
-                val id = parseRegistrationJson(json, privB64)
-                if (id != null) {
-                    val enabled = extractJsonBool(json, "warp_enabled") ?: false
-                    if (!enabled && id.deviceId.isNotEmpty() && id.accessToken.isNotEmpty()) {
-                        runCatching {
-                            httpsJsonRequest(
-                                ip,
-                                "PATCH",
-                                "$API_PATH/${id.deviceId}",
-                                "{\"warp_enabled\":true}",
-                                id.accessToken,
-                                protectSocket,
-                                3500,
-                            )
+        for (apiHost in arrayOf(API_HOST, ALT_API_HOST)) {
+            for (ip in candidates) {
+                val res = runCatching {
+                    httpsJsonRequest(ip, "POST", API_PATH, payload, "", protectSocket, 5000, apiHost)
+                }.getOrNull() ?: continue
+                val (code, json) = res
+                if (code in 200..299 && json.isNotBlank()) {
+                    val id = parseRegistrationJson(json, privB64)
+                    if (id != null) {
+                        val enabled = extractJsonBool(json, "warp_enabled") ?: false
+                        if (!enabled && id.deviceId.isNotEmpty() && id.accessToken.isNotEmpty()) {
+                            runCatching {
+                                httpsJsonRequest(
+                                    ip,
+                                    "PATCH",
+                                    "$API_PATH/${id.deviceId}",
+                                    "{\"warp_enabled\":true}",
+                                    id.accessToken,
+                                    protectSocket,
+                                    3500,
+                                    apiHost,
+                                )
+                            }
                         }
+                        logger?.invoke("WarpProvisioner", "WARP hesabı hazır (${id.clientIpv4} -> ${id.endpointHost}:${id.endpointPort})")
+                        return id
                     }
-                    logger?.invoke("WarpProvisioner", "WARP hesabı hazır (${id.clientIpv4} -> ${id.endpointHost}:${id.endpointPort})")
-                    return id
                 }
             }
         }

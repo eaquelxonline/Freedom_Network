@@ -43,16 +43,27 @@ import java.awt.RenderingHints
 import java.awt.Toolkit
 import java.awt.event.WindowAdapter
 import java.awt.event.WindowEvent
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.PushbackInputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.ServerSocket
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetSocketAddress
@@ -94,6 +105,7 @@ import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
 import javax.swing.ScrollPaneConstants
+import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
 import javax.swing.Timer
 import javax.swing.UIManager
@@ -2724,8 +2736,9 @@ data class WarpIdentity(
 /** Zero-config Cloudflare WARP WireGuard account provisioner via pure Rust X25519 + TLS. */
 object WarpProvisioner {
     private const val API_HOST = "api.cloudflareclient.com"
+    private const val ALT_API_HOST = "api.devices.cloudflare.com"
     private const val API_PATH = "/v0a2158/reg"
-    private val FALLBACK_API_IPS = listOf("162.159.137.105", "162.159.138.105", "104.16.80.230")
+    private val FALLBACK_API_IPS = listOf("162.159.137.105", "162.159.138.105", "104.16.80.230", "104.24.4.6")
 
     internal fun extractJsonString(json: String, key: String, startAt: Int = 0): String? {
         val needle = "\"$key\""
@@ -2825,6 +2838,7 @@ object WarpProvisioner {
         bearerToken: String = "",
         protectSocket: (Socket) -> Boolean,
         timeoutMs: Int = 5500,
+        apiHost: String = API_HOST,
     ): Pair<Int, String> {
         val raw = Socket()
         var ssl: SSLSocket? = null
@@ -2835,7 +2849,7 @@ object WarpProvisioner {
             raw.connect(InetSocketAddress(ip, 443), timeoutMs)
             raw.soTimeout = timeoutMs
             val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
-            ssl = factory.createSocket(raw, API_HOST, 443, true) as SSLSocket
+            ssl = factory.createSocket(raw, apiHost, 443, true) as SSLSocket
             val params = ssl.sslParameters
             params.endpointIdentificationAlgorithm = "HTTPS"
             ssl.sslParameters = params
@@ -2844,7 +2858,7 @@ object WarpProvisioner {
             val bodyBytes = bodyJson.toByteArray(Charsets.UTF_8)
             val sb = StringBuilder()
             sb.append("$method $path HTTP/1.1\r\n")
-            sb.append("Host: $API_HOST\r\n")
+            sb.append("Host: $apiHost\r\n")
             sb.append("User-Agent: okhttp/3.12.1\r\n")
             sb.append("Accept-Encoding: identity\r\n")
             sb.append("Content-Type: application/json; charset=UTF-8\r\n")
@@ -2904,21 +2918,25 @@ object WarpProvisioner {
         val out = ArrayList<InetAddress>()
         runCatching {
             DirectDohClient(protectSocket).use { doh ->
-                val q = Doh.query(API_HOST)
-                if (q != null) {
-                    val r = doh.post("https://1.1.1.1/dns-query", q, 2500)
-                    val b = r.body
-                    if (r.transport == 1 && b != null && !IpPackets.containsPoisonedDns(b)) {
-                        IpPackets.dnsAnswerAddresses(b)?.forEach { addr ->
-                            if (addr.size == 4) runCatching { out.add(InetAddress.getByAddress(addr)) }
+                for (hostName in arrayOf(API_HOST, ALT_API_HOST)) {
+                    val q = Doh.query(hostName)
+                    if (q != null) {
+                        val r = doh.post("https://1.1.1.1/dns-query", q, 2500)
+                        val b = r.body
+                        if (r.transport == 1 && b != null && !IpPackets.containsPoisonedDns(b)) {
+                            IpPackets.dnsAnswerAddresses(b)?.forEach { addr ->
+                                if (addr.size == 4) runCatching { out.add(InetAddress.getByAddress(addr)) }
+                            }
                         }
                     }
                 }
             }
         }
-        runCatching {
-            InetAddress.getAllByName(API_HOST).forEach { a ->
-                if (a is Inet4Address && !a.isLoopbackAddress && !a.isSiteLocalAddress) out.add(a)
+        for (hostName in arrayOf(API_HOST, ALT_API_HOST)) {
+            runCatching {
+                InetAddress.getAllByName(hostName).forEach { a ->
+                    if (a is Inet4Address && !a.isLoopbackAddress && !a.isSiteLocalAddress) out.add(a)
+                }
             }
         }
         for (ipStr in FALLBACK_API_IPS) {
@@ -2946,30 +2964,33 @@ object WarpProvisioner {
         val payload = "{\"install_id\":\"\",\"tos\":\"$tos\",\"key\":\"$pubB64\",\"fcm_token\":\"\",\"type\":\"Android\",\"model\":\"PC\",\"locale\":\"en_US\"}"
 
         val candidates = resolveApiCandidates(protectSocket)
-        for (ip in candidates) {
-            val res = runCatching {
-                httpsJsonRequest(ip, "POST", API_PATH, payload, "", protectSocket, 5000)
-            }.getOrNull() ?: continue
-            val (code, json) = res
-            if (code in 200..299 && json.isNotBlank()) {
-                val id = parseRegistrationJson(json, privB64)
-                if (id != null) {
-                    val enabled = extractJsonBool(json, "warp_enabled") ?: false
-                    if (!enabled && id.deviceId.isNotEmpty() && id.accessToken.isNotEmpty()) {
-                        runCatching {
-                            httpsJsonRequest(
-                                ip,
-                                "PATCH",
-                                "$API_PATH/${id.deviceId}",
-                                "{\"warp_enabled\":true}",
-                                id.accessToken,
-                                protectSocket,
-                                3500,
-                            )
+        for (apiHost in arrayOf(API_HOST, ALT_API_HOST)) {
+            for (ip in candidates) {
+                val res = runCatching {
+                    httpsJsonRequest(ip, "POST", API_PATH, payload, "", protectSocket, 5000, apiHost)
+                }.getOrNull() ?: continue
+                val (code, json) = res
+                if (code in 200..299 && json.isNotBlank()) {
+                    val id = parseRegistrationJson(json, privB64)
+                    if (id != null) {
+                        val enabled = extractJsonBool(json, "warp_enabled") ?: false
+                        if (!enabled && id.deviceId.isNotEmpty() && id.accessToken.isNotEmpty()) {
+                            runCatching {
+                                httpsJsonRequest(
+                                    ip,
+                                    "PATCH",
+                                    "$API_PATH/${id.deviceId}",
+                                    "{\"warp_enabled\":true}",
+                                    id.accessToken,
+                                    protectSocket,
+                                    3500,
+                                    apiHost,
+                                )
+                            }
                         }
+                        logger?.invoke("WarpProvisioner", "WARP hesabı hazır (${id.clientIpv4} -> ${id.endpointHost}:${id.endpointPort})")
+                        return id
                     }
-                    logger?.invoke("WarpProvisioner", "WARP hesabı hazır (${id.clientIpv4} -> ${id.endpointHost}:${id.endpointPort})")
-                    return id
                 }
             }
         }
@@ -4428,12 +4449,8 @@ class TunBridge(
 // WINDOWS PLATFORM SECTION
 // ==================================================================================
 
-/** Windows platform services: native IP Helper detection and the Windows certificate store. */
+/** Windows platform services: native IP Helper detection, Windows cert store, and poison-resilient DoH probing. */
 object WindowsPlatform {
-    /**
-     * TLS trust anchors from the Windows certificate store via the JDK SunMSCAPI provider
-     * ("Windows-ROOT"). Falls back to the JDK trust store when unavailable (non-Windows test host).
-     */
     val trustContext: Pair<SSLContext, String> by lazy {
         try {
             val ks = KeyStore.getInstance("Windows-ROOT")
@@ -4444,7 +4461,33 @@ object WindowsPlatform {
             ctx.init(null, tmf.trustManagers, null)
             ctx to "Windows sertifika deposu"
         } catch (e: Exception) {
-            SSLContext.getDefault() to "JDK güven deposu"
+            val defaultTmf = runCatching {
+                TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(null as KeyStore?) }
+            }.getOrNull()
+            val hasDefaultIssuers = defaultTmf?.trustManagers
+                ?.filterIsInstance<javax.net.ssl.X509TrustManager>()
+                ?.any { it.acceptedIssuers.isNotEmpty() } == true
+            if (hasDefaultIssuers) {
+                SSLContext.getDefault() to "JDK güven deposu"
+            } else {
+                val fallbackCtx = runCatching {
+                    val pem = File("/etc/ssl/certs/ca-certificates.crt")
+                    val ks = KeyStore.getInstance(KeyStore.getDefaultType()).apply { load(null, null) }
+                    if (pem.exists()) {
+                        val cf = java.security.cert.CertificateFactory.getInstance("X.509")
+                        pem.inputStream().use { inp ->
+                            cf.generateCertificates(inp).forEachIndexed { idx, cert ->
+                                ks.setCertificateEntry("sys-ca-$idx", cert)
+                            }
+                        }
+                    }
+                    if (ks.size() > 0) {
+                        val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(ks) }
+                        SSLContext.getInstance("TLS").apply { init(null, tmf.trustManagers, null) }
+                    } else null
+                }.getOrNull()
+                (fallbackCtx ?: SSLContext.getDefault()) to "JDK güven deposu"
+            }
         }
     }
 
@@ -4452,8 +4495,79 @@ object WindowsPlatform {
 
     fun dohClient(): DohClient = JdkDohClient(trustContext.first)
 
+    private fun isIspPoisonedIp(host: String, addr: InetAddress): Boolean {
+        val h = host.lowercase()
+        val isLocalName = h == "localhost" || h.endsWith(".local") || h.endsWith(".test") || h.endsWith(".internal")
+        val raw = addr.address
+        if (raw.size == 4) {
+            val b0 = raw[0].toInt() and 0xFF
+            val b1 = raw[1].toInt() and 0xFF
+            val b2 = raw[2].toInt() and 0xFF
+            if (b0 == 195 && b1 == 175 && b2 == 254) return true // ISP block / warning splash IP
+            if (b0 == 0) return true
+            if (!isLocalName && (b0 == 127 || b0 == 10 || (b0 == 172 && b1 in 16..31) || (b0 == 192 && b1 == 168) || (b0 == 169 && b1 == 254))) {
+                return true
+            }
+            return false
+        }
+        if (raw.size == 16) {
+            if (!isLocalName && raw.copyOfRange(0, 15).all { it.toInt() == 0 }) return true
+            val tt = byteArrayOf(0x2a, 0x01, 0x03, 0x58, 0x40, 0x14, 0x0a, 0x00)
+            if (raw.copyOfRange(0, 8).contentEquals(tt)) return true
+        }
+        return false
+    }
+
+    private fun dohResolveClean(host: String, timeoutMs: Int): List<InetAddress> {
+        val q = Doh.query(host, qtype = 1) ?: return emptyList()
+        val out = ArrayList<InetAddress>()
+        runCatching {
+            DirectDohClient(sslFactory = trust.first).use { client ->
+                for (ep in arrayOf("https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query")) {
+                    val r = client.post(ep, q, timeoutMs.coerceIn(800, 3500))
+                    val b = r.body
+                    if (r.transport == 1 && b != null && !IpPackets.containsPoisonedDns(b)) {
+                        IpPackets.dnsAnswerAddresses(b)?.forEach { raw ->
+                            runCatching { out.add(InetAddress.getByAddress(raw)) }
+                        }
+                        if (out.isNotEmpty()) break
+                    }
+                }
+            }
+        }
+        return out
+    }
+
     fun prober(): TlsProber = TlsProber(trust.first, { host, port, timeout ->
-        Socket().apply { connect(InetSocketAddress(host, port), timeout) }
+        val literal = IpPackets.parseIpLiteral(host) != null || host.contains(':')
+        if (literal) {
+            return@TlsProber Socket().apply {
+                tcpNoDelay = true
+                connect(InetSocketAddress(host, port), timeout)
+            }
+        }
+        val sysCandidates = runCatching {
+            InetAddress.getAllByName(host).filter { !isIspPoisonedIp(host, it) }
+        }.getOrDefault(emptyList())
+        val ordered = (sysCandidates.ifEmpty { dohResolveClean(host, timeout) })
+            .sortedBy { if (it is Inet4Address) 0 else 1 }
+        if (ordered.isEmpty()) {
+            throw IOException("Temiz DNS adresi çözümlenemedi: $host")
+        }
+        var lastErr: IOException? = null
+        val perTry = maxOf(800, timeout / minOf(ordered.size, 3))
+        for (addr in ordered.take(3)) {
+            val s = Socket()
+            try {
+                s.tcpNoDelay = true
+                s.connect(InetSocketAddress(addr, port), perTry)
+                return@TlsProber s
+            } catch (e: IOException) {
+                runCatching { s.close() }
+                lastErr = e
+            }
+        }
+        throw lastErr ?: IOException("Bağlantı başarısız: $host:$port")
     })
 
     /** Native detection (GetAdaptersAddresses + registry); JDK fallback keeps unknowns unknown. */
@@ -4521,7 +4635,7 @@ class JdkDohClient(private val ssl: SSLContext) : DohClient {
                 val b = resp.body()
                 DohResponse(1, rtt(), proto, if (b.size > Wire.MAX_BYTES) b.copyOf(Wire.MAX_BYTES) else b)
             } else {
-                DohResponse(6, rtt(), proto, null) // not a DNS answer (e.g. login page or error)
+                DohResponse(6, rtt(), proto, null)
             }
         } catch (e: HttpTimeoutException) {
             DohResponse(2, rtt(), attempted, null)
@@ -4538,9 +4652,1640 @@ class JdkDohClient(private val ssl: SSLContext) : DohClient {
     }
 
     companion object {
-        /** HTTP/3 when the running JDK supports it, otherwise HTTP/2 (feature detection, no reflection on internals). */
         val PREFERRED: HttpClient.Version =
             runCatching { HttpClient.Version.valueOf("HTTP_3") }.getOrDefault(HttpClient.Version.HTTP_2)
+    }
+}
+
+/** Outbound routing modes for Windows 10/11 Command Center & Next-Gen Proxy. */
+enum class WindowsRouteMode(
+    val id: String,
+    val titleTr: String,
+    val subtitleTr: String,
+) {
+    AUTO_WARP("auto_warp", "Otomatik WARP (IP Maskeli)", "WARP WireGuard -> Tor :9050 -> Hibrit DPI Yedeği"),
+    HYBRID_DPI("hybrid_dpi", "Hızlı DPI + DoH3", "DoH3 Temiz DNS + Çoklu TLS Kayıt Bölme (Sahte Paketsiz)"),
+    CUSTOM_RELAY("custom_relay", "Özel Röle / Tor", "Kişisel SOCKS5 / HTTP / HTTPS Çıkış Rölesi");
+
+    companion object {
+        fun fromId(raw: String?): WindowsRouteMode =
+            values().firstOrNull { it.id.equals(raw?.trim(), ignoreCase = true) } ?: AUTO_WARP
+    }
+}
+
+/** Thread-safe circular log ring buffer backing the Windows UI live log console. */
+object WindowsLogBus {
+    private const val MAX_LINES = 320
+    private val lock = ReentrantLock()
+    private val lines = ArrayList<String>(MAX_LINES)
+    private val timeFmt = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    }
+    val version = AtomicLong(0L)
+
+    fun append(tag: String, msg: String) {
+        val ts = timeFmt.get()!!.format(Date())
+        val entry = "[$ts] [$tag] $msg"
+        lock.lock()
+        try {
+            if (lines.size >= MAX_LINES) lines.removeAt(0)
+            lines.add(entry)
+            version.incrementAndGet()
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    fun snapshot(): Pair<Long, String> {
+        lock.lock()
+        return try {
+            version.get() to lines.joinToString("\n")
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    fun clear() {
+        lock.lock()
+        try {
+            lines.clear()
+            version.incrementAndGet()
+        } finally {
+            lock.unlock()
+        }
+    }
+}
+
+/**
+ * Isolated Privacy Browser Launcher for Chrome / Edge / Brave on Windows:
+ * pre-writes Chromium `Preferences` and supplies launch flags that eliminate
+ * `ERR_QUIC_PROTOCOL_ERROR`, WebRTC local/public IP leaks, browser async DNS bypass,
+ * and expose synthetic User-Agent personas consistently across HTTPS targets.
+ */
+object WindowsBrowserLauncher {
+    data class BrowserInstall(val name: String, val exePath: String)
+
+    fun appDataDir(): File {
+        val localAppData = System.getenv("LOCALAPPDATA")?.takeIf { it.isNotBlank() }
+        val base = if (localAppData != null) File(localAppData) else File(System.getProperty("java.io.tmpdir"), "freedom-network")
+        return File(base, "FreedomNetwork").apply { runCatching { mkdirs() } }
+    }
+
+    fun warpIdentityFile(): File = File(appDataDir(), "warp_identity.dat")
+
+    fun defaultProfileDir(): File = File(appDataDir(), "BrowserProfile").apply { runCatching { mkdirs() } }
+
+    fun detectBrowsers(): List<BrowserInstall> {
+        val pf = System.getenv("ProgramFiles")?.takeIf { it.isNotBlank() } ?: "C:\\Program Files"
+        val pf86 = System.getenv("ProgramFiles(x86)")?.takeIf { it.isNotBlank() } ?: "C:\\Program Files (x86)"
+        val local = System.getenv("LOCALAPPDATA")?.takeIf { it.isNotBlank() } ?: ""
+        val candidates = listOf(
+            "Google Chrome" to listOf(
+                "$pf\\Google\\Chrome\\Application\\chrome.exe",
+                "$pf86\\Google\\Chrome\\Application\\chrome.exe",
+                "$local\\Google\\Chrome\\Application\\chrome.exe",
+            ),
+            "Microsoft Edge" to listOf(
+                "$pf86\\Microsoft\\Edge\\Application\\msedge.exe",
+                "$pf\\Microsoft\\Edge\\Application\\msedge.exe",
+            ),
+            "Brave" to listOf(
+                "$pf\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+                "$pf86\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+                "$local\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            ),
+        )
+        val found = ArrayList<BrowserInstall>()
+        for ((name, paths) in candidates) {
+            val hit = paths.firstOrNull { p -> p.isNotBlank() && File(p).let { it.exists() && it.isFile } }
+            if (hit != null) found.add(BrowserInstall(name, hit))
+        }
+        return found
+    }
+
+    fun prepareProfilePreferences(profileRoot: File = defaultProfileDir(), blockLocation: Boolean = true): File {
+        val defDir = File(profileRoot, "Default").apply { mkdirs() }
+        val prefFile = File(defDir, "Preferences")
+        val geoVal = if (blockLocation) 2 else 3
+        val json = """
+            {
+              "webrtc": {
+                "ip_handling_policy": "disable_non_proxied_udp",
+                "multiple_routes_enabled": false,
+                "nonproxied_udp_enabled": false
+              },
+              "async_dns": {
+                "enabled": false
+              },
+              "dns_over_https": {
+                "mode": "off"
+              },
+              "browser": {
+                "enable_do_not_track": true
+              },
+              "profile": {
+                "default_content_setting_values": {
+                  "geolocation": $geoVal,
+                  "notifications": 2,
+                  "sensors": 2
+                }
+              }
+            }
+        """.trimIndent()
+        prefFile.writeText(json, Charsets.UTF_8)
+        return prefFile
+    }
+
+    fun buildLaunchArgs(
+        exePath: String,
+        proxyPort: Int,
+        persona: DevicePersona,
+        initialUrl: String = "",
+        profileRoot: File = defaultProfileDir(),
+    ): List<String> {
+        val args = ArrayList<String>(14)
+        args.add(exePath)
+        args.add("--user-data-dir=${profileRoot.absolutePath}")
+        args.add("--proxy-server=http://127.0.0.1:$proxyPort")
+        args.add("--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1")
+        args.add("--disable-quic")
+        args.add("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+        args.add("--enforce-webrtc-ip-permission-check")
+        args.add("--disable-features=AsyncDns,UseDnsHttpsSvcb")
+        args.add("--no-first-run")
+        args.add("--no-default-browser-check")
+        if (persona != DevicePersona.OFF && persona.userAgent.isNotEmpty()) {
+            args.add("--user-agent=${persona.userAgent}")
+        }
+        if (initialUrl.isNotBlank()) {
+            args.add(initialUrl.trim())
+        }
+        return args
+    }
+
+    fun launch(
+        proxyPort: Int,
+        persona: DevicePersona,
+        initialUrl: String = "https://discord.com/",
+        preferredBrowserIndex: Int = 0,
+        blockLocation: Boolean = true,
+    ): Pair<Boolean, String> {
+        if (proxyPort !in 1..65535) return false to "Önce Özgür Ağı başlatın (yerel vekil portu etkin değil)"
+        val browsers = detectBrowsers()
+        val chosen = browsers.getOrNull(preferredBrowserIndex) ?: browsers.firstOrNull()
+            ?: return false to "Chrome / Edge / Brave bulunamadı; sistem vekili açıkken mevcut tarayıcınızı kullanabilirsiniz"
+        return try {
+            val profile = defaultProfileDir()
+            prepareProfilePreferences(profile, blockLocation = blockLocation)
+            val cmd = buildLaunchArgs(chosen.exePath, proxyPort, persona, initialUrl, profile)
+            ProcessBuilder(cmd).start()
+            WindowsLogBus.append("Browser", "${chosen.name} başlatıldı -> ${initialUrl.ifBlank { "yeni sekme" }} (proxy=127.0.0.1:$proxyPort, QUIC=kapalı, WebRTC=kilidi, persona=${persona.shortLabel})")
+            true to "${chosen.name} korumalı profil ile açıldı (QUIC kapalı · WebRTC kilitli)"
+        } catch (t: Throwable) {
+            WindowsLogBus.append("Browser", "Başlatma hatası (${chosen.name}): ${t.message}")
+            false to "Tarayıcı başlatılamadı: ${t.message}"
+        }
+    }
+}
+
+/**
+ * Pure-Kotlin client RFC-793 userspace TCP/IPv4 stack operating directly over raw L3 IPv4 packets
+ * (e.g. Cloudflare WARP WireGuard tunnel without Windows Administrator privileges or Wintun driver).
+ *
+ * Implements 3-way handshake, MSS negotiation & clamping (<=1220 B for WireGuard MTU),
+ * 32-bit wraparound-safe sequence arithmetic, out-of-order segment reassembly,
+ * 3-duplicate-ACK fast retransmit, exponential-backoff RTO timer, and half-close FIN/RST lifecycle.
+ */
+class UserspaceTcpStack(
+    val clientIpInt: Int,
+    private val sendRawIp: (ByteArray) -> Boolean,
+    private val mtu: Int = 1280,
+) : AutoCloseable {
+    private enum class TcpState { CLOSED, SYN_SENT, ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, LAST_ACK, TIME_WAIT }
+
+    internal data class FlowKey(val localPort: Int, val remoteIp: Int, val remotePort: Int)
+
+    private data class UnackedSeg(
+        val seq: Long,
+        val endSeq: Long,
+        val flags: Int,
+        val payload: ByteArray,
+        var sentAtMs: Long,
+        val firstSentMs: Long,
+        var retries: Int,
+    )
+
+    private val closed = AtomicBoolean(false)
+    private val connections = ConcurrentHashMap<FlowKey, UserspaceTcpSocket>()
+    private val nextEphemeral = AtomicInteger(32768 + java.security.SecureRandom().nextInt(16000))
+    private val localMss = (mtu - 40).coerceIn(536, 1220)
+    val totalTxBytes = AtomicLong(0L)
+    val totalRxBytes = AtomicLong(0L)
+    val retransmits = AtomicLong(0L)
+
+    private val timerThread = Thread({
+        while (!closed.get()) {
+            try {
+                Thread.sleep(25L)
+            } catch (_: InterruptedException) {
+                break
+            }
+            if (closed.get()) break
+            val now = System.currentTimeMillis()
+            val it = connections.entries.iterator()
+            while (it.hasNext()) {
+                val entry = it.next()
+                val sock = entry.value
+                val pkts = sock.pollRetransmit(now)
+                for (p in pkts) {
+                    emitIpPacket(p)
+                }
+                if (sock.isReapable(now)) {
+                    connections.remove(entry.key, sock)
+                }
+            }
+        }
+    }, "freedom-utcp-timer").apply {
+        isDaemon = true
+        start()
+    }
+
+    private fun seqDiff(a: Long, b: Long): Int = (a.toInt() - b.toInt())
+    private fun seqAdd(seq: Long, delta: Int): Long = (seq + delta.toLong()) and 0xFFFFFFFFL
+
+    private fun emitIpPacket(pkt: ByteArray): Boolean {
+        totalTxBytes.addAndGet(pkt.size.toLong())
+        return sendRawIp(pkt)
+    }
+
+    private fun allocateLocalPort(dstIp: Int, dstPort: Int): Int {
+        for (attempt in 0 until 2048) {
+            val raw = nextEphemeral.getAndIncrement()
+            val candidate = 32768 + ((raw and 0x7FFFFFFF) % 28000)
+            val key = FlowKey(candidate, dstIp, dstPort)
+            if (!connections.containsKey(key)) return candidate
+        }
+        throw IOException("Kullanılabilir yerel kullanıcı-alanı port kalmadı")
+    }
+
+    fun connect(remoteIpInt: Int, remotePort: Int, timeoutMs: Int = 5500): UserspaceTcpSocket {
+        if (closed.get()) throw IOException("UserspaceTcpStack kapalı")
+        if (remotePort !in 1..65535) throw IOException("Geçersiz hedef port: $remotePort")
+        val localPort = allocateLocalPort(remoteIpInt, remotePort)
+        val key = FlowKey(localPort, remoteIpInt, remotePort)
+        val sock = UserspaceTcpSocket(key)
+        connections[key] = sock
+        return try {
+            sock.connectInternal(timeoutMs)
+            sock
+        } catch (t: Throwable) {
+            connections.remove(key, sock)
+            sock.close()
+            throw t
+        }
+    }
+
+    fun onInboundIpPacket(pkt: ByteArray) {
+        if (closed.get()) return
+        val ip = IpPackets.parseIpv4(pkt) ?: return
+        if (ip.proto != IpPackets.PROTO_TCP || ip.dstIp != clientIpInt) return
+        val seg = IpPackets.parseTcp(pkt, ip) ?: return
+        totalRxBytes.addAndGet(pkt.size.toLong())
+        val key = FlowKey(seg.dstPort, ip.srcIp, seg.srcPort)
+        val sock = connections[key] ?: return
+        sock.onSegment(pkt, ip, seg)
+    }
+
+    fun activeConnections(): Int = connections.size
+
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        runCatching { timerThread.interrupt() }
+        for (sock in connections.values) {
+            runCatching { sock.close() }
+        }
+        connections.clear()
+    }
+
+    inner class UserspaceTcpSocket internal constructor(
+        private val key: FlowKey,
+    ) : AutoCloseable {
+        private val lock = ReentrantLock()
+        private val rxCond = lock.newCondition()
+        private val txCond = lock.newCondition()
+        private val connectLatch = CountDownLatch(1)
+
+        private var state = TcpState.CLOSED
+        private var sndUna: Long = 0L
+        private var sndNxt: Long = 0L
+        private var sndWnd: Int = 32768
+        private var lastAckedWnd: Int = 32768
+        private var cwnd: Int = 16384
+        private var rcvNxt: Long = 0L
+        private var peerMss: Int = localMss
+        private var peerFinSeq: Long? = null
+        private var rxEof = false
+        private var resetByPeer = false
+        private var closedLocal = false
+        private var finSent = false
+        private var dupAcks = 0
+        private var rtoMs = 180L
+        private var srttMs = 90L
+        private var lastAdvertisedWnd = RX_BUF_CAP
+        private var closedAtMs = 0L
+
+        private val rxChunks = ArrayDeque<ByteArray>()
+        private var rxHeadOff = 0
+        private var rxQueued = 0
+        private val oooList = ArrayList<Pair<Long, ByteArray>>()
+        private val unacked = ArrayList<UnackedSeg>()
+
+        @Volatile var soTimeoutMs: Int = 30_000
+        @Volatile var receivedAnyPayload: Boolean = false
+
+        val inputStream: InputStream = object : InputStream() {
+            override fun read(): Int {
+                val one = ByteArray(1)
+                val n = read(one, 0, 1)
+                return if (n < 0) -1 else (one[0].toInt() and 0xFF)
+            }
+
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (len == 0) return 0
+                return readBytes(b, off, len)
+            }
+        }
+
+        val outputStream: OutputStream = object : OutputStream() {
+            override fun write(b: Int) = write(byteArrayOf(b.toByte()), 0, 1)
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                if (len == 0) return
+                writeBytes(b, off, len)
+            }
+            override fun flush() {}
+        }
+
+        private fun buildTcp(seq: Long, ack: Long, flags: Int, payload: ByteArray = ByteArray(0), mssOpt: Int = 0): ByteArray {
+            val wnd = (RX_BUF_CAP - rxQueued).coerceIn(0, 65535)
+            lastAdvertisedWnd = wnd
+            return IpPackets.buildIpv4Tcp(
+                srcIp = clientIpInt,
+                dstIp = key.remoteIp,
+                srcPort = key.localPort,
+                dstPort = key.remotePort,
+                seq = seq,
+                ack = ack,
+                flags = flags,
+                window = wnd,
+                payload = payload,
+                mssOption = mssOpt,
+            )
+        }
+
+        private fun parsePeerMss(raw: ByteArray, ihl: Int, dataOff: Int): Int? {
+            if (dataOff <= 20 || ihl + dataOff > raw.size) return null
+            var pos = ihl + 20
+            val end = ihl + dataOff
+            while (pos < end) {
+                val kind = raw[pos].toInt() and 0xFF
+                if (kind == 0) break
+                if (kind == 1) { pos++; continue }
+                if (pos + 1 >= end) break
+                val len = raw[pos + 1].toInt() and 0xFF
+                if (len < 2 || pos + len > end) break
+                if (kind == 2 && len == 4 && pos + 4 <= end) {
+                    return IpPackets.u16(raw, pos + 2)
+                }
+                pos += len
+            }
+            return null
+        }
+
+        internal fun connectInternal(timeoutMs: Int) {
+            val iss = ((java.security.SecureRandom().nextInt() and 0x3FFFFFFF).toLong() + 1000L) and 0xFFFFFFFFL
+            val synPkt: ByteArray
+            val now = System.currentTimeMillis()
+            lock.lock()
+            try {
+                state = TcpState.SYN_SENT
+                sndUna = iss
+                sndNxt = seqAdd(iss, 1)
+                unacked.add(UnackedSeg(iss, sndNxt, IpPackets.TCP_SYN, ByteArray(0), now, now, 0))
+                synPkt = buildTcp(iss, 0L, IpPackets.TCP_SYN, mssOpt = localMss)
+            } finally {
+                lock.unlock()
+            }
+            if (!emitIpPacket(synPkt)) {
+                throw IOException("Kullanıcı-alanı SYN paketi gönderilemedi")
+            }
+            val signaled = connectLatch.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            lock.lock()
+            try {
+                if (!signaled || state != TcpState.ESTABLISHED) {
+                    throw SocketTimeoutException("WARP TCP el sıkışması zaman aşımı (${IpPackets.ipToString(key.remoteIp)}:${key.remotePort})")
+                }
+            } finally {
+                lock.unlock()
+            }
+        }
+
+        private fun inflightBytes(): Int {
+            var acc = 0
+            for (u in unacked) acc += u.payload.size
+            return acc
+        }
+
+        private fun appendRx(bytes: ByteArray) {
+            if (bytes.isEmpty()) return
+            rxChunks.addLast(bytes)
+            rxQueued += bytes.size
+            receivedAnyPayload = true
+        }
+
+        private fun drainOooLocked() {
+            if (oooList.isEmpty()) return
+            oooList.sortWith { a, b -> seqDiff(a.first, b.first) }
+            val iter = oooList.iterator()
+            while (iter.hasNext()) {
+                val (startSeq, data) = iter.next()
+                val overlap = seqDiff(rcvNxt, startSeq)
+                if (overlap < 0) break
+                iter.remove()
+                if (overlap < data.size) {
+                    val slice = if (overlap == 0) data else data.copyOfRange(overlap, data.size)
+                    appendRx(slice)
+                    rcvNxt = seqAdd(rcvNxt, slice.size)
+                }
+            }
+        }
+
+        internal fun onSegment(raw: ByteArray, ip: IpPackets.Ipv4Header, seg: IpPackets.TcpSegment) {
+            val toSend = ArrayList<ByteArray>(2)
+            var handshakeDone = false
+            val now = System.currentTimeMillis()
+            lock.lock()
+            try {
+                if ((seg.flags and IpPackets.TCP_RST) != 0) {
+                    if (state == TcpState.SYN_SENT && (seg.flags and IpPackets.TCP_ACK) != 0 && seg.ack != sndNxt) {
+                        return
+                    }
+                    resetByPeer = true
+                    rxEof = true
+                    state = TcpState.CLOSED
+                    closedAtMs = now
+                    unacked.clear()
+                    rxCond.signalAll()
+                    txCond.signalAll()
+                    connectLatch.countDown()
+                    return
+                }
+                if (state == TcpState.SYN_SENT) {
+                    if ((seg.flags and (IpPackets.TCP_SYN or IpPackets.TCP_ACK)) == (IpPackets.TCP_SYN or IpPackets.TCP_ACK) &&
+                        seg.ack == sndNxt
+                    ) {
+                        unacked.clear()
+                        sndUna = seg.ack
+                        rcvNxt = seqAdd(seg.seq, 1)
+                        sndWnd = seg.window.coerceAtLeast(1024)
+                        lastAckedWnd = seg.window
+                        val offered = parsePeerMss(raw, ip.ihl, seg.dataOffset)
+                        if (offered != null && offered in 536..localMss) {
+                            peerMss = offered
+                        }
+                        state = TcpState.ESTABLISHED
+                        toSend.add(buildTcp(sndNxt, rcvNxt, IpPackets.TCP_ACK))
+                        handshakeDone = true
+                    }
+                    return
+                }
+                if (state == TcpState.CLOSED) return
+
+                if ((seg.flags and IpPackets.TCP_ACK) != 0) {
+                    val adv = seqDiff(seg.ack, sndUna)
+                    if (adv > 0 && seqDiff(seg.ack, sndNxt) <= 0) {
+                        val uIt = unacked.iterator()
+                        while (uIt.hasNext()) {
+                            val u = uIt.next()
+                            if (seqDiff(seg.ack, u.endSeq) >= 0) {
+                                if (u.retries == 0) {
+                                    val sample = (now - u.firstSentMs).coerceIn(15L, 2000L)
+                                    srttMs = (srttMs * 3L + sample) / 4L
+                                    rtoMs = (srttMs * 2L).coerceIn(80L, 2500L)
+                                }
+                                uIt.remove()
+                            } else {
+                                break
+                            }
+                        }
+                        sndUna = seg.ack
+                        dupAcks = 0
+                        if (cwnd < 65536) cwnd = minOf(65536, cwnd + peerMss)
+                        if (state == TcpState.FIN_WAIT_1 && finSent && unacked.none { (it.flags and IpPackets.TCP_FIN) != 0 }) {
+                            state = TcpState.FIN_WAIT_2
+                        } else if (state == TcpState.LAST_ACK && unacked.isEmpty()) {
+                            state = TcpState.CLOSED
+                            closedAtMs = now
+                        }
+                        txCond.signalAll()
+                    } else if (adv == 0 && seg.payload.isEmpty() && (seg.flags and IpPackets.TCP_FIN) == 0 &&
+                        unacked.isNotEmpty() && seg.window == lastAckedWnd
+                    ) {
+                        dupAcks++
+                        if (dupAcks == 3) {
+                            val oldest = unacked[0]
+                            oldest.sentAtMs = now
+                            oldest.retries++
+                            retransmits.incrementAndGet()
+                            cwnd = maxOf(peerMss * 2, cwnd / 2)
+                            toSend.add(buildTcp(oldest.seq, rcvNxt, oldest.flags, oldest.payload))
+                        }
+                    }
+                }
+                lastAckedWnd = seg.window
+                sndWnd = seg.window.coerceAtLeast(1024)
+
+                var needAck = false
+                if (seg.payload.isNotEmpty()) {
+                    val rel = seqDiff(seg.seq, rcvNxt)
+                    if (rel == 0) {
+                        appendRx(seg.payload.copyOf())
+                        rcvNxt = seqAdd(rcvNxt, seg.payload.size)
+                        drainOooLocked()
+                        needAck = true
+                    } else if (rel < 0) {
+                        needAck = true
+                        val skip = -rel
+                        if (skip < seg.payload.size) {
+                            val tail = seg.payload.copyOfRange(skip, seg.payload.size)
+                            appendRx(tail)
+                            rcvNxt = seqAdd(rcvNxt, tail.size)
+                            drainOooLocked()
+                        }
+                    } else if (rel < RX_BUF_CAP) {
+                        needAck = true
+                        if (oooList.size < 64 && oooList.none { it.first == seg.seq && it.second.size == seg.payload.size }) {
+                            oooList.add(seg.seq to seg.payload.copyOf())
+                        }
+                    }
+                }
+                if ((seg.flags and IpPackets.TCP_FIN) != 0) {
+                    val finAt = seqAdd(seg.seq, seg.payload.size)
+                    if (peerFinSeq == null) peerFinSeq = finAt
+                    needAck = true
+                }
+                val pf = peerFinSeq
+                if (pf != null && seqDiff(rcvNxt, pf) >= 0) {
+                    if (seqDiff(rcvNxt, pf) == 0) {
+                        rcvNxt = seqAdd(rcvNxt, 1)
+                        needAck = true
+                    }
+                    rxEof = true
+                    state = when (state) {
+                        TcpState.ESTABLISHED -> TcpState.CLOSE_WAIT
+                        TcpState.FIN_WAIT_1, TcpState.FIN_WAIT_2 -> {
+                            closedAtMs = now
+                            TcpState.TIME_WAIT
+                        }
+                        else -> state
+                    }
+                }
+                if (needAck) {
+                    toSend.add(buildTcp(sndNxt, rcvNxt, IpPackets.TCP_ACK))
+                }
+                if (rxQueued > 0 || rxEof) {
+                    rxCond.signalAll()
+                }
+            } finally {
+                lock.unlock()
+                for (p in toSend) emitIpPacket(p)
+                if (handshakeDone) connectLatch.countDown()
+            }
+        }
+
+        internal fun pollRetransmit(now: Long): List<ByteArray> {
+            val out = ArrayList<ByteArray>(2)
+            lock.lock()
+            try {
+                if (state == TcpState.TIME_WAIT && now - closedAtMs > 1200L) {
+                    state = TcpState.CLOSED
+                    return emptyList()
+                }
+                val oldest = unacked.firstOrNull() ?: return emptyList()
+                if (now - oldest.sentAtMs < rtoMs) return emptyList()
+                if (oldest.retries >= 8) {
+                    resetByPeer = true
+                    rxEof = true
+                    state = TcpState.CLOSED
+                    closedAtMs = now
+                    unacked.clear()
+                    rxCond.signalAll()
+                    txCond.signalAll()
+                    connectLatch.countDown()
+                    return emptyList()
+                }
+                oldest.retries++
+                oldest.sentAtMs = now
+                rtoMs = minOf(2500L, (rtoMs * 3L) / 2L)
+                retransmits.incrementAndGet()
+                val mssOpt = if ((oldest.flags and IpPackets.TCP_SYN) != 0) localMss else 0
+                out.add(buildTcp(oldest.seq, rcvNxt, oldest.flags, oldest.payload, mssOpt))
+            } finally {
+                lock.unlock()
+            }
+            return out
+        }
+
+        internal fun isReapable(now: Long): Boolean {
+            lock.lock()
+            return try {
+                state == TcpState.CLOSED || (closedLocal && now - closedAtMs > 2000L)
+            } finally {
+                lock.unlock()
+            }
+        }
+
+        private fun readBytes(dst: ByteArray, off: Int, len: Int): Int {
+            var windowAckPkt: ByteArray? = null
+            val copied: Int
+            lock.lock()
+            try {
+                val deadlineNs = System.nanoTime() + soTimeoutMs.coerceAtLeast(1).toLong() * 1_000_000L
+                while (rxQueued == 0) {
+                    if (resetByPeer) throw IOException("Connection reset by peer")
+                    if (rxEof || closedLocal || state == TcpState.CLOSED) return -1
+                    val remNs = deadlineNs - System.nanoTime()
+                    if (remNs <= 0L) throw SocketTimeoutException("WARP TCP okuma zaman aşımı")
+                    rxCond.awaitNanos(remNs)
+                }
+                var done = 0
+                while (done < len && rxChunks.isNotEmpty()) {
+                    val head = rxChunks.first()
+                    val avail = head.size - rxHeadOff
+                    val take = minOf(len - done, avail)
+                    System.arraycopy(head, rxHeadOff, dst, off + done, take)
+                    done += take
+                    rxQueued -= take
+                    if (take == avail) {
+                        rxChunks.removeFirst()
+                        rxHeadOff = 0
+                    } else {
+                        rxHeadOff += take
+                    }
+                }
+                copied = done
+                val newWnd = (RX_BUF_CAP - rxQueued).coerceIn(0, 65535)
+                if ((lastAdvertisedWnd < 4096 && newWnd >= 16384) || newWnd - lastAdvertisedWnd >= RX_BUF_CAP / 2) {
+                    windowAckPkt = buildTcp(sndNxt, rcvNxt, IpPackets.TCP_ACK)
+                }
+            } finally {
+                lock.unlock()
+            }
+            if (windowAckPkt != null) emitIpPacket(windowAckPkt)
+            return copied
+        }
+
+        private fun writeBytes(src: ByteArray, off: Int, len: Int) {
+            var pos = off
+            val end = off + len
+            while (pos < end) {
+                val chunkLen = minOf(peerMss, end - pos)
+                val chunk = src.copyOfRange(pos, pos + chunkLen)
+                var pkt: ByteArray
+                lock.lock()
+                try {
+                    val deadlineNs = System.nanoTime() + 15_000_000_000L
+                    while ((state != TcpState.ESTABLISHED && state != TcpState.CLOSE_WAIT) ||
+                        inflightBytes() >= minOf(cwnd, sndWnd).coerceAtLeast(peerMss)
+                    ) {
+                        if (resetByPeer || closedLocal || finSent || state == TcpState.CLOSED) {
+                            throw IOException("Kullanıcı-alanı TCP soketi kapalı")
+                        }
+                        val remNs = deadlineNs - System.nanoTime()
+                        if (remNs <= 0L) throw SocketTimeoutException("WARP TCP yazma zaman aşımı")
+                        txCond.awaitNanos(remNs)
+                    }
+                    if (resetByPeer || closedLocal || finSent || state == TcpState.CLOSED) {
+                        throw IOException("Kullanıcı-alanı TCP soketi kapalı")
+                    }
+                    val now = System.currentTimeMillis()
+                    val seq = sndNxt
+                    val endSeq = seqAdd(seq, chunk.size)
+                    sndNxt = endSeq
+                    val flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK
+                    unacked.add(UnackedSeg(seq, endSeq, flags, chunk, now, now, 0))
+                    pkt = buildTcp(seq, rcvNxt, flags, chunk)
+                } finally {
+                    lock.unlock()
+                }
+                if (!emitIpPacket(pkt)) throw IOException("WARP paket gönderilemedi")
+                pos += chunkLen
+            }
+        }
+
+        fun shutdownOutput() {
+            var finPkt: ByteArray? = null
+            lock.lock()
+            try {
+                if (!finSent && !closedLocal && (state == TcpState.ESTABLISHED || state == TcpState.CLOSE_WAIT)) {
+                    finSent = true
+                    val now = System.currentTimeMillis()
+                    val seq = sndNxt
+                    val endSeq = seqAdd(seq, 1)
+                    sndNxt = endSeq
+                    val flags = IpPackets.TCP_FIN or IpPackets.TCP_ACK
+                    unacked.add(UnackedSeg(seq, endSeq, flags, ByteArray(0), now, now, 0))
+                    state = if (state == TcpState.CLOSE_WAIT) TcpState.LAST_ACK else TcpState.FIN_WAIT_1
+                    finPkt = buildTcp(seq, rcvNxt, flags)
+                }
+            } finally {
+                lock.unlock()
+            }
+            if (finPkt != null) emitIpPacket(finPkt)
+        }
+
+        override fun close() {
+            var pkt: ByteArray? = null
+            lock.lock()
+            try {
+                if (closedLocal) return
+                closedLocal = true
+                closedAtMs = System.currentTimeMillis()
+                if (!finSent && (state == TcpState.ESTABLISHED || state == TcpState.CLOSE_WAIT)) {
+                    finSent = true
+                    val seq = sndNxt
+                    sndNxt = seqAdd(seq, 1)
+                    pkt = buildTcp(seq, rcvNxt, IpPackets.TCP_FIN or IpPackets.TCP_ACK)
+                    state = TcpState.TIME_WAIT
+                } else if (state == TcpState.SYN_SENT) {
+                    pkt = buildTcp(sndNxt, rcvNxt, IpPackets.TCP_RST)
+                    state = TcpState.CLOSED
+                }
+                rxEof = true
+                rxCond.signalAll()
+                txCond.signalAll()
+                connectLatch.countDown()
+            } finally {
+                lock.unlock()
+            }
+            if (pkt != null) emitIpPacket(pkt)
+        }
+    }
+
+    companion object {
+        private const val RX_BUF_CAP = 65535
+    }
+}
+
+/**
+ * Windows 10/11 Next-Gen Proxy Engine (HTTP / HTTPS CONNECT / SOCKS5 on one local listener):
+ * 1. `AUTO_WARP`: Pure-Kotlin WireGuard WARP via [UserspaceTcpStack] (real IP masking without admin rights)
+ *    with seamless failover to local Tor `:9050` or Hybrid DPI+DoH3 if UDP is firewalled.
+ * 2. `HYBRID_DPI`: Poison-filtered DoH3 + TCP-DNS fallback + Happy Eyeballs multi-IP + safe multi-record
+ *    TLS `0x16` SNI/ECH fragmentation (zero stream-corrupting decoy bytes) with automatic immediate-RST retry.
+ * 3. Privacy & Leak Shield: Tracker domain blocking (`403`), STUN/QUIC UDP rejection, URL tracking param
+ *    stripping, geo/IP header removal, and HTTP [DevicePersona] header spoofing.
+ */
+class WindowsNextGenProxy(
+    private val port: Int = 0,
+    val routeMode: WindowsRouteMode = WindowsRouteMode.AUTO_WARP,
+    private val customRelayUri: String = "",
+    var persona: DevicePersona = DevicePersona.IPHONE_19_BETA,
+    private val blockTrackers: Boolean = true,
+    private val stripUrlParams: Boolean = true,
+    private val blockQuicAndLeaks: Boolean = true,
+    private val dohEndpoints: List<String> = TunBridge.DEFAULT_DOH_ENDPOINTS,
+    private val upstreamDnsServers: List<String> = TunBridge.DEFAULT_DNS_SERVERS,
+    private val dohClient: DohClient? = null,
+    private val warpIdentityOverride: WarpIdentity? = null,
+    private val warpFactory: ((WarpIdentity) -> WarpTunnel)? = null,
+    private val onWarpIdentityReady: ((WarpIdentity) -> Unit)? = null,
+    private val onRouteUpdated: ((String, Boolean) -> Unit)? = null,
+    private val forceDirectForLoopback: Boolean = true,
+    private val allowLoopbackDns: Boolean = false,
+) : AutoCloseable {
+    private interface UpstreamChannel : Closeable {
+        val inputStream: InputStream
+        val outputStream: OutputStream
+        fun setSoTimeout(ms: Int)
+        fun shutdownOutput()
+    }
+
+    private class TcpSocketChannel(val sock: Socket) : UpstreamChannel {
+        override val inputStream: InputStream get() = sock.inputStream
+        override val outputStream: OutputStream get() = sock.outputStream
+        override fun setSoTimeout(ms: Int) { sock.soTimeout = ms }
+        override fun shutdownOutput() { runCatching { sock.shutdownOutput() } }
+        override fun close() { runCatching { sock.close() } }
+    }
+
+    private class UserspaceChannel(val sock: UserspaceTcpStack.UserspaceTcpSocket) : UpstreamChannel {
+        override val inputStream: InputStream get() = sock.inputStream
+        override val outputStream: OutputStream get() = sock.outputStream
+        override fun setSoTimeout(ms: Int) { sock.soTimeoutMs = ms }
+        override fun shutdownOutput() { runCatching { sock.shutdownOutput() } }
+        override fun close() { runCatching { sock.close() } }
+    }
+
+    private val running = AtomicBoolean(false)
+    private var serverSocket: ServerSocket? = null
+    private var acceptThread: Thread? = null
+    private var internalDoh: DirectDohClient? = null
+    private val ioPool: ExecutorService = Executors.newCachedThreadPool { r ->
+        Thread(r, "freedom-win-proxy").apply { isDaemon = true }
+    }
+
+    @Volatile private var warpTunnel: WarpTunnel? = null
+    @Volatile private var warpStack: UserspaceTcpStack? = null
+    @Volatile private var activeRelay: ExitRelayConfig? =
+        if (routeMode == WindowsRouteMode.CUSTOM_RELAY) ExitRelayConfig.parse(customRelayUri) else null
+    @Volatile var routeLabel: String = when (routeMode) {
+        WindowsRouteMode.AUTO_WARP -> "WARP WireGuard Bağlanıyor..."
+        WindowsRouteMode.HYBRID_DPI -> "Hibrit DPI + DoH3 (Çoklu TLS Kayıt Bölme)"
+        WindowsRouteMode.CUSTOM_RELAY -> activeRelay?.label() ?: "Özel Röle Bekleniyor"
+    }
+        private set
+    @Volatile var isIpMasked: Boolean = (routeMode == WindowsRouteMode.CUSTOM_RELAY && activeRelay != null)
+        private set
+    @Volatile var localPort: Int = 0
+        private set
+    val isActive: Boolean get() = running.get() && localPort > 0
+
+    private val dnsCache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
+    private val hostStrategyCache = ConcurrentHashMap<String, Int>()
+
+    val connections = AtomicLong(0L)
+    val tlsSplit = AtomicLong(0L)
+    val tlsAdaptiveRetries = AtomicLong(0L)
+    val httpSplit = AtomicLong(0L)
+    val fakeSent = AtomicLong(0L)
+    val rstDropped = AtomicLong(0L)
+    val visionSplice = AtomicLong(0L)
+    val trackersBlocked = AtomicLong(0L)
+    val paramsStripped = AtomicLong(0L)
+    val leaksBlocked = AtomicLong(0L)
+    val dohResolved = AtomicLong(0L)
+    val poisonedDnsBlocked = AtomicLong(0L)
+    val warpFlows = AtomicLong(0L)
+    val bytesUp = AtomicLong(0L)
+    val bytesDown = AtomicLong(0L)
+
+    fun statusSnapshot(): ProxyStatus = ProxyStatus(
+        status = Codes.OK,
+        active = isActive,
+        port = localPort,
+        mode = if (isIpMasked) DesyncMode.REALITY_VISION else DesyncMode.ADAPTIVE_FULL,
+        connections = connections.get(),
+        tlsSplit = tlsSplit.get(),
+        httpSplit = httpSplit.get(),
+        fakeSent = fakeSent.get(),
+        rstDropped = rstDropped.get(),
+        visionSplice = visionSplice.get(),
+        trackersBlocked = trackersBlocked.get(),
+        paramsStripped = paramsStripped.get(),
+    )
+
+    fun start(): Int {
+        if (!running.compareAndSet(false, true)) return localPort
+        val ss = ServerSocket()
+        ss.reuseAddress = true
+        ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port.coerceIn(0, 65535)), 128)
+        serverSocket = ss
+        localPort = ss.localPort
+        if (dohClient == null) {
+            internalDoh = DirectDohClient(sslFactory = WindowsPlatform.trust.first)
+        }
+        WindowsLogBus.append("Proxy", "Yerel motor dinliyor: 127.0.0.1:$localPort (HTTP/HTTPS + SOCKS5, mod=${routeMode.id})")
+        if (routeMode == WindowsRouteMode.AUTO_WARP) {
+            ioPool.execute { bootstrapAutoWarp() }
+        } else {
+            onRouteUpdated?.invoke(routeLabel, isIpMasked)
+        }
+        acceptThread = Thread({ acceptLoop(ss) }, "freedom-proxy-accept").apply {
+            isDaemon = true
+            start()
+        }
+        return localPort
+    }
+
+    private fun isLocalPortOpen(host: String, p: Int, timeoutMs: Int = 450): Boolean = runCatching {
+        Socket().use { s -> s.connect(InetSocketAddress(InetAddress.getByName(host), p), timeoutMs) }
+        true
+    }.getOrDefault(false)
+
+    private fun bootstrapAutoWarp() {
+        try {
+            var id = warpIdentityOverride?.takeIf { it.isValid() }
+            if (id == null) {
+                id = runCatching {
+                    val f = WindowsBrowserLauncher.warpIdentityFile()
+                    if (f.exists()) WarpIdentity.deserialize(f.readText(Charsets.UTF_8)) else null
+                }.getOrNull()
+            }
+            var freshlyProvisioned = false
+            if (id == null && running.get()) {
+                WindowsLogBus.append("WARP", "Cloudflare WARP WireGuard hesabı oluşturuluyor...")
+                id = WarpProvisioner.register(logger = { tag, m -> WindowsLogBus.append(tag, m) })
+                freshlyProvisioned = id != null
+                if (id != null) {
+                    runCatching { WindowsBrowserLauncher.warpIdentityFile().writeText(id.serialize(), Charsets.UTF_8) }
+                    onWarpIdentityReady?.invoke(id)
+                }
+            }
+            if (id != null && running.get()) {
+                val wt = warpFactory?.invoke(id) ?: WarpTunnel(id, logger = { tag, m -> WindowsLogBus.append(tag, m) })
+                if (wt.connect(3200)) {
+                    activateWarpTunnel(id, wt)
+                    return
+                }
+                wt.close()
+                if (!freshlyProvisioned && warpIdentityOverride == null && running.get()) {
+                    val fresh = WarpProvisioner.register(logger = { tag, m -> WindowsLogBus.append(tag, m) })
+                    if (fresh != null) {
+                        runCatching { WindowsBrowserLauncher.warpIdentityFile().writeText(fresh.serialize(), Charsets.UTF_8) }
+                        onWarpIdentityReady?.invoke(fresh)
+                        val wt2 = warpFactory?.invoke(fresh) ?: WarpTunnel(fresh, logger = { tag, m -> WindowsLogBus.append(tag, m) })
+                        if (wt2.connect(3200)) {
+                            activateWarpTunnel(fresh, wt2)
+                            return
+                        }
+                        wt2.close()
+                    }
+                }
+            }
+            if (running.get() && isLocalPortOpen("127.0.0.1", 9050, 450)) {
+                activeRelay = ExitRelayConfig("socks5", "127.0.0.1", 9050)
+                isIpMasked = true
+                routeLabel = "Tor / Orbot (127.0.0.1:9050)"
+                WindowsLogBus.append("WARP", "WARP UDP el sıkışması engelli; otomatik Tor/Orbot yedeği devreye alındı")
+                onRouteUpdated?.invoke(routeLabel, true)
+                return
+            }
+        } catch (t: Throwable) {
+            WindowsLogBus.append("WARP", "Otomatik WARP başlatma hatası: ${t.message}")
+        }
+        if (running.get()) {
+            isIpMasked = false
+            routeLabel = "Hibrit DPI + DoH3 (WARP UDP Engelli)"
+            WindowsLogBus.append("Route", "Yedek moda geçildi: $routeLabel")
+            onRouteUpdated?.invoke(routeLabel, false)
+        }
+    }
+
+    private fun activateWarpTunnel(id: WarpIdentity, wt: WarpTunnel) {
+        val clientIp = id.clientIpInt() ?: IpPackets.parseIpLiteral("172.16.0.2")!!
+        val stack = UserspaceTcpStack(clientIp, sendRawIp = { pkt -> wt.sendIpPacket(pkt) }, mtu = 1280)
+        warpTunnel = wt
+        warpStack = stack
+        wt.startLoops { dec -> stack.onInboundIpPacket(dec) }
+        val ep = wt.activeEndpoint?.let { "${it.hostString}:${it.port}" } ?: "${id.endpointHost}:${id.endpointPort}"
+        isIpMasked = true
+        routeLabel = "WARP WireGuard ($ep · ${wt.handshakeRttMs}ms)"
+        WindowsLogBus.append("WARP", "Aktif tünel: $routeLabel · iç IP=${id.clientIpv4}")
+        onRouteUpdated?.invoke(routeLabel, true)
+    }
+
+    private fun acceptLoop(ss: ServerSocket) {
+        while (running.get() && !ss.isClosed) {
+            val client = try {
+                ss.accept()
+            } catch (_: Throwable) {
+                break
+            }
+            ioPool.execute {
+                runCatching {
+                    client.tcpNoDelay = true
+                    client.soTimeout = 30_000
+                    handleClient(client)
+                }.onFailure {
+                    runCatching { client.close() }
+                }
+            }
+        }
+    }
+
+    private fun isPoisonedBytes(host: String, raw: ByteArray): Boolean {
+        val h = host.lowercase()
+        val allowLocal = h == "localhost" || h.endsWith(".local") || h.endsWith(".test") || h.endsWith(".internal")
+        if (raw.size == 4) {
+            val b0 = raw[0].toInt() and 0xFF
+            val b1 = raw[1].toInt() and 0xFF
+            val b2 = raw[2].toInt() and 0xFF
+            if (b0 == 195 && b1 == 175 && b2 == 254) return true
+            if (b0 == 0) return true
+            if (!allowLocal && (b0 == 127 || b0 == 10 || (b0 == 172 && b1 in 16..31) || (b0 == 192 && b1 == 168) || (b0 == 169 && b1 == 254) || (b0 == 100 && b1 in 64..127))) {
+                return true
+            }
+            return false
+        }
+        if (raw.size == 16) {
+            if (!allowLocal && raw.copyOfRange(0, 15).all { it.toInt() == 0 }) return true
+            val tt = byteArrayOf(0x2a, 0x01, 0x03, 0x58, 0x40, 0x14, 0x0a, 0x00)
+            if (raw.copyOfRange(0, 8).contentEquals(tt)) return true
+        }
+        return false
+    }
+
+    private fun buildDnsQueryA(host: String): ByteArray? {
+        Doh.query(host, 1)?.let { return it }
+        val labels = host.trimEnd('.').split('.').filter { it.isNotEmpty() }
+        if (labels.isEmpty()) return null
+        val out = ByteArrayOutputStream()
+        out.write(0); out.write(0)
+        out.write(0x01); out.write(0x00)
+        out.write(0); out.write(1)
+        out.write(0); out.write(0); out.write(0); out.write(0); out.write(0); out.write(0)
+        for (l in labels) {
+            val lb = l.toByteArray(Charsets.US_ASCII)
+            if (lb.size > 63) return null
+            out.write(lb.size)
+            out.write(lb)
+        }
+        out.write(0)
+        out.write(0); out.write(1) // QTYPE A
+        out.write(0); out.write(1) // QCLASS IN
+        return out.toByteArray()
+    }
+
+    private fun queryTcpDns(serverIp: String, query: ByteArray): ByteArray? = runCatching {
+        Socket().use { s ->
+            s.tcpNoDelay = true
+            s.connect(InetSocketAddress(InetAddress.getByName(serverIp), 53), 1800)
+            s.soTimeout = 1800
+            val lenBuf = byteArrayOf(((query.size ushr 8) and 0xFF).toByte(), (query.size and 0xFF).toByte())
+            s.outputStream.write(lenBuf)
+            s.outputStream.write(query)
+            s.outputStream.flush()
+            val inp = s.inputStream
+            val b0 = inp.read(); val b1 = inp.read()
+            if (b0 < 0 || b1 < 0) return null
+            val respLen = (b0 shl 8) or b1
+            if (respLen !in 12..8192) return null
+            readExact(inp, respLen)
+        }
+    }.getOrNull()
+
+    private fun resolveTargetIps(host: String): List<InetAddress> {
+        val literalV4 = IpPackets.parseIpLiteral(host)
+        if (literalV4 != null) return listOf(InetAddress.getByAddress(IpPackets.ipToBytes(literalV4)))
+        if (host.contains(':')) return listOf(InetAddress.getByName(host))
+
+        val lower = host.lowercase()
+        if (lower == "localhost" || lower.endsWith(".local") || lower.endsWith(".test")) {
+            return runCatching { InetAddress.getAllByName(host).toList() }.getOrDefault(emptyList())
+        }
+
+        val now = System.currentTimeMillis()
+        dnsCache[lower]?.let { (exp, addrs) -> if (now < exp && addrs.isNotEmpty()) return addrs }
+
+        val query = buildDnsQueryA(lower)
+        val client = dohClient ?: internalDoh
+        val resolved = ArrayList<InetAddress>()
+        if (query != null && client != null) {
+            for (ep in dohEndpoints) {
+                val r = runCatching { client.post(ep, query, 2400) }.getOrNull() ?: continue
+                val body = r.body
+                if (r.transport == 1 && body != null) {
+                    val rawAddrs = IpPackets.dnsAnswerAddresses(body).orEmpty()
+                    val loopbackOverride = allowLoopbackDns && dohClient != null && rawAddrs.isNotEmpty() && rawAddrs.all { raw ->
+                        (raw.size == 4 && (raw[0].toInt() and 0xFF) == 127) ||
+                            (raw.size == 16 && runCatching { InetAddress.getByAddress(raw).isLoopbackAddress }.getOrDefault(false))
+                    }
+                    if (!loopbackOverride && IpPackets.containsPoisonedDns(body)) {
+                        poisonedDnsBlocked.incrementAndGet()
+                        WindowsLogBus.append("DNS", "Zehirli yanıt engellendi ($ep -> $lower)")
+                        continue
+                    }
+                    rawAddrs.forEach { raw ->
+                        if (loopbackOverride || !isPoisonedBytes(lower, raw)) {
+                            runCatching { resolved.add(InetAddress.getByAddress(raw)) }
+                        }
+                    }
+                    if (resolved.isNotEmpty()) {
+                        dohResolved.incrementAndGet()
+                        val ttl = (IpPackets.dnsMinTtl(body) ?: 60L).coerceIn(30L, 600L)
+                        val ordered = resolved.sortedBy { if (it is Inet4Address) 0 else 1 }
+                        dnsCache[lower] = (now + ttl * 1000L) to ordered
+                        return ordered
+                    }
+                }
+            }
+        }
+        if (query != null) {
+            for (dnsIp in upstreamDnsServers) {
+                val tcpResp = queryTcpDns(dnsIp.substringBefore(':'), query) ?: continue
+                if (!IpPackets.containsPoisonedDns(tcpResp)) {
+                    IpPackets.dnsAnswerAddresses(tcpResp)?.forEach { raw ->
+                        if (!isPoisonedBytes(lower, raw)) {
+                            runCatching { resolved.add(InetAddress.getByAddress(raw)) }
+                        }
+                    }
+                    if (resolved.isNotEmpty()) {
+                        val ordered = resolved.sortedBy { if (it is Inet4Address) 0 else 1 }
+                        dnsCache[lower] = (now + 60_000L) to ordered
+                        return ordered
+                    }
+                } else {
+                    poisonedDnsBlocked.incrementAndGet()
+                }
+            }
+        }
+        val sys = runCatching {
+            InetAddress.getAllByName(host).filter { !isPoisonedBytes(lower, it.address) }
+        }.getOrDefault(emptyList()).sortedBy { if (it is Inet4Address) 0 else 1 }
+        if (sys.isNotEmpty()) dnsCache[lower] = (now + 30_000L) to sys
+        return sys
+    }
+
+    private fun isLoopbackDest(host: String, addrs: List<InetAddress>): Boolean {
+        val h = host.lowercase()
+        if (h == "127.0.0.1" || h == "localhost" || h == "::1") return true
+        return addrs.any { it.isLoopbackAddress }
+    }
+
+    private fun openExitRelay(relay: ExitRelayConfig, dstHost: String, dstPort: Int): UpstreamChannel {
+        val raw = Socket()
+        try {
+            raw.tcpNoDelay = true
+            raw.connect(InetSocketAddress(InetAddress.getByName(relay.host), relay.port), 5500)
+            raw.soTimeout = 30_000
+            val s: Socket = if (relay.scheme == "https") {
+                val ssl = WindowsPlatform.trust.first.createSocket(raw, relay.host, relay.port, true) as SSLSocket
+                val p = ssl.sslParameters
+                p.endpointIdentificationAlgorithm = "HTTPS"
+                ssl.sslParameters = p
+                ssl.startHandshake()
+                ssl
+            } else {
+                raw
+            }
+            val inp = s.inputStream
+            val out = s.outputStream
+            if (relay.scheme == "socks5") {
+                val hasAuth = relay.username.isNotEmpty() || relay.password.isNotEmpty()
+                out.write(if (hasAuth) byteArrayOf(0x05, 0x02, 0x00, 0x02) else byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                val choice = readExact(inp, 2)
+                if (choice[0].toInt() != 0x05) throw IOException("SOCKS5 bad version")
+                if ((choice[1].toInt() and 0xFF) == 0x02) {
+                    val u = relay.username.toByteArray(Charsets.UTF_8).take(255).toByteArray()
+                    val p = relay.password.toByteArray(Charsets.UTF_8).take(255).toByteArray()
+                    val auth = ByteArray(3 + u.size + p.size)
+                    auth[0] = 0x01; auth[1] = u.size.toByte()
+                    System.arraycopy(u, 0, auth, 2, u.size)
+                    auth[2 + u.size] = p.size.toByte()
+                    System.arraycopy(p, 0, auth, 3 + u.size, p.size)
+                    out.write(auth); out.flush()
+                    val ar = readExact(inp, 2)
+                    if (ar[1].toInt() != 0) throw IOException("SOCKS5 auth failed")
+                } else if ((choice[1].toInt() and 0xFF) != 0x00) {
+                    throw IOException("SOCKS5 unsupported auth")
+                }
+                val hostBytes = dstHost.toByteArray(Charsets.US_ASCII).take(255).toByteArray()
+                val req = ByteArray(7 + hostBytes.size)
+                req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03
+                req[4] = hostBytes.size.toByte()
+                System.arraycopy(hostBytes, 0, req, 5, hostBytes.size)
+                IpPackets.putU16(req, 5 + hostBytes.size, dstPort)
+                out.write(req); out.flush()
+                val rep = readExact(inp, 4)
+                if (rep[1].toInt() != 0x00) throw IOException("SOCKS5 connect status=${rep[1].toInt() and 0xFF}")
+                when (rep[3].toInt() and 0xFF) {
+                    0x01 -> readExact(inp, 6)
+                    0x04 -> readExact(inp, 18)
+                    0x03 -> { val dlen = readExact(inp, 1)[0].toInt() and 0xFF; readExact(inp, dlen + 2) }
+                }
+            } else {
+                val req = StringBuilder("CONNECT $dstHost:$dstPort HTTP/1.1\r\nHost: $dstHost:$dstPort\r\n")
+                if (relay.username.isNotEmpty() || relay.password.isNotEmpty()) {
+                    val token = java.util.Base64.getEncoder().encodeToString("${relay.username}:${relay.password}".toByteArray(Charsets.UTF_8))
+                    req.append("Proxy-Authorization: Basic $token\r\n")
+                }
+                req.append("\r\n")
+                out.write(req.toString().toByteArray(Charsets.US_ASCII)); out.flush()
+                val statusLine = readHttpLine(inp)
+                val code = statusLine.split(' ').getOrNull(1)?.toIntOrNull() ?: 0
+                while (readHttpLine(inp).isNotEmpty()) {}
+                if (code !in 200..299) throw IOException("Relay CONNECT HTTP $code")
+            }
+            return TcpSocketChannel(s)
+        } catch (t: Throwable) {
+            runCatching { raw.close() }
+            throw t
+        }
+    }
+
+    private fun openDirectHappyEyeballs(addrs: List<InetAddress>, dstPort: Int, startIdx: Int = 0): UpstreamChannel {
+        if (addrs.isEmpty()) throw IOException("Çözümlenen hedef adresi yok")
+        var lastErr: IOException? = null
+        for (i in addrs.indices) {
+            val addr = addrs[(startIdx + i) % addrs.size]
+            val s = Socket()
+            try {
+                s.tcpNoDelay = true
+                runCatching { s.receiveBufferSize = 65536; s.sendBufferSize = 65536 }
+                s.connect(InetSocketAddress(addr, dstPort), 4200)
+                s.soTimeout = 30_000
+                return TcpSocketChannel(s)
+            } catch (e: IOException) {
+                runCatching { s.close() }
+                lastErr = e
+            }
+        }
+        throw lastErr ?: IOException("Hedefe bağlanılamadı")
+    }
+
+    private fun openUpstream(dstHost: String, dstPort: Int, candidateShift: Int = 0): Pair<UpstreamChannel, Boolean> {
+        val resolved = resolveTargetIps(dstHost)
+        val isLoopback = forceDirectForLoopback && isLoopbackDest(dstHost, resolved)
+        if (!isLoopback) {
+            val relay = activeRelay
+            if (relay != null) {
+                return openExitRelay(relay, dstHost, dstPort) to true
+            }
+            val stack = warpStack
+            val wt = warpTunnel
+            if (stack != null && wt != null && wt.established) {
+                val v4 = resolved.firstOrNull { it is Inet4Address } as? Inet4Address
+                if (v4 != null) {
+                    val dstInt = IpPackets.u32(v4.address, 0).toInt()
+                    val ws = stack.connect(dstInt, dstPort, 5500)
+                    warpFlows.incrementAndGet()
+                    return UserspaceChannel(ws) to true
+                }
+            }
+        }
+        return openDirectHappyEyeballs(resolved, dstPort, candidateShift) to false
+    }
+
+    private fun buildFineTlsFragments(payload: ByteArray): List<ByteArray> {
+        val sni = IpPackets.findClientHelloSni(payload) ?: return IpPackets.planFirstPayload(payload, emptyList())
+        val cuts = ArrayList<Int>(6)
+        cuts.add(minOf(9, payload.size - 1))
+        if (sni.first > 11) cuts.add(sni.first - 2)
+        cuts.add(sni.first + 1)
+        cuts.add(sni.first + maxOf(2, sni.second / 2))
+        if (sni.first + sni.second - 1 < payload.size) cuts.add(sni.first + sni.second - 1)
+        val tcpChunks = IpPackets.splitAt(payload, cuts)
+        return IpPackets.fragmentTlsClientHelloRecords(payload, tcpChunks)
+    }
+
+    private fun writeDpiFirstFlight(out: OutputStream, payload: ByteArray, strategyLevel: Int) {
+        val isTls = payload.size >= 5 && (payload[0].toInt() and 0xFF) == 0x16 && (payload[1].toInt() and 0xFF) == 0x03
+        val chunks = if (isTls && strategyLevel >= 1) {
+            buildFineTlsFragments(payload)
+        } else {
+            IpPackets.planFirstPayload(payload, emptyList())
+        }
+        if (isTls && chunks.size > 1) tlsSplit.incrementAndGet()
+        if (!isTls && chunks.size > 1) httpSplit.incrementAndGet()
+        for (i in chunks.indices) {
+            out.write(chunks[i])
+            out.flush()
+            if (i < chunks.size - 1) {
+                try { Thread.sleep(2L) } catch (_: InterruptedException) { break }
+            }
+        }
+    }
+
+    private fun readCompleteFirstFlight(inp: InputStream, initial: ByteArray = ByteArray(0)): ByteArray {
+        val acc = ByteArrayOutputStream()
+        if (initial.isNotEmpty()) acc.write(initial)
+        val tmp = ByteArray(4096)
+        if (acc.size() == 0) {
+            val n = inp.read(tmp)
+            if (n <= 0) return ByteArray(0)
+            acc.write(tmp, 0, n)
+        }
+        var cur = acc.toByteArray()
+        if (cur.size >= 5 && (cur[0].toInt() and 0xFF) == 0x16 && (cur[1].toInt() and 0xFF) == 0x03) {
+            val need = 5 + IpPackets.u16(cur, 3)
+            while (acc.size() < need && need <= 16389) {
+                val n = inp.read(tmp)
+                if (n <= 0) break
+                acc.write(tmp, 0, n)
+            }
+            cur = acc.toByteArray()
+        }
+        return cur
+    }
+
+    private fun bridgeBidirectional(clientSock: Socket, clientIn: InputStream, clientOut: OutputStream, upstream: UpstreamChannel) {
+        clientSock.soTimeout = 90_000
+        upstream.setSoTimeout(90_000)
+        val upThread = Thread({
+            val buf = ByteArray(16384)
+            try {
+                while (running.get()) {
+                    val n = clientIn.read(buf)
+                    if (n < 0) break
+                    bytesUp.addAndGet(n.toLong())
+                    upstream.outputStream.write(buf, 0, n)
+                    upstream.outputStream.flush()
+                }
+            } catch (_: Throwable) {
+            } finally {
+                upstream.shutdownOutput()
+            }
+        }, "freedom-pipe-up").apply {
+            isDaemon = true
+            start()
+        }
+        val buf = ByteArray(16384)
+        try {
+            while (running.get()) {
+                val n = upstream.inputStream.read(buf)
+                if (n < 0) break
+                bytesDown.addAndGet(n.toLong())
+                clientOut.write(buf, 0, n)
+                clientOut.flush()
+            }
+        } catch (_: Throwable) {
+        } finally {
+            runCatching { clientSock.shutdownOutput() }
+            runCatching { upstream.close() }
+            runCatching { upThread.join(1500) }
+        }
+    }
+
+    private fun tunnelWithDpiRetry(
+        clientSock: Socket,
+        clientIn: InputStream,
+        clientOut: OutputStream,
+        dstHost: String,
+        dstPort: Int,
+        sendSuccessBanner: () -> Unit,
+    ) {
+        val cachedLevel = hostStrategyCache[dstHost.lowercase()] ?: 0
+        val (firstUp, masked) = openUpstream(dstHost, dstPort, 0)
+        if (masked) {
+            firstUp.use {
+                sendSuccessBanner()
+                bridgeBidirectional(clientSock, clientIn, clientOut, firstUp)
+            }
+            return
+        }
+        sendSuccessBanner()
+        val firstFlight = readCompleteFirstFlight(clientIn)
+        if (firstFlight.isEmpty()) {
+            firstUp.close()
+            return
+        }
+        var currentUp: UpstreamChannel? = firstUp
+        for (attempt in 0..1) {
+            val strat = maxOf(cachedLevel, attempt)
+            val up = currentUp ?: runCatching { openUpstream(dstHost, dstPort, attempt).first }.getOrNull() ?: return
+            currentUp = null
+            try {
+                writeDpiFirstFlight(up.outputStream, firstFlight, strat)
+                up.setSoTimeout(3800)
+                val firstResp = ByteArray(16384)
+                val n = try {
+                    up.inputStream.read(firstResp)
+                } catch (e: IOException) {
+                    if (attempt == 0 && e !is SocketTimeoutException) -2 else throw e
+                }
+                if (n > 0) {
+                    hostStrategyCache[dstHost.lowercase()] = strat
+                    bytesDown.addAndGet(n.toLong())
+                    clientOut.write(firstResp, 0, n)
+                    clientOut.flush()
+                    try {
+                        bridgeBidirectional(clientSock, clientIn, clientOut, up)
+                    } finally {
+                        up.close()
+                    }
+                    return
+                } else if (n == -1 && attempt == 1) {
+                    up.close()
+                    return
+                } else {
+                    up.close()
+                    if (attempt == 0) {
+                        tlsAdaptiveRetries.incrementAndGet()
+                        rstDropped.incrementAndGet()
+                        WindowsLogBus.append("DPI", "$dstHost için anında RST/EOF algılandı; 4-parçalı ince TLS bölme ile tekrar deneniyor")
+                        continue
+                    }
+                    return
+                }
+            } catch (t: Throwable) {
+                up.close()
+                if (attempt == 0) {
+                    tlsAdaptiveRetries.incrementAndGet()
+                    if (t is IOException && t !is SocketTimeoutException) rstDropped.incrementAndGet()
+                    WindowsLogBus.append("DPI", "$dstHost ilk uçuş hatası (${t.message}); 4-parçalı ince TLS bölme ile tekrar deneniyor")
+                    continue
+                }
+                throw t
+            }
+        }
+    }
+
+    private fun readHttpLine(input: InputStream): String {
+        val sb = StringBuilder()
+        while (sb.length < 8192) {
+            val c = input.read()
+            if (c < 0) throw IOException("EOF")
+            if (c == '\n'.code) break
+            if (c != '\r'.code) sb.append(c.toChar())
+        }
+        return sb.toString()
+    }
+
+    private fun readExact(input: InputStream, n: Int): ByteArray {
+        val out = ByteArray(n)
+        var got = 0
+        while (got < n) {
+            val k = input.read(out, got, n - got)
+            if (k < 0) throw IOException("EOF")
+            got += k
+        }
+        return out
+    }
+
+    private fun isBlockedDestination(host: String, port: Int): String? {
+        if (blockQuicAndLeaks && IpPackets.isLeakRiskTcpPort(port)) return "STUN/IP-Discovery"
+        if (blockTrackers && IpPackets.isTrackerOrAdDomain(host)) return "Tracker/Telemetry"
+        return null
+    }
+
+    private fun handleClient(clientSock: Socket) {
+        connections.incrementAndGet()
+        clientSock.use { sock ->
+            val pb = PushbackInputStream(BufferedInputStream(sock.inputStream, 16384), 16)
+            val out = BufferedOutputStream(sock.outputStream)
+            val b0 = pb.read()
+            if (b0 < 0) return
+            pb.unread(b0)
+            if (b0 == 0x05) {
+                handleSocks5(sock, pb, out)
+            } else {
+                handleHttp(sock, pb, out)
+            }
+        }
+    }
+
+    private fun handleSocks5(sock: Socket, inp: InputStream, out: OutputStream) {
+        val hdr = readExact(inp, 2)
+        if (hdr[0].toInt() != 0x05) return
+        val nMethods = hdr[1].toInt() and 0xFF
+        if (nMethods > 0) readExact(inp, nMethods)
+        out.write(byteArrayOf(0x05, 0x00)); out.flush()
+
+        val req = readExact(inp, 4)
+        if (req[0].toInt() != 0x05) return
+        val cmd = req[1].toInt() and 0xFF
+        val atyp = req[3].toInt() and 0xFF
+        val dstHost = when (atyp) {
+            0x01 -> {
+                val b = readExact(inp, 4)
+                "${b[0].toInt() and 0xFF}.${b[1].toInt() and 0xFF}.${b[2].toInt() and 0xFF}.${b[3].toInt() and 0xFF}"
+            }
+            0x03 -> {
+                val len = readExact(inp, 1)[0].toInt() and 0xFF
+                String(readExact(inp, len), Charsets.US_ASCII)
+            }
+            0x04 -> InetAddress.getByAddress(readExact(inp, 16)).hostAddress
+            else -> return
+        }
+        val portBytes = readExact(inp, 2)
+        val dstPort = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
+
+        if (cmd == 0x03) {
+            if (blockQuicAndLeaks) leaksBlocked.incrementAndGet()
+            out.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0)); out.flush()
+            return
+        }
+        if (cmd != 0x01) {
+            out.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0)); out.flush()
+            return
+        }
+        val blocked = isBlockedDestination(dstHost, dstPort)
+        if (blocked != null) {
+            if (blocked == "Tracker/Telemetry") trackersBlocked.incrementAndGet() else leaksBlocked.incrementAndGet()
+            out.write(byteArrayOf(0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0)); out.flush()
+            return
+        }
+        tunnelWithDpiRetry(sock, inp, out, dstHost, dstPort) {
+            out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+            out.flush()
+        }
+    }
+
+    private fun parseHostPort(raw: String, defaultPort: Int): Pair<String, Int>? {
+        val t = raw.trim()
+        if (t.isEmpty()) return null
+        if (t.startsWith("[")) {
+            val end = t.indexOf(']')
+            if (end <= 1) return null
+            val h = t.substring(1, end)
+            val p = if (end + 1 < t.length && t[end + 1] == ':') t.substring(end + 2).toIntOrNull() ?: defaultPort else defaultPort
+            return h to p
+        }
+        val colon = t.lastIndexOf(':')
+        return if (colon > 0 && colon == t.indexOf(':')) {
+            t.substring(0, colon) to (t.substring(colon + 1).toIntOrNull() ?: defaultPort)
+        } else {
+            t to defaultPort
+        }
+    }
+
+    private fun handleHttp(sock: Socket, inp: InputStream, out: OutputStream) {
+        val reqLine = readHttpLine(inp)
+        val parts = reqLine.split(' ')
+        if (parts.size < 3) return
+        val method = parts[0].uppercase(Locale.US)
+        val target = parts[1]
+        val version = parts[2]
+        val headerLines = ArrayList<String>()
+        var hostHeader = ""
+        while (true) {
+            val line = readHttpLine(inp)
+            if (line.isEmpty()) break
+            if (line.startsWith("Host:", ignoreCase = true)) hostHeader = line.substring(5).trim()
+            if (!line.startsWith("Proxy-Connection:", ignoreCase = true) &&
+                !line.startsWith("Proxy-Authorization:", ignoreCase = true)
+            ) {
+                headerLines.add(line)
+            }
+        }
+        if (method == "CONNECT") {
+            val (dstHost, dstPort) = parseHostPort(target, 443) ?: return
+            val blocked = isBlockedDestination(dstHost, dstPort)
+            if (blocked != null) {
+                if (blocked == "Tracker/Telemetry") trackersBlocked.incrementAndGet() else leaksBlocked.incrementAndGet()
+                out.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                out.flush()
+                return
+            }
+            tunnelWithDpiRetry(sock, inp, out, dstHost, dstPort) {
+                out.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                out.flush()
+            }
+            return
+        }
+
+        // Plain HTTP forwarding with URL tracking param stripping & DevicePersona spoofing
+        var relPath = target
+        var dstHost = ""
+        var dstPort = 80
+        if (target.startsWith("http://", ignoreCase = true)) {
+            val uri = runCatching { URI(target) }.getOrNull() ?: return
+            dstHost = uri.host ?: return
+            dstPort = if (uri.port > 0) uri.port else 80
+            val p = uri.rawPath.orEmpty().ifEmpty { "/" }
+            val q = uri.rawQuery?.let { "?$it" }.orEmpty()
+            relPath = "$p$q"
+        } else {
+            val hp = parseHostPort(hostHeader, 80) ?: return
+            dstHost = hp.first
+            dstPort = hp.second
+        }
+        val blocked = isBlockedDestination(dstHost, dstPort)
+        if (blocked != null) {
+            if (blocked == "Tracker/Telemetry") trackersBlocked.incrementAndGet() else leaksBlocked.incrementAndGet()
+            out.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".toByteArray(Charsets.US_ASCII))
+            out.flush()
+            return
+        }
+        val rawHttp = StringBuilder("$method $relPath $version\r\n")
+        for (h in headerLines) rawHttp.append(h).append("\r\n")
+        rawHttp.append("\r\n")
+        val rawBytes = rawHttp.toString().toByteArray(Charsets.ISO_8859_1)
+        val clean = IpPackets.sanitizePlainHttpHeaders(
+            rawBytes,
+            persona = persona,
+            stripGeoHeaders = persona != DevicePersona.OFF,
+            stripTrackingParams = stripUrlParams,
+        )
+        if (clean !== rawBytes) {
+            leaksBlocked.incrementAndGet()
+            if (IpPackets.stripUrlTrackingParamsFromRequestLine("$method $relPath $version").second) {
+                paramsStripped.incrementAndGet()
+            }
+        }
+        val (up, masked) = openUpstream(dstHost, dstPort, 0)
+        up.use {
+            if (masked) {
+                up.outputStream.write(clean)
+                up.outputStream.flush()
+            } else {
+                writeDpiFirstFlight(up.outputStream, clean, 0)
+            }
+            bridgeBidirectional(sock, inp, out, up)
+        }
+    }
+
+    override fun close() {
+        if (!running.compareAndSet(true, false)) return
+        localPort = 0
+        runCatching { serverSocket?.close() }
+        runCatching { warpStack?.close() }
+        runCatching { warpTunnel?.close() }
+        runCatching { internalDoh?.close() }
+        runCatching { acceptThread?.interrupt() }
+        ioPool.shutdownNow()
+        WindowsLogBus.append("Proxy", "Yerel motor durduruldu")
     }
 }
 
@@ -4551,9 +6296,12 @@ fun runCli(args: List<String>): Int {
     val alt = ArrayList<String>()
     val doh = ArrayList<String>()
     var system = false
+    var serve = false
+    var routeMode = WindowsRouteMode.AUTO_WARP
+    var relayUri = ""
     var desyncMode = DesyncMode.OFF
     var proxyPort = -1
-    var personaId = DevicePersona.IPHONE_19_BETA.id
+    var persona = DevicePersona.IPHONE_19_BETA
     var blockTrackers = true
     var stripUrlParams = true
     var i = 0
@@ -4562,7 +6310,8 @@ fun runCli(args: List<String>): Int {
             "--help", "-h" -> {
                 println("Freedom Network CLI ${runCatching { Native.engineVersion() }.getOrElse { "native" }}")
                 println("Kullanım: FreedomNetwork --cli [hedef ...] [--dns IP] [--alt IP] [--doh URL]")
-                println("          [--desync reality|split|disorder|badsum|ttl|quic|adaptive] [--proxy PORT]")
+                println("          [--mode warp|hybrid|relay] [--relay URI] [--proxy PORT] [--serve]")
+                println("          [--desync reality|split|disorder|badsum|ttl|quic|adaptive]")
                 println("          [--persona iphone19|android19|pixel14|off] [--no-trackers] [--no-strip] [--system]")
                 return 0
             }
@@ -4571,15 +6320,28 @@ fun runCli(args: List<String>): Int {
             "--alt" -> alt += args.getOrNull(++i) ?: ""
             "--doh" -> doh += args.getOrNull(++i) ?: ""
             "--system" -> system = true
+            "--serve" -> serve = true
+            "--mode" -> {
+                val m = (args.getOrNull(++i) ?: "warp").lowercase()
+                routeMode = when (m) {
+                    "hybrid", "dpi" -> WindowsRouteMode.HYBRID_DPI
+                    "relay", "tor" -> WindowsRouteMode.CUSTOM_RELAY
+                    else -> WindowsRouteMode.AUTO_WARP
+                }
+            }
+            "--relay" -> {
+                relayUri = args.getOrNull(++i) ?: ""
+                if (relayUri.isNotBlank()) routeMode = WindowsRouteMode.CUSTOM_RELAY
+            }
             "--no-trackers" -> blockTrackers = false
             "--no-strip" -> stripUrlParams = false
             "--persona" -> {
                 val p = (args.getOrNull(++i) ?: "iphone19").lowercase()
-                personaId = when (p) {
-                    "off", "0", "none" -> ""
-                    "android", "android19" -> DevicePersona.ANDROID_19_QUANTUM.id
-                    "pixel", "pixel14" -> DevicePersona.PIXEL_14_FUTURE.id
-                    else -> DevicePersona.IPHONE_19_BETA.id
+                persona = when (p) {
+                    "off", "0", "none" -> DevicePersona.OFF
+                    "android", "android19" -> DevicePersona.ANDROID_19_QUANTUM
+                    "pixel", "pixel14" -> DevicePersona.PIXEL_14_FUTURE
+                    else -> DevicePersona.IPHONE_19_BETA
                 }
             }
             "--desync" -> {
@@ -4613,20 +6375,26 @@ fun runCli(args: List<String>): Int {
                 )
                 print(Text.report(report))
             }
-            if (desyncMode != DesyncMode.OFF || proxyPort >= 0) {
-                val mode = if (desyncMode != DesyncMode.OFF) desyncMode else DesyncMode.REALITY_VISION
-                val ps = session.startProxy(
-                    DesyncConfig(
-                        mode = mode,
-                        port = if (proxyPort >= 0) proxyPort else 0,
-                        persona = personaId,
-                        blockTrackers = blockTrackers,
-                        stripUrlParams = stripUrlParams,
-                    ),
-                )
-                println()
-                print(Text.proxyStatus(ps))
-                session.stopProxy()
+            if (desyncMode != DesyncMode.OFF || proxyPort >= 0 || serve) {
+                val bindPort = if (proxyPort >= 0) proxyPort else 8880
+                WindowsNextGenProxy(
+                    port = bindPort,
+                    routeMode = routeMode,
+                    customRelayUri = relayUri,
+                    persona = persona,
+                    blockTrackers = blockTrackers,
+                    stripUrlParams = stripUrlParams,
+                ).use { proxy ->
+                    val bound = proxy.start()
+                    println()
+                    println("FREEDOM NETWORK (YENİ NESİL VEKİL): 127.0.0.1:$bound · Rota: ${proxy.routeLabel}")
+                    if (serve) {
+                        println("Vekil çalışıyor (çıkmak için Ctrl+C)...")
+                        while (!Thread.currentThread().isInterrupted) {
+                            try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+                        }
+                    }
+                }
             }
             if (system) {
                 println()
@@ -5263,6 +7031,8 @@ class FreedomButton(
     textColor: Color = Color(226, 232, 240),
     var borderColor: Color = Color(51, 65, 85),
     private val arc: Int = 10,
+    private val leftAlign: Boolean = false,
+    private val iconDrawer: ((Graphics2D, Int, Int, Int, Color) -> Unit)? = null,
 ) : JButton(text) {
     private var hovered = false
     private var pressed = false
@@ -5301,7 +7071,8 @@ class FreedomButton(
     override fun getPreferredSize(): Dimension {
         if (isPreferredSizeSet) return super.getPreferredSize()
         val fm = getFontMetrics(font)
-        val w = fm.stringWidth(text ?: "") + margin.left + margin.right + 4
+        val iconReserve = if (iconDrawer != null) 22 else 0
+        val w = fm.stringWidth(text ?: "") + margin.left + margin.right + 4 + iconReserve
         val h = maxOf(32, fm.height + margin.top + margin.bottom)
         return Dimension(w, h)
     }
@@ -5337,12 +7108,27 @@ class FreedomButton(
         g2.drawRoundRect(0, 0, w - 1, h - 1, arc, arc)
 
         val label = text ?: ""
-        if (label.isNotEmpty()) {
-            g2.font = font
-            val fm = g2.fontMetrics
-            g2.color = if (isEnabled) foreground else Color(100, 116, 139)
-            val tx = ((w - fm.stringWidth(label)) / 2).coerceAtLeast(6)
-            val ty = ((h - fm.height) / 2) + fm.ascent
+        val fgColor = if (isEnabled) foreground else Color(100, 116, 139)
+        g2.font = font
+        val fm = g2.fontMetrics
+        val drawer = iconDrawer
+        val ty = ((h - fm.height) / 2) + fm.ascent
+        if (drawer != null) {
+            if (leftAlign) {
+                val iconCx = 19
+                drawer(g2, iconCx, h / 2, 15, fgColor)
+                g2.color = fgColor
+                g2.drawString(label, 36, ty)
+            } else {
+                val totalW = 16 + 7 + fm.stringWidth(label)
+                val startX = ((w - totalW) / 2).coerceAtLeast(8)
+                drawer(g2, startX + 8, h / 2, 15, fgColor)
+                g2.color = fgColor
+                g2.drawString(label, startX + 23, ty)
+            }
+        } else if (label.isNotEmpty()) {
+            g2.color = fgColor
+            val tx = if (leftAlign) 14 else ((w - fm.stringWidth(label)) / 2).coerceAtLeast(6)
             g2.drawString(label, tx, ty)
         }
         g2.dispose()
@@ -5431,6 +7217,18 @@ internal object FreedomDarkTheme {
         UIManager.put("CheckBox.background", bg)
         UIManager.put("CheckBox.foreground", muted)
         UIManager.put("CheckBox.focus", transparent)
+        UIManager.put("ComboBox.background", surface)
+        UIManager.put("ComboBox.foreground", fg)
+        UIManager.put("ComboBox.selectionBackground", Color(30, 58, 138))
+        UIManager.put("ComboBox.selectionForeground", Color.WHITE)
+        UIManager.put("ComboBox.buttonBackground", Color(23, 34, 54))
+        UIManager.put("ComboBox.buttonShadow", border)
+        UIManager.put("ComboBox.buttonDarkShadow", bg)
+        UIManager.put("ComboBox.buttonHighlight", Color(51, 65, 85))
+        UIManager.put("List.background", surface)
+        UIManager.put("List.foreground", fg)
+        UIManager.put("List.selectionBackground", Color(30, 58, 138))
+        UIManager.put("List.selectionForeground", Color.WHITE)
         UIManager.put("TextArea.background", surface)
         UIManager.put("TextArea.foreground", fg)
         UIManager.put("TextArea.caretForeground", accent)
@@ -5469,6 +7267,41 @@ internal object FreedomDarkTheme {
             unitIncrement = 16
         }
         setCorner(ScrollPaneConstants.LOWER_RIGHT_CORNER, JPanel().apply { background = Color(9, 13, 22) })
+    }
+
+    fun styleField(tf: JTextField, tooltip: String = ""): JTextField = tf.apply {
+        background = Color(14, 22, 38)
+        foreground = Color(241, 245, 249)
+        caretColor = Color(56, 189, 248)
+        font = Font("Segoe UI", Font.PLAIN, 12)
+        border = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(Color(38, 52, 74), 1),
+            BorderFactory.createEmptyBorder(5, 8, 5, 8),
+        )
+        if (tooltip.isNotEmpty()) toolTipText = tooltip
+    }
+
+    fun styleCombo(cb: JComboBox<String>): JComboBox<String> = cb.apply {
+        background = Color(14, 22, 38)
+        foreground = Color(226, 232, 240)
+        font = Font("Segoe UI", Font.PLAIN, 12)
+        border = BorderFactory.createLineBorder(Color(38, 52, 74), 1)
+        isFocusable = false
+        renderer = object : javax.swing.DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                list: javax.swing.JList<*>?,
+                value: Any?,
+                index: Int,
+                isSelected: Boolean,
+                cellHasFocus: Boolean,
+            ): java.awt.Component {
+                val lbl = super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus) as JLabel
+                lbl.background = if (isSelected) Color(30, 58, 138) else Color(14, 22, 38)
+                lbl.foreground = if (isSelected) Color.WHITE else Color(226, 232, 240)
+                lbl.border = BorderFactory.createEmptyBorder(4, 8, 4, 8)
+                return lbl
+            }
+        }
     }
 }
 
@@ -5562,123 +7395,59 @@ object WindowsSystemProxy {
     }
 }
 
-/**
- * MainWindow:
- * Freedom Network 2026–2027 Windows desktop architecture with 3 segmented navigation tabs:
- * 1. KONTROL (Freedom Hero Power Shield, WinINet System Proxy Toggle, Persona, Dual-Path Leak Test & Metrics)
- * 2. TEŞHİS (ISP Out-of-Tunnel Diagnostic Runner, Targets, Monospace Output, Copy)
- * 3. GÜNLÜK & SİSTEM (System Connection Explorer, Socket Diagnostics, Copy)
- */
-class MainWindow {
-    private val frame = JFrame("Freedom Network — 2026–2027 Özgür Ağ Motoru")
-    private val pulsePanel = ModernPowerShieldPanel()
-    private val sparkline = ThroughputSparklinePanel()
-    private val cardTcp = ModernStatCard(0, "TCP DESYNC", Color(16, 185, 129))
-    private val cardVision = ModernStatCard(1, "VISION & GİZLİLİK", Color(56, 189, 248))
-    private val cardFake = ModernStatCard(2, "SAHTE & KALKAN", Color(167, 139, 250))
-    private val cardDns = ModernStatCard(3, "ŞİFRELİ DoH3 / ECH", Color(251, 191, 36))
-
-    private var selectedPersona = DevicePersona.IPHONE_19_BETA
-    private var advancedExpanded = false
-    private var systemProxyDesired = false
-
-    private val statusPill = JLabel("KORUMA KAPALI · DOKUNARAK BAĞLANIN", JLabel.CENTER).apply {
-        isOpaque = true
-        background = Color(11, 18, 32)
-        font = Font("Segoe UI", Font.BOLD, 11)
-        foreground = Color(148, 163, 184)
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-            BorderFactory.createEmptyBorder(5, 14, 5, 14),
-        )
+/** Dark glass rounded card container with crisp border and zero native Swing chrome. */
+private class GlassCardPanel(
+    private val cardBg: Color = Color(12, 19, 34),
+    private var cardBorder: Color = Color(30, 41, 59),
+    private val arc: Int = 14,
+) : JPanel(BorderLayout(8, 6)) {
+    init {
+        isOpaque = false
+        border = BorderFactory.createEmptyBorder(11, 13, 11, 13)
     }
 
-    private val ipCardDetail = JLabel("Yerel DPI Proxy + Dahili WireGuard WARP Kripto Hazır").apply {
-        font = Font("Segoe UI", Font.PLAIN, 11)
-        foreground = Color(226, 232, 240)
+    override fun paintComponent(g: Graphics) {
+        val g2 = g.create() as Graphics2D
+        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        g2.color = cardBg
+        g2.fillRoundRect(0, 0, width - 1, height - 1, arc, arc)
+        g2.color = cardBorder
+        g2.stroke = BasicStroke(1f)
+        g2.drawRoundRect(0, 0, width - 1, height - 1, arc, arc)
+        g2.dispose()
+        super.paintComponent(g)
     }
-    private val btnSystemProxyToggle = FreedomButton(
-        "Sistem Vekili: Kapalı",
-        fillColor = Color(15, 27, 46),
-        textColor = Color(148, 163, 184),
-        borderColor = Color(51, 65, 85),
-    )
-    private val btnPersonaCycle = FreedomButton(
-        selectedPersona.shortLabel,
-        fillColor = Color(46, 16, 101),
-        textColor = Color(233, 213, 255),
-        borderColor = Color(124, 58, 237),
-    )
-    private val btnLeakTest = FreedomButton(
-        "Gizlilik & Çift-Yol Testi",
-        fillColor = Color(15, 27, 46),
-        textColor = Color(56, 189, 248),
-        borderColor = Color(29, 78, 216),
-    )
-    private val leakTestResult = JLabel("İzleyici & URL Parametre Temizliği + HTTP Kimlik Maskeleme + WireGuard hazır").apply {
-        font = Font("Segoe UI", Font.PLAIN, 10)
-        foreground = Color(148, 163, 184)
-    }
+}
 
-    private val targets = JTextArea("cloudflare.com\nwikipedia.org\nietf.org", 2, 35).apply {
-        background = Color(14, 22, 38)
-        foreground = Color.WHITE
-        caretColor = Color(56, 189, 248)
-        font = Font("Segoe UI", Font.PLAIN, 12)
-        border = BorderFactory.createEmptyBorder(4, 6, 4, 6)
-    }
-    private val altDns = JTextField(25).apply {
-        background = Color(14, 22, 38)
-        foreground = Color.WHITE
-        caretColor = Color(56, 189, 248)
-        font = Font("Segoe UI", Font.PLAIN, 12)
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-            BorderFactory.createEmptyBorder(4, 6, 4, 6),
-        )
-    }
-    private val dohEndpoints = JTextField(25).apply {
-        toolTipText = "Örnek: https://1.1.1.1/dns-query"
-        background = Color(14, 22, 38)
-        foreground = Color.WHITE
-        caretColor = Color(56, 189, 248)
-        font = Font("Segoe UI", Font.PLAIN, 12)
-        border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-            BorderFactory.createEmptyBorder(4, 6, 4, 6),
-        )
-    }
-    private val runButton = FreedomButton(
-        "Ağ Tanıla",
-        fillColor = Color(37, 99, 235),
-        textColor = Color.WHITE,
-        borderColor = Color(59, 130, 246),
-    ).apply { font = Font("Segoe UI", Font.BOLD, 12) }
+private object FreedomUiHelpers {
+    fun pillLabel(text: String, fg: Color = Color(148, 163, 184), bg: Color = Color(13, 21, 37), borderCol: Color = Color(30, 41, 59)): JLabel =
+        JLabel(text, SwingConstants.CENTER).apply {
+            isOpaque = true
+            background = bg
+            foreground = fg
+            font = Font("Segoe UI", Font.BOLD, 10)
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(borderCol, 1),
+                BorderFactory.createEmptyBorder(4, 10, 4, 10),
+            )
+        }
 
-    private val heroActionButton = FreedomButton(
-        "ÖZGÜR AĞI BAŞLAT (DPI Aşma + Gizlilik)",
-        fillColor = Color(16, 185, 129),
-        textColor = Color(4, 22, 16),
-        borderColor = Color(52, 211, 153),
-        arc = 12,
-    ).apply { font = Font("Segoe UI", Font.BOLD, 12) }
+    fun sectionHeader(title: String, accent: Color, rightComp: java.awt.Component? = null): JPanel =
+        JPanel(BorderLayout(8, 0)).apply {
+            isOpaque = false
+            add(
+                JLabel(title).apply {
+                    font = Font("Segoe UI", Font.BOLD, 10)
+                    foreground = accent
+                },
+                BorderLayout.WEST,
+            )
+            if (rightComp != null) add(rightComp, BorderLayout.EAST)
+        }
 
-    private val systemButton = FreedomButton(
-        "Sistem Bağlantıları",
-        fillColor = Color(30, 41, 59),
-        textColor = Color(226, 232, 240),
-        borderColor = Color(71, 85, 105),
-    )
-    private val appliedButton = FreedomButton(
-        "Öneriyi Doğrula",
-        fillColor = Color(30, 41, 59),
-        textColor = Color(226, 232, 240),
-        borderColor = Color(51, 65, 85),
-    ).apply { isEnabled = false }
-
-    private val auto = JCheckBox("Ağ değişince yeniden tanıla", false).apply {
-        foreground = Color(148, 163, 184)
-        background = Color(7, 11, 20)
+    fun darkCheckBox(text: String, checked: Boolean): JCheckBox = JCheckBox(text, checked).apply {
+        foreground = Color(203, 213, 225)
+        background = Color(12, 19, 34)
         isOpaque = false
         isContentAreaFilled = false
         isBorderPainted = false
@@ -5688,104 +7457,876 @@ class MainWindow {
         font = Font("Segoe UI", Font.PLAIN, 11)
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
     }
-    private val output = JTextArea().apply {
+
+    fun monoLogArea(initial: String, fgColor: Color): JTextArea = JTextArea().apply {
         isEditable = false
         font = Font(Font.MONOSPACED, Font.PLAIN, 12)
         lineWrap = true
         wrapStyleWord = true
-        background = Color(9, 13, 22)
-        foreground = Color(226, 232, 240)
-        border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
+        background = Color(8, 13, 24)
+        foreground = fgColor
+        caretColor = Color(56, 189, 248)
+        border = BorderFactory.createEmptyBorder(8, 10, 8, 10)
+        text = initial
     }
+
+    fun clipboardCopy(text: String, statusLabel: JLabel, msg: String) {
+        runCatching {
+            val sel = StringSelection(text)
+            Toolkit.getDefaultToolkit().systemClipboard.setContents(sel, sel)
+        }
+        statusLabel.text = msg
+    }
+}
+
+/**
+ * MainWindow:
+ * Freedom Network 2026–2027 4-Workspace Obsidian/Glass Command Center for Windows 10/11:
+ * 0. Kontrol Merkezi (Hero Shield, Auto-WARP/DPI/Relay Routing, Live IP Verification, Sparkline & 2x2 Cards)
+ * 1. Tarayıcı & Gizlilik (Isolated QUIC-free Chromium Launcher, DevicePersona Masking, Leak Shield & Dual-Path Test)
+ * 2. Ağ Teşhis Lab (Preset Censorship Targets, DoH/Alt-DNS Diagnostics, Verification & Copy)
+ * 3. Sistem & Günlük (Real-time Internal Engine Log Bus & System-Wide Socket Snapshot Inspector)
+ */
+class MainWindow {
+    private val frame: JFrame by lazy { JFrame("Freedom Network — 2026–2027 Özgür Ağ Komuta Merkezi") }
+    private val pulsePanel = ModernPowerShieldPanel().apply { preferredSize = Dimension(320, 176) }
+    private val sparkline = ThroughputSparklinePanel().apply { preferredSize = Dimension(380, 108) }
+    private val cardTcp = ModernStatCard(0, "TÜNEL & DPI", Color(16, 185, 129))
+    private val cardVision = ModernStatCard(1, "İZLEYİCİ & URL", Color(56, 189, 248))
+    private val cardFake = ModernStatCard(2, "QUIC & STUN KALKANI", Color(167, 139, 250))
+    private val cardDns = ModernStatCard(3, "ŞİFRELİ DoH3 / ECH", Color(251, 191, 36))
+
+    private val proxyLock = ReentrantLock()
+    @Volatile private var activeProxy: WindowsNextGenProxy? = null
+    @Volatile private var selectedRouteMode = WindowsRouteMode.AUTO_WARP
+    @Volatile private var selectedPersona = DevicePersona.IPHONE_19_BETA
+    @Volatile private var systemProxyDesired = true
+    @Volatile private var blockTrackersDesired = true
+    @Volatile private var stripUrlParamsDesired = true
+    @Volatile private var blockQuicLeaksDesired = true
+
+    private var activeWorkspaceIdx = 0
+    private var builtRoot: JPanel? = null
+
+    private val topRoutePill = FreedomUiHelpers.pillLabel("Rota: Hazır · WARP / DoH3", Color(56, 189, 248))
+    private val topDnsQuicPill = FreedomUiHelpers.pillLabel("DoH3 + QUIC Kalkanı: Açık", Color(16, 185, 129))
+    private val topPersonaPill = FreedomUiHelpers.pillLabel("Kimlik: iPhone 19 Beta", Color(196, 181, 253))
+    private val topSysProxyPill = FreedomUiHelpers.pillLabel("Sistem Vekili: Otomatik", Color(251, 191, 36))
+    private val sidebarStateBadge = FreedomUiHelpers.pillLabel("● HAZIR", Color(148, 163, 184), Color(15, 23, 42), Color(51, 65, 85))
+
+    private val navButtons = listOf(
+        FreedomButton("Kontrol Merkezi", arc = 10, leftAlign = true, iconDrawer = SwingVectorIcons::drawShield),
+        FreedomButton("Tarayıcı & Gizlilik", arc = 10, leftAlign = true, iconDrawer = SwingVectorIcons::drawGlobe),
+        FreedomButton("Ağ Teşhis Lab", arc = 10, leftAlign = true, iconDrawer = SwingVectorIcons::drawRadar),
+        FreedomButton("Sistem & Günlük", arc = 10, leftAlign = true, iconDrawer = SwingVectorIcons::drawTerminal),
+    )
+    private val btnQuickDiscord = FreedomButton(
+        "Discord'u Korumalı Aç",
+        fillColor = Color(30, 58, 138),
+        textColor = Color.WHITE,
+        borderColor = Color(56, 189, 248),
+        arc = 10,
+        iconDrawer = SwingVectorIcons::drawBolt,
+    )
+
+    private val statusPill = FreedomUiHelpers.pillLabel(
+        "KORUMA KAPALI · TEK TIKLA BAĞLANIN",
+        fg = Color(148, 163, 184),
+        bg = Color(10, 17, 30),
+        borderCol = Color(30, 41, 59),
+    )
+    private val heroActionButton = FreedomButton(
+        "ÖZGÜR AĞI BAŞLAT",
+        fillColor = Color(16, 185, 129),
+        textColor = Color(4, 22, 16),
+        borderColor = Color(52, 211, 153),
+        arc = 12,
+        iconDrawer = SwingVectorIcons::drawPower,
+    ).apply {
+        font = Font("Segoe UI", Font.BOLD, 12)
+        preferredSize = Dimension(310, 42)
+    }
+
+    private val btnModeWarp = FreedomButton("Otomatik WARP", arc = 8)
+    private val btnModeHybrid = FreedomButton("Hızlı DPI", arc = 8)
+    private val btnModeRelay = FreedomButton("Özel Röle", arc = 8)
+    private val txtRelayUri = FreedomDarkTheme.styleField(
+        JTextField("socks5://127.0.0.1:9050"),
+        "Örnek: socks5://127.0.0.1:9050 veya http://user:pass@host:port",
+    )
+    private val btnSystemProxyToggle = FreedomButton(
+        "WinINet Sistem Vekili: Otomatik Açık",
+        fillColor = Color(15, 27, 46),
+        textColor = Color(251, 191, 36),
+        borderColor = Color(217, 119, 6),
+        arc = 9,
+    )
+
+    private val ipCardDetail = JLabel("Hazır · WARP WireGuard -> Tor :9050 -> Hibrit DPI + DoH3").apply {
+        font = Font("Segoe UI", Font.BOLD, 11)
+        foreground = Color(226, 232, 240)
+    }
+    private val directIpLabel = JLabel("Doğrudan Ağ IP: ölçülmedi").apply {
+        font = Font("Segoe UI", Font.PLAIN, 10)
+        foreground = Color(148, 163, 184)
+    }
+    private val proxyIpLabel = JLabel("Tünel / Vekil Çıkışı: koruma açıldığında doğrulanır").apply {
+        font = Font("Segoe UI", Font.PLAIN, 10)
+        foreground = Color(148, 163, 184)
+    }
+    private val btnVerifyIp = FreedomButton(
+        "Canlı IP Doğrula",
+        fillColor = Color(15, 27, 46),
+        textColor = Color(56, 189, 248),
+        borderColor = Color(29, 78, 216),
+        arc = 9,
+    )
+
+    private val detectedBrowsers = WindowsBrowserLauncher.detectBrowsers()
+    private val cmbBrowser = FreedomDarkTheme.styleCombo(
+        JComboBox<String>(
+            if (detectedBrowsers.isNotEmpty()) {
+                detectedBrowsers.map { it.name }.toTypedArray()
+            } else {
+                arrayOf("Chrome / Edge / Brave bulunamadı (Sistem Vekili Kullan)")
+            },
+        ),
+    )
+    private val txtBrowserUrl = FreedomDarkTheme.styleField(
+        JTextField("https://discord.com/"),
+        "Korumalı profilde açılacak hedef adres",
+    )
+    private val btnLaunchBrowser = FreedomButton(
+        "Korumalı Tarayıcı Aç",
+        fillColor = Color(16, 185, 129),
+        textColor = Color(4, 22, 16),
+        borderColor = Color(52, 211, 153),
+        arc = 10,
+        iconDrawer = SwingVectorIcons::drawGlobe,
+    )
+    private val btnLaunchDiscord = FreedomButton(
+        "Discord'u Aç",
+        fillColor = Color(30, 58, 138),
+        textColor = Color.WHITE,
+        borderColor = Color(56, 189, 248),
+        arc = 10,
+        iconDrawer = SwingVectorIcons::drawBolt,
+    )
+    private val browserLaunchStatus = JLabel("Hazır · İzole tarayıcı profili QUIC/WebRTC sızıntısını ve tarayıcı DNS kaçağını kapatır").apply {
+        font = Font("Segoe UI", Font.PLAIN, 10)
+        foreground = Color(148, 163, 184)
+    }
+
+    private val personaButtons = DevicePersona.entries.map { p ->
+        p to FreedomButton(p.shortLabel, arc = 8)
+    }
+    private val chkBlockTrackers = FreedomUiHelpers.darkCheckBox("İzleyici, reklam & telemetri alan adlarını engelle (403 / SOCKS5 blok)", true)
+    private val chkStripUrlParams = FreedomUiHelpers.darkCheckBox("URL takip parametrelerini temizle (utm_*, fbclid, gclid, si)", true)
+    private val chkBlockQuicLeaks = FreedomUiHelpers.darkCheckBox("Null Island konum kalkanı + WebRTC UDP / QUIC / STUN engelle", true)
+    private val btnLeakTest = FreedomButton(
+        "Çift-Yol IP & Gizlilik Testini Çalıştır",
+        fillColor = Color(15, 27, 46),
+        textColor = Color(56, 189, 248),
+        borderColor = Color(29, 78, 216),
+        arc = 9,
+    )
+    private val leakTestResult = JLabel("Doğrudan çıkış vs Vekil/WARP çıkış karşılaştırması + Curve25519 Kripto denetimi hazır").apply {
+        font = Font("Segoe UI", Font.PLAIN, 10)
+        foreground = Color(148, 163, 184)
+    }
+
+    private val targets = JTextArea("cloudflare.com\nwikipedia.org\nietf.org", 3, 35).apply {
+        background = Color(14, 22, 38)
+        foreground = Color.WHITE
+        caretColor = Color(56, 189, 248)
+        font = Font("Segoe UI", Font.PLAIN, 12)
+        border = BorderFactory.createEmptyBorder(5, 7, 5, 7)
+    }
+    private val altDns = FreedomDarkTheme.styleField(JTextField(24), "Karşılaştırılacak ek DNS sunucu IP (isteğe bağlı)")
+    private val dohEndpoints = FreedomDarkTheme.styleField(JTextField(24), "Örnek: https://1.1.1.1/dns-query")
+    private val runButton = FreedomButton(
+        "Ağ Tanıla",
+        fillColor = Color(37, 99, 235),
+        textColor = Color.WHITE,
+        borderColor = Color(59, 130, 246),
+        iconDrawer = SwingVectorIcons::drawRadar,
+    ).apply { font = Font("Segoe UI", Font.BOLD, 12) }
+    private val appliedButton = FreedomButton(
+        "Öneriyi Doğrula",
+        fillColor = Color(30, 41, 59),
+        textColor = Color(226, 232, 240),
+        borderColor = Color(51, 65, 85),
+    ).apply { isEnabled = false }
+    private val auto = FreedomUiHelpers.darkCheckBox("Ağ değişince yeniden tanıla", false)
+    private val output = FreedomUiHelpers.monoLogArea(
+        "Ağ Teşhis Laboratuvarı hazır. 'Ağ Tanıla' ile sansür, DNS zehirlenmesi ve QUIC uyumsuzluğunu ölçün.",
+        Color(226, 232, 240),
+    )
+
+    private val systemButton = FreedomButton(
+        "Sistem Bağlantılarını Tara",
+        fillColor = Color(30, 41, 59),
+        textColor = Color(226, 232, 240),
+        borderColor = Color(71, 85, 105),
+    )
+    private val motorLogOutput = FreedomUiHelpers.monoLogArea(
+        "İç motor günlüğü başlatıldı (WARP / DoH3 / Adaptif TLS Bölme / Tarayıcı olayları burada canlı akar)...",
+        Color(147, 197, 253),
+    )
+    private val logOutput = FreedomUiHelpers.monoLogArea(
+        "Sistem geneli soket gözlemcisi hazır. Açık bağlantıları listelemek için 'Sistem Bağlantılarını Tara' düğmesine basın.",
+        Color(167, 243, 208),
+    )
     private val status = JLabel(" ").apply {
         foreground = Color(56, 189, 248)
         font = Font("Segoe UI", Font.PLAIN, 11)
     }
 
-    // Segmented tab cards
     private val cardLayout = CardLayout()
-    private val centerContainer = JPanel(cardLayout).apply {
-        background = Color(7, 11, 20)
-    }
-    private val tabBtnControl = FreedomButton("KONTROL", arc = 8)
-    private val tabBtnDiag = FreedomButton("TEŞHİS", arc = 8)
-    private val tabBtnLog = FreedomButton("GÜNLÜK & SİSTEM", arc = 8)
+    private val centerContainer = JPanel(cardLayout).apply { background = Color(7, 11, 20) }
 
-    private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "freedom-worker").apply { isDaemon = true } }
+    private val worker: ExecutorService = Executors.newCachedThreadPool { r ->
+        Thread(r, "freedom-ui-worker").apply { isDaemon = true }
+    }
     private val busy = AtomicBoolean(false)
     private var session: DiagnosticSession? = null
     @Volatile private var lastEnv: EnvironmentInfo? = null
     @Volatile private var lastDecision: Decision? = null
     private val watcher = Timer(15_000) { worker.execute { checkNetwork() } }
 
-    private var lastConns = 0L
+    private var lastBytesDown = 0L
+    private var lastBytesUp = 0L
     private var lastTickMs = 0L
+    private var lastLogVersion = -1L
 
     private val ticker = Timer(1000) {
-        val s = session ?: return@Timer
-        val p = s.proxyStats()
-        pulsePanel.isActive = p.active
-        pulsePanel.portInfo = if (p.active) "127.0.0.1:${p.port}" else ""
+        val p = activeProxy
+        if (p != null && p.isActive) {
+            val ps = p.statusSnapshot()
+            pulsePanel.isActive = true
+            pulsePanel.portInfo = "127.0.0.1:${p.localPort}"
 
-        cardTcp.update("${p.connections} Akış", "TLS Bölme: ${p.tlsSplit} · HTTP: ${p.httpSplit}")
-        cardVision.update("${p.visionSplice} Splice", "İzleyici: ${p.trackersBlocked} · URL: ${p.paramsStripped}")
-        cardFake.update("${p.fakeSent} Sahte", "RST Kalkanı: ${p.rstDropped} Engellendi")
-        cardDns.update(if (p.active) "Etkin" else "Beklemede", "PQ-TLS 1.3 / ECH + ${selectedPersona.shortLabel}")
+            cardTcp.update(
+                "${ps.connections} Akış",
+                "TLS Bölme: ${ps.tlsSplit} · 4x Uyum: ${p.tlsAdaptiveRetries.get()} · WARP: ${p.warpFlows.get()}",
+            )
+            cardVision.update(
+                "${ps.trackersBlocked + ps.paramsStripped} Temiz",
+                "İzleyici: ${ps.trackersBlocked} · URL: ${ps.paramsStripped}",
+            )
+            cardFake.update(
+                "${p.leaksBlocked.get()} Engel",
+                "QUIC/STUN Kalkanı · RST: ${ps.rstDropped}",
+            )
+            cardDns.update(
+                "${p.dohResolved.get()} DoH",
+                "Zehirli DNS: ${p.poisonedDnsBlocked.get()} · ${p.persona.shortLabel}",
+            )
 
-        val now = System.currentTimeMillis()
-        var rxRate = 0f
-        var txRate = 0f
-        if (p.active && lastTickMs > 0L) {
-            val dConn = (p.connections - lastConns).coerceAtLeast(0L)
-            rxRate = dConn * 14.5f
-            txRate = dConn * 2.2f
+            val now = System.currentTimeMillis()
+            val curDown = p.bytesDown.get()
+            val curUp = p.bytesUp.get()
+            val dtSec = if (lastTickMs > 0L) ((now - lastTickMs).coerceAtLeast(250L) / 1000f) else 1f
+            val rxRate = if (lastTickMs > 0L) ((curDown - lastBytesDown).coerceAtLeast(0L) / 1024f) / dtSec else 0f
+            val txRate = if (lastTickMs > 0L) ((curUp - lastBytesUp).coerceAtLeast(0L) / 1024f) / dtSec else 0f
+            lastBytesDown = curDown
+            lastBytesUp = curUp
+            lastTickMs = now
+            sparkline.updateMetrics(rxRate, txRate, curDown, curUp)
+            updateProtectionVisuals(ps, p.routeLabel, p.isIpMasked)
+        } else {
+            lastTickMs = System.currentTimeMillis()
+            lastBytesDown = 0L
+            lastBytesUp = 0L
+            sparkline.updateMetrics(0f, 0f, 0L, 0L)
+            updateProtectionVisuals(null, selectedRouteMode.subtitleTr, false)
         }
-        lastConns = p.connections
-        lastTickMs = now
-        sparkline.updateMetrics(rxRate, txRate, p.connections * 16384L, p.connections * 4096L)
 
-        updateProtectionVisuals(p)
+        val (logVer, logText) = WindowsLogBus.snapshot()
+        if (logVer != lastLogVersion) {
+            lastLogVersion = logVer
+            motorLogOutput.text = logText.ifBlank { "Henüz motor olay kaydı yok." }
+            motorLogOutput.caretPosition = motorLogOutput.document.length
+        }
     }
 
-    private fun updateProtectionVisuals(p: ProxyStatus) {
-        if (p.active) {
-            val sysState = if (WindowsSystemProxy.appliedByApp) "Sistem Vekili Açık" else "SOCKS5/HTTP Hazır"
-            statusPill.text = "FREEDOM NETWORK DEVREDE (127.0.0.1:${p.port} · ${selectedPersona.shortLabel})"
-            statusPill.foreground = Color(16, 185, 129)
-            ipCardDetail.text = "Aktif: 127.0.0.1:${p.port} · $sysState · İzleyici ${p.trackersBlocked} / URL ${p.paramsStripped}"
-            heroActionButton.text = "KORUMAYI DURDUR (127.0.0.1:${p.port})"
-            heroActionButton.background = Color(220, 38, 38)
-            heroActionButton.foreground = Color.WHITE
-            heroActionButton.borderColor = Color(248, 113, 113)
-        } else {
-            statusPill.text = "KORUMA KAPALI · DOKUNARAK BAĞLANIN"
-            statusPill.foreground = Color(148, 163, 184)
-            ipCardDetail.text = "Hazır · Yerel DPI Aşma Vekili + Cihaz Kimliği & URL Gizliliği"
-            heroActionButton.text = "ÖZGÜR AĞI BAŞLAT (DPI Aşma + Gizlilik)"
-            heroActionButton.background = Color(16, 185, 129)
-            heroActionButton.foreground = Color(4, 22, 16)
-            heroActionButton.borderColor = Color(52, 211, 153)
+    private fun buildNavRail(): JPanel {
+        val rail = JPanel(BorderLayout(0, 12)).apply {
+            preferredSize = Dimension(224, 0)
+            background = Color(9, 14, 26)
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 0, 1, Color(26, 37, 56)),
+                BorderFactory.createEmptyBorder(16, 14, 16, 14),
+            )
         }
-        ipCardDetail.toolTipText = ipCardDetail.text
-        heroActionButton.repaint()
 
-        if (WindowsSystemProxy.appliedByApp) {
-            btnSystemProxyToggle.text = "Sistem Vekili: Açık"
-            btnSystemProxyToggle.background = Color(6, 78, 59)
-            btnSystemProxyToggle.foreground = Color(167, 243, 208)
-            btnSystemProxyToggle.borderColor = Color(16, 185, 129)
-        } else if (systemProxyDesired) {
-            btnSystemProxyToggle.text = "Sistem Vekili: Bekliyor"
-            btnSystemProxyToggle.background = Color(30, 41, 59)
-            btnSystemProxyToggle.foreground = Color(251, 191, 36)
-            btnSystemProxyToggle.borderColor = Color(217, 119, 6)
-        } else {
-            btnSystemProxyToggle.text = "Sistem Vekili: Kapalı"
-            btnSystemProxyToggle.background = Color(15, 27, 46)
-            btnSystemProxyToggle.foreground = Color(148, 163, 184)
-            btnSystemProxyToggle.borderColor = Color(51, 65, 85)
+        val topBrand = JPanel(BorderLayout(10, 8)).apply {
+            isOpaque = false
+            val emblem = object : JPanel() {
+                init {
+                    preferredSize = Dimension(38, 38)
+                    isOpaque = false
+                }
+                override fun paintComponent(g: Graphics) {
+                    super.paintComponent(g)
+                    val g2 = g.create() as Graphics2D
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                    val active = activeProxy?.isActive == true
+                    SwingVectorIcons.drawFreedomShieldEmblem(
+                        g2,
+                        19,
+                        19,
+                        32,
+                        if (active) Color(16, 185, 129) else Color(56, 189, 248),
+                        if (active) Color(34, 211, 238) else Color(129, 140, 248),
+                    )
+                    g2.dispose()
+                }
+            }
+            val titleStack = JPanel(GridLayout(2, 1, 0, 1)).apply {
+                isOpaque = false
+                add(
+                    JLabel("FREEDOM").apply {
+                        font = Font("Segoe UI", Font.BOLD, 16)
+                        foreground = Color(248, 250, 252)
+                    },
+                )
+                add(
+                    JLabel("2026–2027 · v2.5").apply {
+                        font = Font("Segoe UI", Font.BOLD, 10)
+                        foreground = Color(56, 189, 248)
+                    },
+                )
+            }
+            val brandHeader = JPanel(BorderLayout(8, 0)).apply {
+                isOpaque = false
+                add(emblem, BorderLayout.WEST)
+                add(titleStack, BorderLayout.CENTER)
+            }
+            add(brandHeader, BorderLayout.NORTH)
+            add(sidebarStateBadge, BorderLayout.SOUTH)
         }
-        btnSystemProxyToggle.repaint()
+
+        val navStack = JPanel(GridLayout(4, 1, 0, 8)).apply {
+            isOpaque = false
+            navButtons.forEachIndexed { idx, btn ->
+                btn.preferredSize = Dimension(196, 40)
+                btn.addActionListener { selectWorkspace(idx) }
+                add(btn)
+            }
+        }
+        val navHost = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            border = BorderFactory.createEmptyBorder(14, 0, 0, 0)
+            add(navStack, BorderLayout.NORTH)
+        }
+
+        val bottomBox = JPanel(BorderLayout(0, 6)).apply {
+            isOpaque = false
+            add(
+                JLabel("Hızlı Sızıntısız Başlatma").apply {
+                    font = Font("Segoe UI", Font.BOLD, 10)
+                    foreground = Color(100, 116, 139)
+                },
+                BorderLayout.NORTH,
+            )
+            btnQuickDiscord.preferredSize = Dimension(196, 38)
+            add(btnQuickDiscord, BorderLayout.CENTER)
+        }
+
+        rail.add(topBrand, BorderLayout.NORTH)
+        rail.add(navHost, BorderLayout.CENTER)
+        rail.add(bottomBox, BorderLayout.SOUTH)
+        return rail
+    }
+
+    private fun buildTelemetryStrip(): JPanel {
+        val bar = JPanel(BorderLayout()).apply {
+            background = Color(8, 12, 22)
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, Color(26, 37, 56)),
+                BorderFactory.createEmptyBorder(10, 16, 10, 16),
+            )
+        }
+        val pills = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
+            isOpaque = false
+            add(topRoutePill)
+            add(topDnsQuicPill)
+            add(topPersonaPill)
+            add(topSysProxyPill)
+        }
+        bar.add(pills, BorderLayout.CENTER)
+        return bar
+    }
+
+    private fun buildControlWorkspace(): JPanel {
+        val panel = JPanel(GridBagLayout()).apply {
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(14, 16, 10, 16)
+        }
+
+        // Left Column: Hero Shield + Mode Routing + WinINet Proxy Toggle
+        val leftCol = JPanel(GridBagLayout()).apply { isOpaque = false }
+        val heroCard = GlassCardPanel().apply {
+            val shieldHost = JPanel(BorderLayout()).apply {
+                isOpaque = false
+                add(pulsePanel, BorderLayout.CENTER)
+            }
+            val bottomStack = JPanel(GridLayout(2, 1, 0, 8)).apply {
+                isOpaque = false
+                add(statusPill)
+                add(heroActionButton)
+            }
+            add(FreedomUiHelpers.sectionHeader("GÜVENLİK MOTORU VE TÜNEL DURUMU", Color(56, 189, 248)), BorderLayout.NORTH)
+            add(shieldHost, BorderLayout.CENTER)
+            add(bottomStack, BorderLayout.SOUTH)
+        }
+
+        val routingCard = GlassCardPanel().apply {
+            val modeRow = JPanel(GridLayout(1, 3, 6, 0)).apply {
+                isOpaque = false
+                add(btnModeWarp)
+                add(btnModeHybrid)
+                add(btnModeRelay)
+            }
+            val relayRow = JPanel(BorderLayout(8, 0)).apply {
+                isOpaque = false
+                add(
+                    JLabel("Röle URI:").apply {
+                        font = Font("Segoe UI", Font.BOLD, 10)
+                        foreground = Color(148, 163, 184)
+                    },
+                    BorderLayout.WEST,
+                )
+                add(txtRelayUri, BorderLayout.CENTER)
+            }
+            val midStack = JPanel(GridLayout(3, 1, 0, 8)).apply {
+                isOpaque = false
+                add(modeRow)
+                add(relayRow)
+                add(btnSystemProxyToggle)
+            }
+            add(FreedomUiHelpers.sectionHeader("ÇIKIŞ ROTASI & SİSTEM VEKİLİ (Yönetici İzni Gerektirmez)", Color(16, 185, 129)), BorderLayout.NORTH)
+            add(midStack, BorderLayout.CENTER)
+        }
+
+        val lc = GridBagConstraints().apply {
+            gridx = 0
+            weightx = 1.0
+            fill = GridBagConstraints.BOTH
+        }
+        lc.gridy = 0; lc.weighty = 0.57; lc.insets = Insets(0, 0, 10, 0); leftCol.add(heroCard, lc)
+        lc.gridy = 1; lc.weighty = 0.43; lc.insets = Insets(0, 0, 0, 0); leftCol.add(routingCard, lc)
+
+        // Right Column: Live Exit Route & IP Card + Sparkline + 2x2 Stats Grid
+        val rightCol = JPanel(GridBagLayout()).apply { isOpaque = false }
+        val routeIpCard = GlassCardPanel().apply {
+            val infoStack = JPanel(GridLayout(3, 1, 0, 3)).apply {
+                isOpaque = false
+                add(ipCardDetail)
+                add(directIpLabel)
+                add(proxyIpLabel)
+            }
+            val actionWrap = JPanel(GridBagLayout()).apply {
+                isOpaque = false
+                add(btnVerifyIp)
+            }
+            add(FreedomUiHelpers.sectionHeader("ÇIKIŞ ROTASI & CANLI IP DOĞRULAMA", Color(56, 189, 248)), BorderLayout.NORTH)
+            add(infoStack, BorderLayout.CENTER)
+            add(actionWrap, BorderLayout.EAST)
+        }
+        val sparkCard = GlassCardPanel(cardBg = Color(10, 16, 29)).apply {
+            border = BorderFactory.createEmptyBorder(8, 10, 8, 10)
+            add(sparkline, BorderLayout.CENTER)
+        }
+        val grid2x2 = JPanel(GridLayout(2, 2, 8, 8)).apply {
+            isOpaque = false
+            add(cardTcp)
+            add(cardVision)
+            add(cardFake)
+            add(cardDns)
+        }
+
+        val rc = GridBagConstraints().apply {
+            gridx = 0
+            weightx = 1.0
+            fill = GridBagConstraints.BOTH
+        }
+        rc.gridy = 0; rc.weighty = 0.0; rc.insets = Insets(0, 0, 10, 0); rightCol.add(routeIpCard, rc)
+        rc.gridy = 1; rc.weighty = 0.38; rc.insets = Insets(0, 0, 10, 0); rightCol.add(sparkCard, rc)
+        rc.gridy = 2; rc.weighty = 0.62; rc.insets = Insets(0, 0, 0, 0); rightCol.add(grid2x2, rc)
+
+        val mainC = GridBagConstraints().apply {
+            gridy = 0
+            weighty = 1.0
+            fill = GridBagConstraints.BOTH
+        }
+        mainC.gridx = 0; mainC.weightx = 0.45; mainC.insets = Insets(0, 0, 0, 12); panel.add(leftCol, mainC)
+        mainC.gridx = 1; mainC.weightx = 0.55; mainC.insets = Insets(0, 0, 0, 0); panel.add(rightCol, mainC)
+        return panel
+    }
+
+    private fun buildPrivacyWorkspace(): JPanel {
+        val stack = JPanel(GridBagLayout()).apply {
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(14, 16, 10, 16)
+        }
+
+        // Card 1: Protected Browser Launcher
+        val browserCard = GlassCardPanel().apply {
+            val form = JPanel(GridBagLayout()).apply { isOpaque = false }
+            val fc = GridBagConstraints().apply { insets = Insets(3, 4, 3, 4); fill = GridBagConstraints.HORIZONTAL }
+            fc.gridx = 0; fc.gridy = 0; fc.weightx = 0.0
+            form.add(JLabel("Tarayıcı:").apply { foreground = Color(148, 163, 184); font = Font("Segoe UI", Font.PLAIN, 11) }, fc)
+            fc.gridx = 1; fc.weightx = 0.45; form.add(cmbBrowser, fc)
+            fc.gridx = 2; fc.weightx = 0.0
+            form.add(JLabel("Hedef URL:").apply { foreground = Color(148, 163, 184); font = Font("Segoe UI", Font.PLAIN, 11) }, fc)
+            fc.gridx = 3; fc.weightx = 0.55; form.add(txtBrowserUrl, fc)
+
+            val quickUrlRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
+                isOpaque = false
+                add(
+                    FreedomButton("Discord", arc = 7).apply {
+                        addActionListener { txtBrowserUrl.text = "https://discord.com/" }
+                    },
+                )
+                add(
+                    FreedomButton("DuckDuckGo", arc = 7).apply {
+                        addActionListener { txtBrowserUrl.text = "https://duckduckgo.com/" }
+                    },
+                )
+                add(
+                    FreedomButton("IP Kontrol", arc = 7).apply {
+                        addActionListener { txtBrowserUrl.text = "https://api.ipify.org/" }
+                    },
+                )
+                add(btnLaunchBrowser)
+                add(btnLaunchDiscord)
+            }
+            val descLbl = JLabel("Chrome QUIC (UDP:443), WebRTC yerel IP sızıntısı, tarayıcı Async-DNS ve konum sensörü otomatik kapatılır.").apply {
+                font = Font("Segoe UI", Font.PLAIN, 10)
+                foreground = Color(100, 116, 139)
+            }
+            val body = JPanel(BorderLayout(0, 6)).apply {
+                isOpaque = false
+                add(form, BorderLayout.NORTH)
+                add(quickUrlRow, BorderLayout.CENTER)
+                add(descLbl, BorderLayout.SOUTH)
+            }
+            add(FreedomUiHelpers.sectionHeader("KORUMALI TARAYICI BAŞLATICISI (QUIC & WebRTC Sızıntısız)", Color(16, 185, 129)), BorderLayout.NORTH)
+            add(body, BorderLayout.CENTER)
+            add(browserLaunchStatus, BorderLayout.SOUTH)
+        }
+
+        // Card 2: DevicePersona & Leak Shields
+        val personaCard = GlassCardPanel().apply {
+            val btnRow = JPanel(GridLayout(1, personaButtons.size, 8, 0)).apply {
+                isOpaque = false
+                personaButtons.forEach { (p, b) ->
+                    b.addActionListener { selectPersona(p) }
+                    add(b)
+                }
+            }
+            val chkStack = JPanel(GridLayout(3, 1, 0, 4)).apply {
+                isOpaque = false
+                add(chkBlockTrackers)
+                add(chkStripUrlParams)
+                add(chkBlockQuicLeaks)
+            }
+            val center = JPanel(BorderLayout(0, 10)).apply {
+                isOpaque = false
+                add(btnRow, BorderLayout.NORTH)
+                add(chkStack, BorderLayout.CENTER)
+            }
+            add(FreedomUiHelpers.sectionHeader("CİHAZ KİMLİĞİ (HTTP / User-Agent Maskeleme) & SIZINTI KALKANLARI", Color(167, 139, 250)), BorderLayout.NORTH)
+            add(center, BorderLayout.CENTER)
+        }
+
+        // Card 3: Dual-Path Self-Test
+        val testCard = GlassCardPanel().apply {
+            val wrapBtn = JPanel(GridBagLayout()).apply { isOpaque = false; add(btnLeakTest) }
+            add(FreedomUiHelpers.sectionHeader("ÇİFT-YOL IP & SIZINTI DOĞRULAMA TESTİ", Color(56, 189, 248)), BorderLayout.NORTH)
+            add(leakTestResult, BorderLayout.CENTER)
+            add(wrapBtn, BorderLayout.EAST)
+        }
+
+        val c = GridBagConstraints().apply {
+            gridx = 0
+            weightx = 1.0
+            fill = GridBagConstraints.BOTH
+        }
+        c.gridy = 0; c.weighty = 0.36; c.insets = Insets(0, 0, 10, 0); stack.add(browserCard, c)
+        c.gridy = 1; c.weighty = 0.44; c.insets = Insets(0, 0, 10, 0); stack.add(personaCard, c)
+        c.gridy = 2; c.weighty = 0.20; c.insets = Insets(0, 0, 0, 0); stack.add(testCard, c)
+        return stack
+    }
+    private fun buildDiagWorkspace(): JPanel {
+        val panel = JPanel(BorderLayout(0, 10)).apply {
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(14, 16, 10, 16)
+        }
+        val topCard = GlassCardPanel().apply {
+            val presetBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
+                isOpaque = false
+                add(
+                    FreedomButton("Standart Set", arc = 7).apply {
+                        addActionListener { targets.text = "cloudflare.com\nwikipedia.org\nietf.org" }
+                    },
+                )
+                add(
+                    FreedomButton("Discord + Sansür Seti", arc = 7).apply {
+                        addActionListener { targets.text = "discord.com\ncloudflare.com\nwikipedia.org\nyoutube.com" }
+                    },
+                )
+            }
+            val form = JPanel(GridBagLayout()).apply { isOpaque = false }
+            val c = GridBagConstraints().apply {
+                insets = Insets(3, 4, 3, 4)
+                anchor = GridBagConstraints.WEST
+                fill = GridBagConstraints.HORIZONTAL
+            }
+            fun row(y: Int, label: String, comp: java.awt.Component) {
+                val lbl = JLabel(label).apply {
+                    foreground = Color(148, 163, 184)
+                    font = Font("Segoe UI", Font.PLAIN, 11)
+                }
+                c.gridx = 0; c.gridy = y; c.weightx = 0.0; form.add(lbl, c)
+                c.gridx = 1; c.weightx = 1.0; form.add(comp, c)
+            }
+            row(0, "Test hedefleri:", FreedomDarkTheme.darkScrollPane(targets))
+            row(1, "Karşılaştırılacak DNS:", altDns)
+            row(2, "Şifreli DoH adresleri:", dohEndpoints)
+
+            val btnCopyDiag = FreedomButton(
+                "Raporu Kopyala",
+                fillColor = Color(30, 41, 59),
+                textColor = Color(226, 232, 240),
+                borderColor = Color(71, 85, 105),
+                iconDrawer = SwingVectorIcons::drawCopy,
+            ).apply {
+                addActionListener {
+                    FreedomUiHelpers.clipboardCopy(output.text, status, "Teşhis çıktısı panoya kopyalandı")
+                }
+            }
+            val actionRow = JPanel(FlowLayout(FlowLayout.LEFT, 8, 2)).apply {
+                isOpaque = false
+                add(runButton)
+                add(appliedButton)
+                add(btnCopyDiag)
+                add(auto)
+            }
+            add(FreedomUiHelpers.sectionHeader("AĞ TEŞHİS LABORATUVARI", Color(56, 189, 248), presetBar), BorderLayout.NORTH)
+            add(form, BorderLayout.CENTER)
+            add(actionRow, BorderLayout.SOUTH)
+        }
+        val reportCard = GlassCardPanel().apply {
+            add(FreedomUiHelpers.sectionHeader("CANLI TEŞHİS RAPORU", Color(148, 163, 184)), BorderLayout.NORTH)
+            add(FreedomDarkTheme.darkScrollPane(output), BorderLayout.CENTER)
+        }
+        panel.add(topCard, BorderLayout.NORTH)
+        panel.add(reportCard, BorderLayout.CENTER)
+        return panel
+    }
+
+    private fun buildLogWorkspace(): JPanel {
+        val splitGrid = JPanel(GridLayout(2, 1, 0, 12)).apply {
+            background = Color(7, 11, 20)
+            border = BorderFactory.createEmptyBorder(14, 16, 10, 16)
+        }
+
+        val engineBtns = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
+            isOpaque = false
+            add(
+                FreedomButton("Günlüğü Temizle", arc = 8).apply {
+                    addActionListener {
+                        WindowsLogBus.clear()
+                        lastLogVersion = -1L
+                        motorLogOutput.text = "İç motor olay günlüğü temizlendi."
+                    }
+                },
+            )
+            add(
+                FreedomButton("Kopyala", arc = 8, iconDrawer = SwingVectorIcons::drawCopy).apply {
+                    addActionListener {
+                        FreedomUiHelpers.clipboardCopy(motorLogOutput.text, status, "Motor olay günlüğü panoya kopyalandı")
+                    }
+                },
+            )
+        }
+        val motorCard = GlassCardPanel().apply {
+            add(FreedomUiHelpers.sectionHeader("CANLI İÇ MOTOR OLAY GÜNLÜĞÜ (WARP · DoH3 · TLS Bölme · Tarayıcı)", Color(56, 189, 248), engineBtns), BorderLayout.NORTH)
+            add(FreedomDarkTheme.darkScrollPane(motorLogOutput), BorderLayout.CENTER)
+        }
+
+        val sysBtns = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
+            isOpaque = false
+            add(systemButton)
+            add(
+                FreedomButton("Kopyala", arc = 8, iconDrawer = SwingVectorIcons::drawCopy).apply {
+                    addActionListener {
+                        FreedomUiHelpers.clipboardCopy(logOutput.text, status, "Sistem soket çıktısı panoya kopyalandı")
+                    }
+                },
+            )
+        }
+        val sysCard = GlassCardPanel().apply {
+            add(FreedomUiHelpers.sectionHeader("SİSTEM GENELİ BAĞLANTI GÖZLEMCİSİ", Color(16, 185, 129), sysBtns), BorderLayout.NORTH)
+            add(FreedomDarkTheme.darkScrollPane(logOutput), BorderLayout.CENTER)
+        }
+
+        splitGrid.add(motorCard)
+        splitGrid.add(sysCard)
+        return splitGrid
+    }
+
+    private fun selectWorkspace(idx: Int) {
+        activeWorkspaceIdx = idx.coerceIn(0, 3)
+        navButtons.forEachIndexed { i, b ->
+            val on = i == activeWorkspaceIdx
+            b.background = if (on) Color(22, 42, 78) else Color(12, 19, 34)
+            b.foreground = if (on) Color.WHITE else Color(148, 163, 184)
+            b.borderColor = if (on) Color(56, 189, 248) else Color(26, 37, 56)
+            b.repaint()
+        }
+        cardLayout.show(
+            centerContainer,
+            when (activeWorkspaceIdx) {
+                0 -> "CONTROL"
+                1 -> "PRIVACY"
+                2 -> "DIAG"
+                else -> "LOG"
+            },
+        )
+    }
+
+    private fun refreshModeButtons() {
+        val items = listOf(
+            WindowsRouteMode.AUTO_WARP to btnModeWarp,
+            WindowsRouteMode.HYBRID_DPI to btnModeHybrid,
+            WindowsRouteMode.CUSTOM_RELAY to btnModeRelay,
+        )
+        for ((mode, btn) in items) {
+            val active = mode == selectedRouteMode
+            btn.background = if (active) Color(6, 78, 59) else Color(15, 23, 42)
+            btn.foreground = if (active) Color(167, 243, 208) else Color(148, 163, 184)
+            btn.borderColor = if (active) Color(16, 185, 129) else Color(36, 48, 68)
+            btn.repaint()
+        }
+        txtRelayUri.isEnabled = true
+    }
+
+    private fun selectRouteMode(mode: WindowsRouteMode) {
+        val changed = selectedRouteMode != mode
+        selectedRouteMode = mode
+        refreshModeButtons()
+        if (activeProxy?.isActive == true && changed) {
+            status.text = "Çıkış rotası değiştiriliyor: ${mode.titleTr}..."
+            worker.execute {
+                proxyLock.lock()
+                try {
+                    stopActiveProxyLocked()
+                    ensureProxyStartedLocked()
+                } finally {
+                    proxyLock.unlock()
+                }
+            }
+        } else {
+            updateProtectionVisuals(activeProxy?.statusSnapshot(), mode.subtitleTr, activeProxy?.isIpMasked == true)
+            status.text = "Seçili çıkış rotası: ${mode.titleTr}"
+        }
+    }
+
+    private fun selectPersona(persona: DevicePersona) {
+        selectedPersona = persona
+        activeProxy?.let { it.persona = persona }
+        for ((p, btn) in personaButtons) {
+            val on = p == persona
+            btn.background = if (on) Color(46, 16, 101) else Color(15, 23, 42)
+            btn.foreground = if (on) Color(233, 213, 255) else Color(148, 163, 184)
+            btn.borderColor = if (on) Color(139, 92, 246) else Color(36, 48, 68)
+            btn.repaint()
+        }
+        topPersonaPill.text = "Kimlik: ${persona.shortLabel}"
+        status.text = "Cihaz kimliği: ${persona.shortLabel} (anında uygulandı)"
+    }
+
+    fun buildRootPanel(): JPanel {
+        builtRoot?.let { return it }
+
+        centerContainer.add(buildControlWorkspace(), "CONTROL")
+        centerContainer.add(buildPrivacyWorkspace(), "PRIVACY")
+        centerContainer.add(buildDiagWorkspace(), "DIAG")
+        centerContainer.add(buildLogWorkspace(), "LOG")
+
+        val mainArea = JPanel(BorderLayout()).apply {
+            background = Color(7, 11, 20)
+            add(buildTelemetryStrip(), BorderLayout.NORTH)
+            add(centerContainer, BorderLayout.CENTER)
+            add(status.apply { border = BorderFactory.createEmptyBorder(4, 16, 8, 16) }, BorderLayout.SOUTH)
+        }
+
+        val root = JPanel(BorderLayout()).apply {
+            background = Color(7, 11, 20)
+            add(buildNavRail(), BorderLayout.WEST)
+            add(mainArea, BorderLayout.CENTER)
+        }
+
+        wireUiActions()
+        selectWorkspace(0)
+        refreshModeButtons()
+        selectPersona(selectedPersona)
+        updateProtectionVisuals(null, selectedRouteMode.subtitleTr, false)
+
+        builtRoot = root
+        return root
+    }
+
+    internal fun buildRootPanelForTest(): JPanel = buildRootPanel()
+
+    private fun wireUiActions() {
+        pulsePanel.onToggleListener = { toggleDesync() }
+        heroActionButton.addActionListener { toggleDesync() }
+        btnModeWarp.addActionListener { selectRouteMode(WindowsRouteMode.AUTO_WARP) }
+        btnModeHybrid.addActionListener { selectRouteMode(WindowsRouteMode.HYBRID_DPI) }
+        btnModeRelay.addActionListener { selectRouteMode(WindowsRouteMode.CUSTOM_RELAY) }
+
+        btnSystemProxyToggle.addActionListener {
+            systemProxyDesired = !systemProxyDesired
+            worker.execute {
+                val p = activeProxy
+                if (systemProxyDesired && p != null && p.isActive) {
+                    WindowsSystemProxy.enable(p.localPort)
+                } else {
+                    WindowsSystemProxy.restore()
+                }
+                ui {
+                    updateProtectionVisuals(p?.statusSnapshot(), p?.routeLabel ?: selectedRouteMode.subtitleTr, p?.isIpMasked == true)
+                    status.text = if (systemProxyDesired) {
+                        if (WindowsSystemProxy.appliedByApp) {
+                            "Windows sistem vekili etkin (127.0.0.1:${p?.localPort})"
+                        } else {
+                            "Sistem vekili koruma başlatılınca otomatik uygulanacak"
+                        }
+                    } else {
+                        "Windows sistem vekili orijinal ayarlara geri döndürüldü"
+                    }
+                }
+            }
+        }
+
+        chkBlockTrackers.addActionListener { blockTrackersDesired = chkBlockTrackers.isSelected }
+        chkStripUrlParams.addActionListener { stripUrlParamsDesired = chkStripUrlParams.isSelected }
+        chkBlockQuicLeaks.addActionListener { blockQuicLeaksDesired = chkBlockQuicLeaks.isSelected }
+
+        btnVerifyIp.addActionListener { runDualIpCheck() }
+        btnLeakTest.addActionListener { runDualIpCheck() }
+        btnLaunchBrowser.addActionListener { launchProtectedBrowser(null) }
+        btnLaunchDiscord.addActionListener { launchProtectedBrowser("https://discord.com/") }
+        btnQuickDiscord.addActionListener { launchProtectedBrowser("https://discord.com/") }
+
+        runButton.addActionListener { startRun(verifyRuns = 0) }
+        appliedButton.addActionListener { applied() }
+        systemButton.addActionListener { showSystem() }
     }
 
     private fun loadWindowIcons() {
@@ -5796,366 +8337,17 @@ class MainWindow {
     }
 
     fun show() {
+        val root = buildRootPanel()
         loadWindowIcons()
-        val root = JPanel(BorderLayout()).apply {
-            background = Color(7, 11, 20)
-        }
-
-        // Top Header + Tab Navigation
-        val topBar = JPanel(BorderLayout()).apply {
-            background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(10, 14, 8, 14)
-        }
-        val brandRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0)).apply {
-            background = Color(7, 11, 20)
-            val lblTitle = JLabel("FREEDOM NETWORK").apply {
-                font = Font("Segoe UI", Font.BOLD, 17)
-                foreground = Color(248, 250, 252)
-            }
-            val lblVer = JLabel("2026–2027 · v2.0").apply {
-                font = Font("Segoe UI", Font.BOLD, 11)
-                foreground = Color(56, 189, 248)
-            }
-            add(lblTitle)
-            add(lblVer)
-        }
-        val tabRow = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
-            background = Color(7, 11, 20)
-            add(tabBtnControl)
-            add(tabBtnDiag)
-            add(tabBtnLog)
-        }
-        topBar.add(brandRow, BorderLayout.WEST)
-        topBar.add(tabRow, BorderLayout.EAST)
-        root.add(topBar, BorderLayout.NORTH)
-
-        // ---------------- TAB 0: KONTROL ----------------
-        val panelControl = JPanel(BorderLayout()).apply {
-            background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(0, 14, 8, 14)
-        }
-        pulsePanel.onToggleListener = { toggleDesync() }
-        panelControl.add(pulsePanel, BorderLayout.NORTH)
-
-        val controlCenter = JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            background = Color(7, 11, 20)
-        }
-        val statusRow = JPanel(FlowLayout(FlowLayout.CENTER, 0, 4)).apply {
-            background = Color(7, 11, 20)
-            add(statusPill)
-        }
-        controlCenter.add(statusRow)
-
-        fun privacyCard(titleText: String, titleColor: Color, bodyComp: java.awt.Component, rightComp: java.awt.Component? = null): JPanel {
-            return JPanel(BorderLayout(12, 2)).apply {
-                background = Color(11, 18, 32)
-                border = BorderFactory.createCompoundBorder(
-                    BorderFactory.createLineBorder(Color(30, 41, 59), 1),
-                    BorderFactory.createEmptyBorder(9, 12, 9, 12),
-                )
-                val left = JPanel(BorderLayout(0, 3)).apply {
-                    isOpaque = false
-                    add(
-                        JLabel(titleText).apply {
-                            font = Font("Segoe UI", Font.BOLD, 10)
-                            foreground = titleColor
-                        },
-                        BorderLayout.NORTH,
-                    )
-                    add(bodyComp, BorderLayout.CENTER)
-                }
-                add(left, BorderLayout.CENTER)
-                if (rightComp != null) {
-                    val rightWrap = JPanel(GridBagLayout()).apply {
-                        isOpaque = false
-                        add(rightComp)
-                    }
-                    add(rightWrap, BorderLayout.EAST)
-                }
-            }
-        }
-
-        val privacyStack = JPanel(GridLayout(3, 1, 0, 6)).apply {
-            background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(4, 0, 6, 0)
-            add(
-                privacyCard(
-                    "IP GİZLİLİĞİ & WINDOWS SİSTEM VEKİLİ (HKCU WinINet)",
-                    Color(16, 185, 129),
-                    ipCardDetail,
-                    btnSystemProxyToggle,
-                ),
-            )
-            add(
-                privacyCard(
-                    "CİHAZ GİZLİLİĞİ & GELECEK KİMLİK",
-                    Color(167, 139, 250),
-                    JLabel("HTTP User-Agent, Client Hints & URL izleme parametreleri otomatik temizlenir").apply {
-                        font = Font("Segoe UI", Font.PLAIN, 10)
-                        foreground = Color(148, 163, 184)
-                    },
-                    btnPersonaCycle,
-                ),
-            )
-            add(
-                privacyCard(
-                    "GİZLİLİK & ÇİFT-YOL IP SIZINTI TESTİ",
-                    Color(56, 189, 248),
-                    leakTestResult,
-                    btnLeakTest,
-                ),
-            )
-        }
-        controlCenter.add(privacyStack)
-
-        val advancedContainer = JPanel(BorderLayout()).apply {
-            background = Color(7, 11, 20)
-            isVisible = false
-            add(sparkline, BorderLayout.NORTH)
-            val cardsPanel = JPanel(GridLayout(1, 4, 6, 6)).apply {
-                background = Color(7, 11, 20)
-                border = BorderFactory.createEmptyBorder(6, 0, 4, 0)
-                add(cardTcp)
-                add(cardVision)
-                add(cardFake)
-                add(cardDns)
-            }
-            add(cardsPanel, BorderLayout.CENTER)
-        }
-        val btnAdvancedToggle = FreedomButton(
-            "Gelişmiş Metrikler & Canlı Trafik ▾",
-            fillColor = Color(12, 19, 34),
-            textColor = Color(148, 163, 184),
-            borderColor = Color(30, 41, 59),
-        ).apply {
-            alignmentX = java.awt.Component.CENTER_ALIGNMENT
-            addActionListener {
-                advancedExpanded = !advancedExpanded
-                advancedContainer.isVisible = advancedExpanded
-                text = if (advancedExpanded) "Gelişmiş Metrikler & Canlı Trafik ▴" else "Gelişmiş Metrikler & Canlı Trafik ▾"
-                panelControl.revalidate()
-            }
-        }
-        val advToggleWrap = JPanel(FlowLayout(FlowLayout.CENTER, 0, 2)).apply {
-            background = Color(7, 11, 20)
-            add(btnAdvancedToggle)
-        }
-        controlCenter.add(advToggleWrap)
-        controlCenter.add(advancedContainer)
-        val controlScrollHost = JPanel(BorderLayout()).apply {
-            background = Color(7, 11, 20)
-            add(controlCenter, BorderLayout.NORTH)
-        }
-        panelControl.add(FreedomDarkTheme.darkScrollPane(controlScrollHost, showBorder = false), BorderLayout.CENTER)
-
-        val quickActionRow = JPanel(FlowLayout(FlowLayout.CENTER, 0, 6)).apply {
-            background = Color(7, 11, 20)
-            heroActionButton.preferredSize = Dimension(460, 38)
-            add(heroActionButton)
-        }
-        panelControl.add(quickActionRow, BorderLayout.SOUTH)
-        centerContainer.add(panelControl, "CONTROL")
-
-        btnSystemProxyToggle.addActionListener {
-            systemProxyDesired = !systemProxyDesired
-            val s = session
-            worker.execute {
-                val ps = s?.proxyStats()
-                if (systemProxyDesired && ps != null && ps.active) {
-                    WindowsSystemProxy.enable(ps.port)
-                } else {
-                    WindowsSystemProxy.restore()
-                }
-                ui {
-                    ps?.let { updateProtectionVisuals(it) }
-                    status.text = if (systemProxyDesired) {
-                        if (WindowsSystemProxy.appliedByApp) {
-                            "Windows sistem vekili etkin (127.0.0.1:${ps?.port})"
-                        } else {
-                            "Sistem vekili koruma açılınca devreye girecek"
-                        }
-                    } else {
-                        "Windows sistem vekili orijinal ayarlara geri döndürüldü"
-                    }
-                }
-            }
-        }
-
-        btnPersonaCycle.addActionListener {
-            val all = DevicePersona.entries
-            selectedPersona = all[(all.indexOf(selectedPersona) + 1) % all.size]
-            btnPersonaCycle.text = selectedPersona.shortLabel
-            btnPersonaCycle.repaint()
-            status.text = "Cihaz kimliği: ${selectedPersona.shortLabel} (yeniden bağlanmada uygulanır)"
-        }
-
-        btnLeakTest.addActionListener {
-            btnLeakTest.isEnabled = false
-            leakTestResult.text = "Doğrudan çıkış & yerel vekil yolu test ediliyor..."
-            val s = session
-            worker.execute {
-                val directIp = runCatching {
-                    val conn = URI("https://api.ipify.org").toURL().openConnection(java.net.Proxy.NO_PROXY) as javax.net.ssl.HttpsURLConnection
-                    conn.connectTimeout = 3500
-                    conn.readTimeout = 3500
-                    try {
-                        conn.inputStream.bufferedReader().readText().trim()
-                    } finally {
-                        conn.disconnect()
-                    }
-                }.getOrNull()
-                val ps = s?.proxyStats()
-                val proxyIp = if (ps != null && ps.active) {
-                    runCatching {
-                        val proxy = java.net.Proxy(java.net.Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", ps.port))
-                        val conn = URI("https://api.ipify.org").toURL().openConnection(proxy) as javax.net.ssl.HttpsURLConnection
-                        conn.connectTimeout = 4000
-                        conn.readTimeout = 4000
-                        try {
-                            conn.inputStream.bufferedReader().readText().trim()
-                        } finally {
-                            conn.disconnect()
-                        }
-                    }.getOrNull()
-                } else null
-                val wgPub = Native.wgPublicKey(ByteArray(32).also { java.security.SecureRandom().nextBytes(it) })?.size == 32
-                ui {
-                    btnLeakTest.isEnabled = true
-                    val resText = buildString {
-                        append("Doğrudan IP: ").append(directIp ?: "ölçülemedi")
-                        if (ps?.active == true) {
-                            append(" · Vekil (:").append(ps.port).append("): ").append(proxyIp ?: "hata")
-                            append(" · İzleyici=").append(ps.trackersBlocked).append(" URL=").append(ps.paramsStripped)
-                        }
-                        append(" · WG: ").append(if (wgPub) "Hazır" else "Hata")
-                    }
-                    leakTestResult.text = resText
-                    leakTestResult.toolTipText = resText
-                }
-            }
-        }
-
-        // ---------------- TAB 1: TEŞHİS ----------------
-        val panelDiag = JPanel(BorderLayout()).apply {
-            background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(4, 14, 8, 14)
-        }
-        val form = JPanel(GridBagLayout()).apply {
-            background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(4, 0, 8, 0)
-        }
-        val c = GridBagConstraints().apply { insets = Insets(3, 4, 3, 4); anchor = GridBagConstraints.WEST; fill = GridBagConstraints.HORIZONTAL }
-        fun row(y: Int, label: String, comp: java.awt.Component) {
-            val lbl = JLabel(label).apply {
-                foreground = Color(148, 163, 184)
-                font = Font("Segoe UI", Font.PLAIN, 11)
-            }
-            c.gridx = 0; c.gridy = y; c.weightx = 0.0; form.add(lbl, c)
-            c.gridx = 1; c.weightx = 1.0; form.add(comp, c)
-        }
-        row(0, "Test hedefleri:", FreedomDarkTheme.darkScrollPane(targets))
-        row(1, "Karşılaştırılacak DNS (isteğe bağlı):", altDns)
-        row(2, "Şifreli DoH adresleri (isteğe bağlı):", dohEndpoints)
-
-        val btnCopyDiag = FreedomButton(
-            "Raporu Kopyala",
-            fillColor = Color(30, 41, 59),
-            textColor = Color(226, 232, 240),
-            borderColor = Color(71, 85, 105),
-        ).apply {
-            addActionListener {
-                val sel = StringSelection(output.text)
-                Toolkit.getDefaultToolkit().systemClipboard.setContents(sel, sel)
-                status.text = "Teşhis çıktısı panoya kopyalandı"
-            }
-        }
-        val btnRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
-            background = Color(7, 11, 20)
-            add(runButton)
-            add(appliedButton)
-            add(btnCopyDiag)
-            add(auto)
-        }
-        c.gridx = 0; c.gridy = 3; c.gridwidth = 2; form.add(btnRow, c)
-        panelDiag.add(form, BorderLayout.NORTH)
-        panelDiag.add(FreedomDarkTheme.darkScrollPane(output), BorderLayout.CENTER)
-        centerContainer.add(panelDiag, "DIAG")
-
-        // ---------------- TAB 2: GÜNLÜK & SİSTEM ----------------
-        val panelLog = JPanel(BorderLayout()).apply {
-            background = Color(7, 11, 20)
-            border = BorderFactory.createEmptyBorder(6, 14, 8, 14)
-        }
-        val logOutput = JTextArea().apply {
-            isEditable = false
-            font = Font(Font.MONOSPACED, Font.PLAIN, 12)
-            lineWrap = true
-            wrapStyleWord = true
-            background = Color(8, 12, 20)
-            foreground = Color(167, 243, 208)
-            border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
-            text = "Freedom Network Dahili Log & Sistem Gözlemcisi Hazır.\nSistem genelindeki bağlantıları incelemek için 'Sistem Bağlantıları' düğmesine tıklayın."
-        }
-        val logTopBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
-            background = Color(7, 11, 20)
-            add(systemButton)
-            val btnCopyLog = FreedomButton(
-                "Sistem Çıktısını Kopyala",
-                fillColor = Color(37, 99, 235),
-                textColor = Color.WHITE,
-                borderColor = Color(59, 130, 246),
-            ).apply {
-                addActionListener {
-                    val sel = StringSelection(logOutput.text)
-                    Toolkit.getDefaultToolkit().systemClipboard.setContents(sel, sel)
-                    status.text = "Sistem günlüğü panoya kopyalandı"
-                }
-            }
-            add(btnCopyLog)
-        }
-        panelLog.add(logTopBar, BorderLayout.NORTH)
-        panelLog.add(FreedomDarkTheme.darkScrollPane(logOutput), BorderLayout.CENTER)
-        centerContainer.add(panelLog, "LOG")
-
-        root.add(centerContainer, BorderLayout.CENTER)
-        root.add(status.apply { border = BorderFactory.createEmptyBorder(4, 14, 8, 14) }, BorderLayout.SOUTH)
-
-        fun updateTabs(activeIdx: Int) {
-            val tabs = listOf(tabBtnControl, tabBtnDiag, tabBtnLog)
-            tabs.forEachIndexed { idx, btn ->
-                val active = idx == activeIdx
-                btn.background = if (active) Color(30, 58, 138) else Color(15, 23, 42)
-                btn.foreground = if (active) Color.WHITE else Color(148, 163, 184)
-                btn.borderColor = if (active) Color(56, 189, 248) else Color(30, 41, 59)
-                btn.repaint()
-            }
-            cardLayout.show(centerContainer, when (activeIdx) {
-                0 -> "CONTROL"
-                1 -> "DIAG"
-                else -> "LOG"
-            })
-        }
-
-        tabBtnControl.addActionListener { updateTabs(0) }
-        tabBtnDiag.addActionListener { updateTabs(1) }
-        tabBtnLog.addActionListener { updateTabs(2) }
-        updateTabs(0)
-
         frame.background = Color(7, 11, 20)
         frame.contentPane = root
         frame.defaultCloseOperation = WindowConstants.DISPOSE_ON_CLOSE
         frame.addWindowListener(object : WindowAdapter() {
             override fun windowClosed(e: WindowEvent) = shutdown()
         })
-        frame.minimumSize = Dimension(820, 680)
-        frame.size = Dimension(880, 740)
+        frame.minimumSize = Dimension(960, 680)
+        frame.size = Dimension(1080, 760)
         frame.setLocationRelativeTo(null)
-
-        runButton.addActionListener { startRun(verifyRuns = 0) }
-        heroActionButton.addActionListener { toggleDesync() }
-        appliedButton.addActionListener { applied() }
-        systemButton.addActionListener { showSystem(logOutput) }
 
         try {
             session = DiagnosticSession()
@@ -6171,6 +8363,221 @@ class MainWindow {
 
     private fun ui(block: () -> Unit) = SwingUtilities.invokeLater(block)
 
+    private fun updateProtectionVisuals(ps: ProxyStatus?, routeText: String, ipMasked: Boolean) {
+        val active = ps != null && ps.active
+        if (active && ps != null) {
+            sidebarStateBadge.text = "● BAĞLI :${ps.port}"
+            sidebarStateBadge.foreground = Color(167, 243, 208)
+            sidebarStateBadge.background = Color(6, 78, 59)
+            statusPill.text = "KORUMA AKTİF · 127.0.0.1:${ps.port}"
+            statusPill.foreground = Color(16, 185, 129)
+            heroActionButton.text = "KORUMAYI DURDUR (127.0.0.1:${ps.port})"
+            heroActionButton.background = Color(220, 38, 38)
+            heroActionButton.foreground = Color.WHITE
+            heroActionButton.borderColor = Color(248, 113, 113)
+            ipCardDetail.text = "$routeText · Port: 127.0.0.1:${ps.port}"
+            topRoutePill.text = if (ipMasked) "Rota: $routeText (Maskeli)" else "Rota: $routeText"
+            topRoutePill.foreground = if (ipMasked) Color(167, 243, 208) else Color(56, 189, 248)
+        } else {
+            sidebarStateBadge.text = "● HAZIR"
+            sidebarStateBadge.foreground = Color(148, 163, 184)
+            sidebarStateBadge.background = Color(15, 23, 42)
+            statusPill.text = "KORUMA KAPALI · TEK TIKLA BAĞLANIN"
+            statusPill.foreground = Color(148, 163, 184)
+            heroActionButton.text = "ÖZGÜR AĞI BAŞLAT"
+            heroActionButton.background = Color(16, 185, 129)
+            heroActionButton.foreground = Color(4, 22, 16)
+            heroActionButton.borderColor = Color(52, 211, 153)
+            ipCardDetail.text = "Hazır · Seçili mod: ${selectedRouteMode.titleTr}"
+            topRoutePill.text = "Rota: Hazır · ${selectedRouteMode.titleTr}"
+            topRoutePill.foreground = Color(56, 189, 248)
+        }
+        ipCardDetail.toolTipText = ipCardDetail.text
+        heroActionButton.repaint()
+
+        if (WindowsSystemProxy.appliedByApp) {
+            btnSystemProxyToggle.text = "WinINet Sistem Vekili: Açık"
+            btnSystemProxyToggle.background = Color(6, 78, 59)
+            btnSystemProxyToggle.foreground = Color(167, 243, 208)
+            btnSystemProxyToggle.borderColor = Color(16, 185, 129)
+            topSysProxyPill.text = "Sistem Vekili: Açık"
+            topSysProxyPill.foreground = Color(167, 243, 208)
+        } else if (systemProxyDesired) {
+            btnSystemProxyToggle.text = "WinINet Sistem Vekili: Otomatik Açık"
+            btnSystemProxyToggle.background = Color(15, 27, 46)
+            btnSystemProxyToggle.foreground = Color(251, 191, 36)
+            btnSystemProxyToggle.borderColor = Color(217, 119, 6)
+            topSysProxyPill.text = "Sistem Vekili: Otomatik"
+            topSysProxyPill.foreground = Color(251, 191, 36)
+        } else {
+            btnSystemProxyToggle.text = "WinINet Sistem Vekili: Kapalı"
+            btnSystemProxyToggle.background = Color(15, 27, 46)
+            btnSystemProxyToggle.foreground = Color(148, 163, 184)
+            btnSystemProxyToggle.borderColor = Color(51, 65, 85)
+            topSysProxyPill.text = "Sistem Vekili: Kapalı"
+            topSysProxyPill.foreground = Color(148, 163, 184)
+        }
+        btnSystemProxyToggle.repaint()
+    }
+
+    private fun ensureProxyStartedLocked(): WindowsNextGenProxy {
+        activeProxy?.let { if (it.isActive) return it }
+        val customDoh = splitList(dohEndpoints.text).ifEmpty { TunBridge.DEFAULT_DOH_ENDPOINTS }
+        val p = WindowsNextGenProxy(
+            port = 0,
+            routeMode = selectedRouteMode,
+            customRelayUri = txtRelayUri.text.trim(),
+            persona = selectedPersona,
+            blockTrackers = blockTrackersDesired,
+            stripUrlParams = stripUrlParamsDesired,
+            blockQuicAndLeaks = blockQuicLeaksDesired,
+            dohEndpoints = customDoh,
+            onRouteUpdated = { label, masked ->
+                ui {
+                    val cur = activeProxy
+                    if (cur != null && cur.isActive) {
+                        updateProtectionVisuals(cur.statusSnapshot(), label, masked)
+                    }
+                }
+            },
+        )
+        val bound = p.start()
+        activeProxy = p
+        if (bound > 0 && systemProxyDesired) {
+            WindowsSystemProxy.enable(bound)
+        }
+        ui {
+            val snap = p.statusSnapshot()
+            pulsePanel.isActive = snap.active
+            pulsePanel.portInfo = if (snap.active) "127.0.0.1:${snap.port}" else ""
+            updateProtectionVisuals(snap, p.routeLabel, p.isIpMasked)
+            status.text = "Freedom Network etkin (127.0.0.1:$bound · ${p.routeLabel})"
+        }
+        return p
+    }
+
+    private fun stopActiveProxyLocked() {
+        runCatching { WindowsSystemProxy.restore() }
+        runCatching { activeProxy?.close() }
+        activeProxy = null
+        ui {
+            pulsePanel.isActive = false
+            pulsePanel.portInfo = ""
+            updateProtectionVisuals(null, selectedRouteMode.subtitleTr, false)
+            status.text = "Freedom Network koruma motoru durduruldu"
+        }
+    }
+
+    private fun toggleDesync() {
+        heroActionButton.isEnabled = false
+        worker.execute {
+            proxyLock.lock()
+            try {
+                if (activeProxy?.isActive == true) {
+                    stopActiveProxyLocked()
+                } else {
+                    ensureProxyStartedLocked()
+                }
+            } catch (t: Throwable) {
+                WindowsLogBus.append("Proxy", "Başlatma/durdurma hatası: ${t.message}")
+                ui { status.text = "Motor hatası: ${t.message}" }
+            } finally {
+                proxyLock.unlock()
+                ui { heroActionButton.isEnabled = true }
+            }
+        }
+    }
+
+    private fun launchProtectedBrowser(urlOverride: String?) {
+        val rawUrl = (urlOverride ?: txtBrowserUrl.text).trim().ifBlank { "https://discord.com/" }
+        val browserIdx = cmbBrowser.selectedIndex.coerceAtLeast(0)
+        browserLaunchStatus.text = "Korumalı tarayıcı profili hazırlanıyor ($rawUrl)..."
+        worker.execute {
+            proxyLock.lock()
+            val port = try {
+                val p = ensureProxyStartedLocked()
+                p.localPort
+            } catch (t: Throwable) {
+                ui { browserLaunchStatus.text = "Motor başlatılamadı: ${t.message}" }
+                0
+            } finally {
+                proxyLock.unlock()
+            }
+            if (port > 0) {
+                val (ok, msg) = WindowsBrowserLauncher.launch(
+                    proxyPort = port,
+                    persona = selectedPersona,
+                    initialUrl = rawUrl,
+                    preferredBrowserIndex = browserIdx,
+                    blockLocation = blockQuicLeaksDesired,
+                )
+                ui {
+                    browserLaunchStatus.text = msg
+                    browserLaunchStatus.foreground = if (ok) Color(167, 243, 208) else Color(251, 191, 36)
+                    status.text = msg
+                }
+            }
+        }
+    }
+
+    private fun runDualIpCheck() {
+        btnLeakTest.isEnabled = false
+        btnVerifyIp.isEnabled = false
+        leakTestResult.text = "Doğrudan çıkış & yerel vekil yolu test ediliyor..."
+        proxyIpLabel.text = "Tünel / Vekil Çıkışı: test ediliyor..."
+        worker.execute {
+            val directIp = runCatching {
+                val conn = URI("https://api.ipify.org").toURL().openConnection(java.net.Proxy.NO_PROXY) as javax.net.ssl.HttpsURLConnection
+                conn.connectTimeout = 3500
+                conn.readTimeout = 3500
+                try {
+                    conn.inputStream.bufferedReader().readText().trim()
+                } finally {
+                    conn.disconnect()
+                }
+            }.getOrNull()
+            val p = activeProxy
+            val proxyIp = if (p != null && p.isActive) {
+                runCatching {
+                    val proxy = java.net.Proxy(java.net.Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", p.localPort))
+                    val conn = URI("https://api.ipify.org").toURL().openConnection(proxy) as javax.net.ssl.HttpsURLConnection
+                    conn.connectTimeout = 5000
+                    conn.readTimeout = 5000
+                    try {
+                        conn.inputStream.bufferedReader().readText().trim()
+                    } finally {
+                        conn.disconnect()
+                    }
+                }.getOrNull()
+            } else null
+            val wgReady = runCatching {
+                Native.wgPublicKey(ByteArray(32).also { java.security.SecureRandom().nextBytes(it) })?.size == 32
+            }.getOrDefault(false)
+            ui {
+                btnLeakTest.isEnabled = true
+                btnVerifyIp.isEnabled = true
+                directIpLabel.text = "Doğrudan Ağ IP: ${directIp ?: "ölçülemedi"}"
+                proxyIpLabel.text = if (p?.isActive == true) {
+                    "Tünel / Vekil (: ${p.localPort}): ${proxyIp ?: "zaman aşımı / ulaşılamadı"}"
+                } else {
+                    "Tünel / Vekil Çıkışı: koruma kapalı"
+                }
+                val summary = buildString {
+                    append("Doğrudan IP: ").append(directIp ?: "ölçülemedi")
+                    if (p?.isActive == true) {
+                        append(" · Vekil (:").append(p.localPort).append("): ").append(proxyIp ?: "hata")
+                        append(" · DoH=").append(p.dohResolved.get())
+                        append(" · İzleyici=").append(p.trackersBlocked.get())
+                        append(" · URL=").append(p.paramsStripped.get())
+                    }
+                    append(" · WG Kripto: ").append(if (wgReady) "Hazır" else "Hata")
+                }
+                leakTestResult.text = summary
+                leakTestResult.toolTipText = summary
+            }
+        }
+    }
+
     private fun startRun(verifyRuns: Int) {
         val s = session ?: return
         if (!busy.compareAndSet(false, true)) return
@@ -6179,7 +8586,7 @@ class MainWindow {
         val dohList = splitList(dohEndpoints.text)
         runButton.isEnabled = false
         appliedButton.isEnabled = false
-        status.text = "Tanılanıyor…"
+        status.text = "Ağ tanılanıyor..."
         worker.execute {
             try {
                 var remaining = verifyRuns + 1
@@ -6195,10 +8602,10 @@ class MainWindow {
                     output.caretPosition = 0
                     val d = lastDecision
                     appliedButton.isEnabled = d != null && d.state == 2 && d.action !in setOf(0, 8)
-                    status.text = "Tamamlandı"
+                    status.text = "Teşhis tamamlandı"
                 }
             } catch (e: Exception) {
-                ui { status.text = "Hata: ${e.message}" }
+                ui { status.text = "Teşhis hatası: ${e.message}" }
             } finally {
                 busy.set(false)
                 ui { runButton.isEnabled = true }
@@ -6206,51 +8613,9 @@ class MainWindow {
         }
     }
 
-    private fun toggleDesync() {
-        val s = session ?: return
-        heroActionButton.isEnabled = false
-        val personaStr = if (selectedPersona != DevicePersona.OFF) selectedPersona.id else ""
-        worker.execute {
-            val cur = s.proxyStats()
-            val next = if (cur.active) {
-                WindowsSystemProxy.restore()
-                s.stopProxy()
-                s.proxyStats()
-            } else {
-                val started = s.startProxy(
-                    DesyncConfig(
-                        mode = DesyncMode.REALITY_VISION,
-                        port = 0,
-                        persona = personaStr,
-                        blockTrackers = true,
-                        stripUrlParams = true,
-                    ),
-                )
-                if (started.active && systemProxyDesired) {
-                    WindowsSystemProxy.enable(started.port)
-                }
-                started
-            }
-            val text = Text.proxyStatus(next)
-            ui {
-                output.text = text + "\n" + output.text
-                output.caretPosition = 0
-                pulsePanel.isActive = next.active
-                pulsePanel.portInfo = if (next.active) "127.0.0.1:${next.port}" else ""
-                updateProtectionVisuals(next)
-                status.text = if (next.active) {
-                    "Freedom Network etkin (127.0.0.1:${next.port})"
-                } else {
-                    "Freedom Network durduruldu"
-                }
-                heroActionButton.isEnabled = true
-            }
-        }
-    }
-
-    private fun showSystem(targetArea: JTextArea) {
+    private fun showSystem() {
         systemButton.isEnabled = false
-        status.text = "Sistem bağlantıları okunuyor…"
+        status.text = "Sistem bağlantıları okunuyor..."
         worker.execute {
             val text = try {
                 Text.system(SystemSnapshot.capture())
@@ -6258,8 +8623,8 @@ class MainWindow {
                 "Sistem bağlantıları okunamadı: ${e.message}"
             }
             ui {
-                targetArea.text = text
-                targetArea.caretPosition = 0
+                logOutput.text = text
+                logOutput.caretPosition = 0
                 status.text = "Sistem geneli görünüm güncellendi"
                 systemButton.isEnabled = true
             }
@@ -6307,8 +8672,10 @@ class MainWindow {
         }
     }
 
-    private fun shutdown() {
+    internal fun shutdown() {
         runCatching { WindowsSystemProxy.restore() }
+        runCatching { activeProxy?.close() }
+        activeProxy = null
         pulsePanel.stop()
         ticker.stop()
         watcher.stop()

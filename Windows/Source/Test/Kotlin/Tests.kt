@@ -150,6 +150,47 @@ private fun testKeystore(): Pair<KeyStore, CharArray> {
     return ks to pw
 }
 
+private fun strictDefaultSslSocketFactory(): javax.net.ssl.SSLSocketFactory {
+    val defaultTmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
+        init(null as KeyStore?)
+    }
+    val hasIssuers = defaultTmf.trustManagers
+        .filterIsInstance<javax.net.ssl.X509TrustManager>()
+        .any { it.acceptedIssuers.isNotEmpty() }
+    if (hasIssuers) return SSLContext.getDefault().socketFactory
+
+    // Stripped container fallback when JDK cacerts is missing: load system PEM CAs
+    // (or generate a distinct unrelated throwaway CA) so PKIX strictly validates and rejects svc.test.
+    val ks = KeyStore.getInstance(KeyStore.getDefaultType()).apply { load(null, null) }
+    val pem = File("/etc/ssl/certs/ca-certificates.crt")
+    if (pem.exists()) {
+        val cf = java.security.cert.CertificateFactory.getInstance("X.509")
+        runCatching {
+            pem.inputStream().use { inp ->
+                cf.generateCertificates(inp).forEachIndexed { idx, cert ->
+                    ks.setCertificateEntry("sys-ca-$idx", cert)
+                }
+            }
+        }
+    }
+    if (ks.size() == 0) {
+        val tmp = File(System.getProperty("java.io.tmpdir"), "freedom-unrelated-ca-${System.nanoTime()}.p12")
+        try {
+            val kt = File(System.getProperty("java.home"), "bin/keytool" + if (System.getProperty("os.name").startsWith("Windows")) ".exe" else "").absolutePath
+            ProcessBuilder(
+                kt, "-genkeypair", "-alias", "unrelated", "-keyalg", "EC", "-groupname", "secp256r1", "-validity", "2",
+                "-dname", "CN=unrelated-ca.invalid", "-storetype", "PKCS12",
+                "-keystore", tmp.absolutePath, "-storepass", "changeit", "-keypass", "changeit",
+            ).redirectErrorStream(true).start().waitFor()
+            FileInputStream(tmp).use { ks.load(it, "changeit".toCharArray()) }
+        } finally {
+            tmp.delete()
+        }
+    }
+    val customTmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(ks) }
+    return SSLContext.getInstance("TLS").apply { init(null, customTmf.trustManagers, null) }.socketFactory
+}
+
 private fun env(dns: String) = EnvironmentInfo(
     osName = "Windows", osVersion = "Windows 11 24H2", osBuild = 26100, arch = "x86_64",
     networkType = NetworkType.ETHERNET, interfaceName = "test0", dnsServers = listOf(dns),
@@ -276,7 +317,7 @@ fun main() {
     test("TLS prober: certificate failure is reported, never bypassed") {
         val (ks, pw) = testKeystore()
         TlsServer(ks, pw).use { srv ->
-            val strict = TlsProber(SSLContext.getDefault().socketFactory, loopbackConnect())
+            val strict = TlsProber(strictDefaultSslSocketFactory(), loopbackConnect())
             val r = strict.probe("svc.test", srv.port, 2000)
             eq(r.status, TlsStatus.CERTIFICATE, "untrusted self-signed")
         }
@@ -300,7 +341,7 @@ fun main() {
     test("TLS prober: silent server times out within bound") {
         ServerSocket(0, 4, InetAddress.getLoopbackAddress()).use { ss ->
             val start = System.nanoTime()
-            val r = TlsProber(SSLContext.getDefault().socketFactory, loopbackConnect()).probe("svc.test", ss.localPort, 300)
+            val r = TlsProber(strictDefaultSslSocketFactory(), loopbackConnect()).probe("svc.test", ss.localPort, 300)
             eq(r.status, TlsStatus.TIMEOUT, "status")
             expect((System.nanoTime() - start) / 1_000_000 < 3000) { "bounded" }
         }
@@ -314,7 +355,7 @@ fun main() {
                     eq(s.setEnvironment(env(dns.address)), Codes.OK, "env")
                     val target = listOf("svc.test:${srv.port}")
                     // 1) Default trust → certificate failure diagnosed.
-                    val strict = TlsProber(SSLContext.getDefault().socketFactory, loopbackConnect())
+                    val strict = TlsProber(strictDefaultSslSocketFactory(), loopbackConnect())
                     val r1 = s.run(target, emptyList(), strict)
                     eq(r1.run.status, Codes.OK, "run status")
                     val t = r1.run.targets.single()
@@ -1284,6 +1325,427 @@ fun main() {
             cg.dispose()
         } finally {
             hero.stop()
+        }
+    }
+
+    // ------------------------------------------------------------------ 36. UserspaceTcpStack RFC-793 loopback test
+    test("36. UserspaceTcpStack RFC-793 handshake, MSS chunking, RTO retransmit, and OOO reassembly") {
+        val clientIp = IpPackets.parseIpLiteral("172.16.0.2")!!
+        val remoteIp = IpPackets.parseIpLiteral("93.184.216.34")!!
+        val remotePort = 443
+        val serverIss = 900000L
+        var peerRcvNxt = 0L
+        var droppedFirstData = false
+        val peerReceived = java.io.ByteArrayOutputStream()
+        val peerLock = Object()
+        var clientLocalPort = 0
+        lateinit var stack: UserspaceTcpStack
+
+        val peerQueue = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        stack = UserspaceTcpStack(
+            clientIpInt = clientIp,
+            sendRawIp = { pkt ->
+                peerQueue.offer(pkt)
+                true
+            },
+            mtu = 1280,
+        )
+
+        val peerDone = AtomicBoolean(false)
+        val responseChunksSent = AtomicBoolean(false)
+        val expectedSendBytes = 16500
+        val outPayload = ByteArray(expectedSendBytes) { idx -> ((idx * 31 + 7) and 0xFF).toByte() }
+        val oooPart1 = "FIRST-CHUNK-HEADER-".toByteArray(Charsets.US_ASCII)
+        val oooPart2 = "SECOND-CHUNK-TAIL!".toByteArray(Charsets.US_ASCII)
+
+        val peerThread = Thread {
+            while (!peerDone.get()) {
+                val pkt = peerQueue.poll(30, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                val ip = IpPackets.parseIpv4(pkt) ?: continue
+                val seg = IpPackets.parseTcp(pkt, ip) ?: continue
+                clientLocalPort = seg.srcPort
+                if ((seg.flags and IpPackets.TCP_SYN) != 0 && (seg.flags and IpPackets.TCP_ACK) == 0) {
+                    peerRcvNxt = (seg.seq + 1L) and 0xFFFFFFFFL
+                    val synAck = IpPackets.buildIpv4Tcp(
+                        srcIp = remoteIp, dstIp = clientIp, srcPort = remotePort, dstPort = clientLocalPort,
+                        seq = serverIss, ack = peerRcvNxt,
+                        flags = IpPackets.TCP_SYN or IpPackets.TCP_ACK, window = 32768, mssOption = 1200,
+                    )
+                    stack.onInboundIpPacket(synAck)
+                } else if (seg.payload.isNotEmpty()) {
+                    // Deliberately drop the very first data segment once to verify RTO retransmission
+                    if (!droppedFirstData) {
+                        droppedFirstData = true
+                        continue
+                    }
+                    expect(seg.payload.size <= 1220) { "MSS clamp violation: chunk size ${seg.payload.size}" }
+                    if (seg.seq == peerRcvNxt) {
+                        synchronized(peerLock) {
+                            peerReceived.write(seg.payload)
+                        }
+                        peerRcvNxt = (peerRcvNxt + seg.payload.size) and 0xFFFFFFFFL
+                    }
+                    val ack = IpPackets.buildIpv4Tcp(
+                        srcIp = remoteIp, dstIp = clientIp, srcPort = remotePort, dstPort = clientLocalPort,
+                        seq = (serverIss + 1L) and 0xFFFFFFFFL, ack = peerRcvNxt,
+                        flags = IpPackets.TCP_ACK, window = 32768,
+                    )
+                    stack.onInboundIpPacket(ack)
+
+                    if (synchronized(peerLock) { peerReceived.size() } >= expectedSendBytes &&
+                        responseChunksSent.compareAndSet(false, true)
+                    ) {
+                        val s1 = (serverIss + 1L) and 0xFFFFFFFFL
+                        val s2 = (s1 + oooPart1.size) and 0xFFFFFFFFL
+                        // Deliver chunk 2 BEFORE chunk 1 (out-of-order), then chunk 1, then FIN
+                        stack.onInboundIpPacket(
+                            IpPackets.buildIpv4Tcp(
+                                srcIp = remoteIp, dstIp = clientIp, srcPort = remotePort, dstPort = clientLocalPort,
+                                seq = s2, ack = peerRcvNxt, flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = oooPart2,
+                            ),
+                        )
+                        stack.onInboundIpPacket(
+                            IpPackets.buildIpv4Tcp(
+                                srcIp = remoteIp, dstIp = clientIp, srcPort = remotePort, dstPort = clientLocalPort,
+                                seq = s1, ack = peerRcvNxt, flags = IpPackets.TCP_PSH or IpPackets.TCP_ACK, payload = oooPart1,
+                            ),
+                        )
+                        stack.onInboundIpPacket(
+                            IpPackets.buildIpv4Tcp(
+                                srcIp = remoteIp, dstIp = clientIp, srcPort = remotePort, dstPort = clientLocalPort,
+                                seq = (s2 + oooPart2.size) and 0xFFFFFFFFL, ack = peerRcvNxt, flags = IpPackets.TCP_FIN or IpPackets.TCP_ACK,
+                            ),
+                        )
+                    }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+
+        try {
+            stack.use { st ->
+                st.connect(remoteIp, remotePort, 4000).use { sock ->
+                    sock.soTimeoutMs = 5000
+                    sock.outputStream.write(outPayload)
+                    sock.outputStream.flush()
+                    val respBytes = sock.inputStream.readAllBytes()
+                    eq(String(respBytes, Charsets.US_ASCII), "FIRST-CHUNK-HEADER-SECOND-CHUNK-TAIL!", "OOO reassembled response before FIN EOF")
+                }
+                val got = synchronized(peerLock) { peerReceived.toByteArray() }
+                expect(got.contentEquals(outPayload)) { "All 16500 bytes must match cleanly (got=${got.size})" }
+                expect(st.retransmits.get() >= 1L) { "Expected >=1 RTO retransmission after intentional packet drop" }
+            }
+        } finally {
+            peerDone.set(true)
+            peerThread.join(1500)
+        }
+    }
+
+    // ------------------------------------------------------------------ 37. WindowsNextGenProxy HTTP CONNECT & 4-way TLS retry
+    test("37. WindowsNextGenProxy HTTP CONNECT, SNI TLS record fragmentation, and adaptive 4-way RST retry") {
+        val fakeDns = FakeDns()
+        try {
+            val attempts = AtomicInteger(0)
+            val secondFlightBytes = AtomicReference(ByteArray(0))
+
+            ServerSocket(0, 8, InetAddress.getLoopbackAddress()).use { origin ->
+                origin.soTimeout = 6000
+                val srvThread = Thread {
+                    while (!origin.isClosed) {
+                        val c = try { origin.accept() } catch (_: Throwable) { break }
+                        c.soTimeout = 3000
+                        val attemptIdx = attempts.incrementAndGet()
+                        Thread {
+                            c.use { sock ->
+                                val buf = ByteArray(8192)
+                                if (attemptIdx == 1) {
+                                    // Read first chunk then abruptly kill connection to mimic ISP DPI RST on attempt 0
+                                    runCatching { sock.inputStream.read(buf) }
+                                    runCatching { sock.setSoLinger(true, 0) }
+                                } else {
+                                    val acc = java.io.ByteArrayOutputStream()
+                                    sock.soTimeout = 120
+                                    while (true) {
+                                        val n = try { sock.inputStream.read(buf) } catch (_: SocketTimeoutException) { break } catch (_: Throwable) { break }
+                                        if (n <= 0) break
+                                        acc.write(buf, 0, n)
+                                    }
+                                    val bytes = acc.toByteArray()
+                                    if (bytes.isNotEmpty() && secondFlightBytes.get().isEmpty()) {
+                                        secondFlightBytes.set(bytes)
+                                    }
+                                    sock.outputStream.write("DPI_BYPASSED_TLS_OK".toByteArray(Charsets.US_ASCII))
+                                    sock.outputStream.flush()
+                                }
+                            }
+                        }.apply { isDaemon = true; start() }
+                    }
+                }.apply { isDaemon = true; start() }
+
+                // Synthetic TLS 1.3 ClientHello carrying discord.com SNI
+                val sniHost = "discord.com".toByteArray(Charsets.US_ASCII)
+                val sniExtLen = 5 + sniHost.size
+                val extsLen = 4 + sniExtLen
+                val bodyLen = 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extsLen
+                val recLen = 4 + bodyLen
+                val clientHello = java.nio.ByteBuffer.allocate(5 + recLen).apply {
+                    put(0x16.toByte()); put(0x03.toByte()); put(0x01.toByte()); putShort(recLen.toShort())
+                    put(0x01.toByte()); put(0x00.toByte()); putShort(bodyLen.toShort())
+                    put(0x03.toByte()); put(0x03.toByte()); put(ByteArray(32))
+                    put(0x00.toByte()); putShort(2); put(0x13.toByte()); put(0x01.toByte())
+                    put(0x01.toByte()); put(0x00.toByte()); putShort(extsLen.toShort())
+                    putShort(0x0000); putShort(sniExtLen.toShort())
+                    putShort((3 + sniHost.size).toShort()); put(0x00.toByte()); putShort(sniHost.size.toShort()); put(sniHost)
+                }.array()
+
+                val dohStub = object : DohClient {
+                    override fun post(url: String, body: ByteArray, timeoutMs: Int): DohResponse {
+                        val q = Doh.query("discord.com", 1) ?: body
+                        val out = java.io.ByteArrayOutputStream()
+                        out.write(body, 0, 2)
+                        out.write(byteArrayOf(0x81.toByte(), 0x80.toByte(), 0, 1, 0, 1, 0, 0, 0, 0))
+                        var qEnd = 12
+                        while (qEnd < q.size && q[qEnd].toInt() != 0) qEnd += (q[qEnd].toInt() and 0xFF) + 1
+                        val qLen = (qEnd + 5).coerceAtMost(body.size)
+                        out.write(body, 12, qLen - 12)
+                        out.write(byteArrayOf(0xC0.toByte(), 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1))
+                        return DohResponse(1, 500, EncProtocol.DOH, out.toByteArray())
+                    }
+                }
+
+                WindowsNextGenProxy(
+                    port = 0,
+                    routeMode = WindowsRouteMode.HYBRID_DPI,
+                    dohEndpoints = listOf("https://1.1.1.1/dns-query"),
+                    dohClient = dohStub,
+                    forceDirectForLoopback = true,
+                    allowLoopbackDns = true,
+                ).use { proxy ->
+                    val proxyPort = proxy.start()
+                    expect(proxyPort > 0) { "Proxy must bind loopback port" }
+
+                    // Attempt #1: triggers DPI reset -> adaptive 4-way split retry -> succeeds cleanly
+                    Socket(InetAddress.getLoopbackAddress(), proxyPort).use { c ->
+                        c.soTimeout = 5000
+                        val out = c.outputStream
+                        out.write("CONNECT discord.com:${origin.localPort} HTTP/1.1\r\nHost: discord.com:${origin.localPort}\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                        out.flush()
+                        val hdrBuf = StringBuilder()
+                        while (true) {
+                            val b = c.inputStream.read()
+                            if (b < 0) break
+                            hdrBuf.append(b.toChar())
+                            if (hdrBuf.endsWith("\r\n\r\n")) break
+                        }
+                        expect("200" in hdrBuf.toString()) { "Expected HTTP 200 CONNECT banner, got: $hdrBuf" }
+                        out.write(clientHello)
+                        out.flush()
+                        val reply = String(c.inputStream.readAllBytes(), Charsets.US_ASCII)
+                        eq(reply, "DPI_BYPASSED_TLS_OK", "Adaptive 4-way split retry must succeed")
+                    }
+
+                    expect(attempts.get() >= 2) { "Expected DPI first-attempt fail then retry" }
+                    expect(proxy.tlsAdaptiveRetries.get() >= 1L) { "Expected tlsAdaptiveRetries >= 1" }
+                    expect(proxy.tlsSplit.get() >= 1L) { "Expected tlsSplit >= 1" }
+                    val sent = secondFlightBytes.get()
+                    var tlsRecCount = 0
+                    var pos = 0
+                    while (pos + 5 <= sent.size && (sent[pos].toInt() and 0xFF) == 0x16) {
+                        val rlen = IpPackets.u16(sent, pos + 3)
+                        tlsRecCount++
+                        pos += 5 + rlen
+                    }
+                    expect(tlsRecCount >= 3) { "Expected multiple TLS 0x16 fragments on adaptive retry, got $tlsRecCount" }
+                    expect(!String(sent, Charsets.ISO_8859_1).contains("discord.com")) { "Full SNI must never appear contiguous in a single TLS record" }
+
+                    // Attempt #2: cached strategy connects in 1 origin attempt directly
+                    val attemptsBefore = attempts.get()
+                    Socket(InetAddress.getLoopbackAddress(), proxyPort).use { c2 ->
+                        c2.soTimeout = 4000
+                        c2.outputStream.write("CONNECT discord.com:${origin.localPort} HTTP/1.1\r\nHost: discord.com:${origin.localPort}\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                        c2.outputStream.flush()
+                        val hb = StringBuilder()
+                        while (!hb.endsWith("\r\n\r\n")) {
+                            val b = c2.inputStream.read()
+                            if (b < 0) break
+                            hb.append(b.toChar())
+                        }
+                        c2.outputStream.write(clientHello)
+                        c2.outputStream.flush()
+                        val rep2 = String(c2.inputStream.readAllBytes(), Charsets.US_ASCII)
+                        eq(rep2, "DPI_BYPASSED_TLS_OK", "Cached host strategy succeeds without retry")
+                    }
+                    eq(attempts.get(), attemptsBefore + 1, "Cached strategy should consume exactly 1 origin connection")
+                }
+                srvThread.join(1000)
+            }
+        } finally {
+            fakeDns.close()
+        }
+    }
+
+    // ------------------------------------------------------------------ 38. WindowsNextGenProxy SOCKS5, UDP block, tracker block & URL/Persona privacy
+    test("38. WindowsNextGenProxy SOCKS5 CONNECT/UDP-block, tracker block, URL sanitization, and DevicePersona spoofing") {
+        val originReceived = AtomicReference("")
+        ServerSocket(0, 8, InetAddress.getLoopbackAddress()).use { origin ->
+            origin.soTimeout = 5000
+            val srv = Thread {
+                while (!origin.isClosed) {
+                    val c = try { origin.accept() } catch (_: Throwable) { break }
+                    Thread {
+                        c.use { s ->
+                            s.soTimeout = 2000
+                            val sb = StringBuilder()
+                            while (!sb.endsWith("\r\n\r\n")) {
+                                val ch = s.inputStream.read()
+                                if (ch < 0) break
+                                sb.append(ch.toChar())
+                            }
+                            if (sb.isNotEmpty()) {
+                                originReceived.set(sb.toString())
+                                s.outputStream.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".toByteArray())
+                                s.outputStream.flush()
+                            } else {
+                                s.outputStream.write("SOCKS_ECHO".toByteArray())
+                                s.outputStream.flush()
+                            }
+                        }
+                    }.apply { isDaemon = true; start() }
+                }
+            }.apply { isDaemon = true; start() }
+
+            WindowsNextGenProxy(
+                port = 0,
+                routeMode = WindowsRouteMode.HYBRID_DPI,
+                persona = DevicePersona.IPHONE_19_BETA,
+                blockTrackers = true,
+                stripUrlParams = true,
+                blockQuicAndLeaks = true,
+            ).use { proxy ->
+                val pPort = proxy.start()
+
+                // 1) SOCKS5 UDP ASSOCIATE (0x03) must be denied with status 0x02 (prevents WebRTC/QUIC UDP bypass)
+                Socket(InetAddress.getLoopbackAddress(), pPort).use { s ->
+                    s.soTimeout = 3000
+                    s.outputStream.write(byteArrayOf(0x05, 0x01, 0x00)); s.outputStream.flush()
+                    val m = s.inputStream.readNBytes(2)
+                    eq(m[1].toInt(), 0, "SOCKS5 no-auth")
+                    s.outputStream.write(byteArrayOf(0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0)); s.outputStream.flush()
+                    val rep = s.inputStream.readNBytes(10)
+                    eq(rep[1].toInt() and 0xFF, 0x02, "SOCKS5 UDP ASSOCIATE must return 0x02 denied")
+                }
+
+                // 2) Tracker domain blocked on HTTP CONNECT (403) and SOCKS5 CONNECT (0x02)
+                Socket(InetAddress.getLoopbackAddress(), pPort).use { s ->
+                    s.soTimeout = 3000
+                    s.outputStream.write("CONNECT doubleclick.net:443 HTTP/1.1\r\nHost: doubleclick.net:443\r\n\r\n".toByteArray())
+                    s.outputStream.flush()
+                    val resp = String(s.inputStream.readAllBytes(), Charsets.US_ASCII)
+                    expect("403 Forbidden" in resp) { "HTTP tracker CONNECT must return 403 Forbidden, got: $resp" }
+                }
+                Socket(InetAddress.getLoopbackAddress(), pPort).use { s ->
+                    s.soTimeout = 3000
+                    s.outputStream.write(byteArrayOf(0x05, 0x01, 0x00)); s.outputStream.flush()
+                    s.inputStream.readNBytes(2)
+                    val host = "doubleclick.net".toByteArray(Charsets.US_ASCII)
+                    val req = byteArrayOf(0x05, 0x01, 0x00, 0x03, host.size.toByte()) + host + byteArrayOf(0x01, 0xBB.toByte())
+                    s.outputStream.write(req); s.outputStream.flush()
+                    val rep = s.inputStream.readNBytes(10)
+                    eq(rep[1].toInt() and 0xFF, 0x02, "SOCKS5 tracker CONNECT must return 0x02 denied")
+                }
+                expect(proxy.trackersBlocked.get() >= 2L) { "Expected trackersBlocked >= 2" }
+
+                // 3) SOCKS5 CONNECT 127.0.0.1:originPort succeeds cleanly
+                Socket(InetAddress.getLoopbackAddress(), pPort).use { s ->
+                    s.soTimeout = 3000
+                    s.outputStream.write(byteArrayOf(0x05, 0x01, 0x00)); s.outputStream.flush()
+                    s.inputStream.readNBytes(2)
+                    val portHi = ((origin.localPort ushr 8) and 0xFF).toByte()
+                    val portLo = (origin.localPort and 0xFF).toByte()
+                    s.outputStream.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, portHi, portLo))
+                    s.outputStream.flush()
+                    val rep = s.inputStream.readNBytes(10)
+                    eq(rep[1].toInt(), 0x00, "SOCKS5 CONNECT to origin must succeed")
+                    s.outputStream.write("GET /socks HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".toByteArray())
+                    s.outputStream.flush()
+                    val body = String(s.inputStream.readAllBytes(), Charsets.US_ASCII)
+                    expect(body.endsWith("OK")) { "Expected HTTP response via SOCKS5, got: $body" }
+                }
+
+                // 4) Plain HTTP URL tracking param stripping + DevicePersona User-Agent masking + X-Forwarded-For stripping
+                Socket(InetAddress.getLoopbackAddress(), pPort).use { s ->
+                    s.soTimeout = 3000
+                    val dirtyReq = (
+                        "GET http://127.0.0.1:${origin.localPort}/watch?utm_source=fb&fbclid=999&keep=1 HTTP/1.1\r\n" +
+                            "Host: 127.0.0.1:${origin.localPort}\r\n" +
+                            "User-Agent: Mozilla/5.0 (Windows NT 10.0) RealDesktop\r\n" +
+                            "X-Forwarded-For: 176.89.26.149\r\n\r\n"
+                        ).toByteArray(Charsets.US_ASCII)
+                    s.outputStream.write(dirtyReq); s.outputStream.flush()
+                    val resp = String(s.inputStream.readAllBytes(), Charsets.US_ASCII)
+                    expect(resp.endsWith("OK")) { "Plain HTTP response must succeed: $resp" }
+                }
+                val forwarded = originReceived.get()
+                expect("GET /watch?keep=1 HTTP/1.1" in forwarded) { "Tracking params must be stripped: $forwarded" }
+                expect("iPhone19,3" in forwarded && "RealDesktop" !in forwarded) { "Persona User-Agent must replace real UA: $forwarded" }
+                expect("176.89.26.149" !in forwarded) { "X-Forwarded-For must be stripped: $forwarded" }
+                expect(proxy.paramsStripped.get() >= 1L) { "Expected paramsStripped >= 1" }
+                expect(proxy.leaksBlocked.get() >= 1L) { "Expected leaksBlocked >= 1" }
+            }
+            srv.join(1000)
+        }
+    }
+
+    // ------------------------------------------------------------------ 39. WindowsBrowserLauncher, runCli --help & MainWindow offscreen render
+    test("39. WindowsBrowserLauncher hardened flags/prefs, runCli --help, and redesigned MainWindow offscreen render") {
+        val tempDir = File(System.getProperty("java.io.tmpdir"), "freedom-browser-test-${System.nanoTime()}")
+        try {
+            val prefsFile = WindowsBrowserLauncher.prepareProfilePreferences(tempDir, blockLocation = true)
+            val prefsJson = prefsFile.readText(Charsets.UTF_8)
+            expect("\"disable_non_proxied_udp\"" in prefsJson) { "WebRTC policy missing from Preferences" }
+            expect("\"nonproxied_udp_enabled\": false" in prefsJson) { "WebRTC nonproxied UDP toggle missing" }
+            expect("\"geolocation\": 2" in prefsJson) { "Location blocking setting missing" }
+
+            val args = WindowsBrowserLauncher.buildLaunchArgs(
+                exePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                proxyPort = 18888,
+                persona = DevicePersona.IPHONE_19_BETA,
+                initialUrl = "https://discord.com/",
+                profileRoot = tempDir,
+            )
+            expect("--disable-quic" in args) { "QUIC disable flag required to fix ERR_QUIC_PROTOCOL_ERROR" }
+            expect("--proxy-server=http://127.0.0.1:18888" in args) { "Proxy server arg missing" }
+            expect("--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1" in args) { "Host resolver rules missing" }
+            expect("--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in args) { "WebRTC CLI flag missing" }
+            expect(args.any { it.startsWith("--user-agent=") && "iPhone19,3" in it }) { "Persona --user-agent flag missing" }
+            expect(args.last() == "https://discord.com/") { "Initial URL must trail arguments" }
+        } finally {
+            tempDir.deleteRecursively()
+        }
+
+        eq(runCli(listOf("--help")), 0, "runCli --help must exit 0")
+
+        FreedomDarkTheme.install()
+        val win = MainWindow()
+        try {
+            val root = win.buildRootPanelForTest()
+            root.setSize(1080, 760)
+            root.doLayout()
+            val canvas = java.awt.image.BufferedImage(1080, 760, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+            val g2 = canvas.createGraphics()
+            root.paint(g2)
+            g2.dispose()
+
+            // Verify sidebar background & canvas edges remain dark obsidian (never light/white Win32 grey)
+            val sidebarPx = java.awt.Color(canvas.getRGB(8, 380), true)
+            val workspacePx = java.awt.Color(canvas.getRGB(1065, 745), true)
+            expect(sidebarPx.red < 40 && sidebarPx.green < 40 && sidebarPx.blue < 60) {
+                "Sidebar canvas must be dark obsidian, got $sidebarPx"
+            }
+            expect(workspacePx.red < 40 && workspacePx.green < 40 && workspacePx.blue < 60) {
+                "Workspace background must be dark obsidian, got $workspacePx"
+            }
+        } finally {
+            win.shutdown()
         }
     }
 
